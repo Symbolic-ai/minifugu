@@ -28,6 +28,16 @@ async fn rows_survive_restarts_and_deletes_are_durable() {
         .await
         .unwrap();
     assert_eq!(write.status(), StatusCode::OK);
+    let metadata_url = url.replace("/v2/namespaces/", "/v1/namespaces/") + "/metadata";
+    let metadata_before: Value = client
+        .get(&metadata_url)
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     task.abort();
 
     let (url, task) = serve(directory.path()).await;
@@ -42,6 +52,18 @@ async fn rows_survive_restarts_and_deletes_are_durable() {
         .await
         .unwrap();
     assert_eq!(result["rows"][0]["id"], 1);
+    let metadata_url = url.replace("/v2/namespaces/", "/v1/namespaces/") + "/metadata";
+    let metadata_after: Value = client
+        .get(&metadata_url)
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(metadata_after["created_at"], metadata_before["created_at"]);
+    assert_eq!(metadata_after["updated_at"], metadata_before["updated_at"]);
     let deleted = client
         .delete(&url)
         .bearer_auth("dummy")
