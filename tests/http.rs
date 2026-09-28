@@ -451,6 +451,57 @@ async fn euclidean_metric_and_i8_vectors_rank_exactly() {
 }
 
 #[tokio::test]
+async fn partial_write_flags_finish_small_local_filters() {
+    let base = server().await;
+    let client = Client::new();
+    let ns = format!("{base}/partial");
+    let (status, _) = post(
+        &client,
+        &ns,
+        json!({
+            "schema":{"id":"uint","tag":"string"},
+            "upsert_rows":[{"id":1,"tag":"old"},{"id":2,"tag":"old"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, patched) = post(
+        &client,
+        &ns,
+        json!({
+            "patch_by_filter":{"filters":["tag","Eq","old"],"patch":{"tag":"new"}},
+            "patch_by_filter_allow_partial":true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(patched["rows_patched"], 2);
+    assert!(patched.get("rows_remaining").is_none());
+    let (status, deleted) = post(
+        &client,
+        &ns,
+        json!({
+            "delete_by_filter":["tag","Eq","new"],
+            "delete_by_filter_allow_partial":true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(deleted["rows_deleted"], 2);
+    assert!(deleted.get("rows_remaining").is_none());
+    let (status, _) = post(
+        &client,
+        &ns,
+        json!({
+            "patch_by_filter":{"filters":["tag","Eq","new"],"patch":{"tag":"old"}},
+            "disable_backpressure":true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn unsupported_fields_fail_loudly() {
     let base = server().await;
     let client = Client::new();

@@ -160,6 +160,34 @@ impl Namespace {
         let object = normalized
             .as_object()
             .ok_or("write body must be an object")?;
+        for (flag, operation) in [
+            ("delete_by_filter_allow_partial", "delete_by_filter"),
+            ("patch_by_filter_allow_partial", "patch_by_filter"),
+        ] {
+            if let Some(value) = object.get(flag) {
+                if !value.is_boolean() {
+                    return Err(format!("{flag} must be a boolean").into());
+                }
+                if !object.contains_key(operation) {
+                    return Err(format!("{flag} requires {operation}").into());
+                }
+            }
+        }
+        if object
+            .get("disable_backpressure")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err("disable_backpressure must be a boolean".into());
+        }
+        if object.get("disable_backpressure") == Some(&Value::Bool(true))
+            && !["upsert_rows", "upsert_columns", "deletes"]
+                .iter()
+                .any(|operation| object.contains_key(*operation))
+        {
+            return Err(
+                "disable_backpressure is only supported for upserts and delete-by-id".into(),
+            );
+        }
         if let Some(metric) = object.get("distance_metric") {
             let metric = metric.as_str().ok_or("distance_metric must be a string")?;
             if !matches!(metric, "cosine_distance" | "euclidean_squared") {
@@ -383,6 +411,9 @@ pub(crate) fn validate_write_keys(object: &Map<String, Value>) -> Result<(), Str
                 | "delete_condition"
                 | "branch_from_namespace"
                 | "copy_from_namespace"
+                | "delete_by_filter_allow_partial"
+                | "patch_by_filter_allow_partial"
+                | "disable_backpressure"
         ) {
             return Err(format!("unsupported write field {key}"));
         }
