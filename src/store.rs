@@ -15,6 +15,8 @@ pub struct Namespace {
     pub(crate) created_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub(crate) updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) approx_logical_bytes: Option<usize>,
 }
 
 impl Namespace {
@@ -22,20 +24,28 @@ impl Namespace {
         let now = Utc::now();
         self.created_at.get_or_insert(now);
         self.updated_at = Some(now);
+        self.approx_logical_bytes = Some(self.compute_logical_bytes());
+    }
+
+    fn compute_logical_bytes(&self) -> usize {
+        self.rows
+            .values()
+            .map(|row| serde_json::to_vec(row).map_or(0, |bytes| bytes.len()))
+            .sum()
+    }
+
+    pub(crate) fn logical_bytes(&self) -> usize {
+        self.approx_logical_bytes
+            .unwrap_or_else(|| self.compute_logical_bytes())
     }
 
     pub(crate) fn metadata(&self) -> Value {
         let created_at = self.created_at.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
         let updated_at = self.updated_at.unwrap_or(created_at);
-        let approx_logical_bytes = self
-            .rows
-            .values()
-            .map(|row| serde_json::to_vec(row).map_or(0, |bytes| bytes.len()))
-            .sum::<usize>();
         json!({
             "schema": self.schema,
             "approx_row_count": self.rows.len(),
-            "approx_logical_bytes": approx_logical_bytes,
+            "approx_logical_bytes": self.logical_bytes(),
             "created_at": created_at,
             "updated_at": updated_at,
             "encryption": {"sse": true},
@@ -76,18 +86,24 @@ impl Namespace {
             .schema
             .iter()
             .find(|(_, definition)| {
-                let kind = field_type(definition);
-                kind.ends_with("]f16") || kind.ends_with("]f32") || kind.ends_with("]i8")
+                vector::dimensions(definition).is_some()
+                    && definition.get("ann") == Some(&Value::Bool(true))
             })
-            .map(|(field, _)| field.as_str())
-            .ok_or("recall requires a vector attribute")?;
+            .map(|(field, _)| field.clone())
+            .or_else(|| {
+                self.schema
+                    .iter()
+                    .find(|(_, definition)| has_embed(definition))
+                    .map(|(field, _)| format!("embed_{field}"))
+            })
+            .ok_or("recall requires an ANN-enabled vector attribute")?;
         let mut ground_truth = Vec::new();
         let mut total = 0usize;
         let mut searched = 0usize;
         for vector in self
             .rows
             .values()
-            .filter_map(|row| row.get(vector_field).and_then(Value::as_array))
+            .filter_map(|row| row.get(&vector_field).and_then(Value::as_array))
             .take(num)
         {
             searched += 1;
@@ -614,8 +630,9 @@ fn validate_value(field: &str, value: &Value, definition: &Value) -> Result<(), 
                 Some(array.len()) == expected
                     && array.iter().all(|item| {
                         if vector.ends_with("]i8") {
-                            item.as_f64()
-                                .is_some_and(|number| (-128.0..=127.0).contains(&number))
+                            item.as_f64().is_some_and(|number| {
+                                number.fract() == 0.0 && (-128.0..=127.0).contains(&number)
+                            })
                         } else {
                             item.is_number()
                         }

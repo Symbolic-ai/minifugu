@@ -14,11 +14,7 @@ impl Namespace {
         if body.get("vector_encoding") == Some(&json!("base64")) {
             vector::encode_response(&mut result, &self.schema)?;
         }
-        let bytes_queried = self
-            .rows
-            .values()
-            .map(|row| serde_json::to_vec(row).map_or(0, |bytes| bytes.len()))
-            .sum::<usize>();
+        let bytes_queried = self.logical_bytes();
         let bytes_returned = serde_json::to_vec(&result).map_or(0, |bytes| bytes.len());
         result["billing"] = json!({
             "billable_logical_bytes_queried": bytes_queried,

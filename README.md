@@ -75,7 +75,7 @@ MiniFugu calls OpenAI's embeddings endpoint for native `embed` fields, using the
 | `POST /v1/namespaces/{name}/_debug/recall` | Measure exact local vector recall |
 | `POST /v2/namespaces/{name}/explain_query` | Explain the local exact scan plan |
 
-Supported filters include `And`, `Or`, `Not`, equality, `In`/`NotIn`, numeric/date ranges, array containment, and full-text token matching. Dense vectors can be sent and returned as float arrays or little-endian float32 base64. Queries validate referenced attributes even when no rows match. Unsupported request fields return HTTP 400. This prevents a test from silently passing when MiniFugu cannot emulate the operation. See [API coverage](docs/api-coverage.md) for exact details and remaining gaps.
+Supported filters include `And`, `Or`, `Not`, equality, `In`/`NotIn`, numeric/date ranges, array containment, and full-text token matching. Dense vectors can be sent as float arrays or little-endian float32 base64; base64 query responses use the schema's f32, f16, or i8 element width. Queries validate referenced attributes even when no rows match. Unsupported request fields return HTTP 400. This prevents a test from silently passing when MiniFugu cannot emulate the operation. See [API coverage](docs/api-coverage.md) for exact details and remaining gaps.
 
 ## Development and compatibility checks
 

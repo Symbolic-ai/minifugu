@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
+use half::f16;
 use serde_json::{json, Map, Value};
 
 pub(crate) fn dimensions(definition: &Value) -> Option<usize> {
@@ -30,15 +31,28 @@ pub(crate) fn decode(value: &str, dimensions: usize) -> Result<Value, String> {
     Ok(json!(floats))
 }
 
-pub(crate) fn encode(value: &Value) -> Result<Value, String> {
+pub(crate) fn encode(value: &Value, definition: &Value) -> Result<Value, String> {
     let values = value.as_array().ok_or("vector must be an array")?;
     let mut bytes = Vec::with_capacity(values.len() * 4);
+    let kind = definition
+        .as_str()
+        .or_else(|| definition.get("type").and_then(Value::as_str))
+        .ok_or("vector type is missing")?;
     for value in values {
         let number = value.as_f64().ok_or("vector must contain numbers")? as f32;
         if !number.is_finite() {
             return Err("vector must contain finite numbers".into());
         }
-        bytes.extend_from_slice(&number.to_le_bytes());
+        if kind.ends_with("]i8") {
+            if number.fract() != 0.0 || !(-128.0..=127.0).contains(&number) {
+                return Err("i8 vector element is not an integer in range".into());
+            }
+            bytes.push(number as i8 as u8);
+        } else if kind.ends_with("]f16") {
+            bytes.extend_from_slice(&f16::from_f32(number).to_bits().to_le_bytes());
+        } else {
+            bytes.extend_from_slice(&number.to_le_bytes());
+        }
     }
     Ok(Value::String(STANDARD.encode(bytes)))
 }
@@ -128,8 +142,11 @@ pub(crate) fn encode_response(
     match value {
         Value::Object(object) => {
             for (field, item) in object {
-                if schema.get(field).and_then(dimensions).is_some() && item.is_array() {
-                    *item = encode(item)?;
+                if let Some(definition) = schema
+                    .get(field)
+                    .filter(|definition| dimensions(definition).is_some() && item.is_array())
+                {
+                    *item = encode(item, definition)?;
                 } else {
                     encode_response(item, schema)?;
                 }

@@ -299,6 +299,16 @@ async fn patches_filters_and_namespace_inspection_work() {
     assert!(body["updated_at"].as_str().unwrap().ends_with('Z'));
     assert_eq!(body["encryption"], json!({"sse":true}));
     assert_eq!(body["index"]["status"], "up-to-date");
+    let legacy: Value = client
+        .get(format!("{origin}/v2/namespaces/inspection/metadata"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(legacy["created_at"], body["created_at"]);
 
     let url = format!("{origin}/v1/namespaces/inspection/schema");
     let response = client.get(&url).bearer_auth("dummy").send().await.unwrap();
@@ -349,6 +359,7 @@ async fn documented_cache_recall_and_explain_routes_work() {
     assert_eq!(recall["avg_exhaustive_count"], 1.0);
     assert_eq!(recall["ground_truth"].as_array().unwrap().len(), 2);
     assert_eq!(recall["ground_truth"][0]["nearest_neighbors"][0]["id"], 1);
+    assert_eq!(recall["ground_truth"][1]["nearest_neighbors"][0]["id"], 1);
 
     let (status, explanation) = post(
         &client,
@@ -357,7 +368,23 @@ async fn documented_cache_recall_and_explain_routes_work() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(explanation["plan_text"].as_str().unwrap().contains("exact"));
+    assert_eq!(
+        explanation["plan_text"],
+        "MiniFugu exact unfiltered ranked scan of 2 rows"
+    );
+
+    let (status, multi_explanation) = post(
+        &client,
+        &format!("{ns}/explain_query"),
+        json!({"queries":[{"rank_by":["vector","ANN",[1,0]],"limit":1},
+                            {"rank_by":["vector","ANN",[0,1]],"limit":1}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        multi_explanation["plan_text"],
+        "MiniFugu exact scan of 2 rows for 2 subqueries; local fusion"
+    );
 
     let (status, invalid) = post(
         &client,
@@ -367,6 +394,55 @@ async fn documented_cache_recall_and_explain_routes_work() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(invalid["error"].as_str().unwrap().contains("absent"));
+}
+
+#[tokio::test]
+async fn recall_selects_an_ann_index_or_native_embedding() {
+    let base = server().await;
+    let client = Client::new();
+    let origin = base.trim_end_matches("/v2/namespaces");
+    let ns = format!("{base}/multiple-vectors");
+    let (status, _) = post(
+        &client,
+        &ns,
+        json!({
+            "schema":{"id":"uint","a_storage":{"type":"[2]f32","ann":false},
+                      "z_search":{"type":"[2]f32","ann":true}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"a_storage":[0,1],"z_search":[1,0]}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, recall) = post(
+        &client,
+        &format!("{origin}/v1/namespaces/multiple-vectors/_debug/recall"),
+        json!({"num":1,"top_k":1,"include_ground_truth":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recall["ground_truth"][0]["nearest_neighbors"][0]["id"], 1);
+
+    let ns = format!("{base}/native-recall");
+    let (status, _) = post(
+        &client,
+        &ns,
+        json!({
+            "schema":{"id":"uint","content":{"type":"string","embed":{"model":"test","dims":4}}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"content":"small fugu"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, recall) = post(
+        &client,
+        &format!("{origin}/v1/namespaces/native-recall/_debug/recall"),
+        json!({"num":1,"top_k":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "native recall: {recall}");
+    assert_eq!(recall["avg_recall"], 1.0);
 }
 
 #[tokio::test]
@@ -421,6 +497,47 @@ async fn base64_vectors_round_trip_through_write_and_query() {
 }
 
 #[tokio::test]
+async fn narrow_vector_types_accept_float32_base64_and_return_native_width() {
+    let base = server().await;
+    let client = Client::new();
+    let input = STANDARD.encode([1.0_f32.to_le_bytes(), 0.0_f32.to_le_bytes()].concat());
+    for (kind, expected) in [("f16", vec![0, 0x3c, 0, 0]), ("i8", vec![1, 0])] {
+        let ns = format!("{base}/encoded-{kind}");
+        let (status, _) = post(
+            &client,
+            &ns,
+            json!({
+                "schema":{"id":"uint","vector":{"type":format!("[2]{kind}"),"ann":true}},
+                "distance_metric":"cosine_distance",
+                "upsert_rows":[{"id":1,"vector":input}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{kind} base64 input");
+        let (status, response) = post(
+            &client,
+            &format!("{ns}/query"),
+            json!({
+                "rank_by":["vector","ANN",input],"limit":1,
+                "include_attributes":["vector"],"vector_encoding":"base64"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{kind} base64 query");
+        assert_eq!(response["rows"][0]["vector"], STANDARD.encode(expected));
+    }
+    let (status, _) = post(
+        &client,
+        &format!("{base}/encoded-i8"),
+        json!({
+            "upsert_rows":[{"id":2,"vector":[1.5,0]}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn euclidean_metric_and_i8_vectors_rank_exactly() {
     let base = server().await;
     let client = Client::new();
@@ -448,6 +565,18 @@ async fn euclidean_metric_and_i8_vectors_rank_exactly() {
     assert_eq!(response["rows"][0]["id"], 1);
     assert_eq!(response["rows"][0]["$dist"], 2.0);
     assert_eq!(response["rows"][1]["$dist"], 13.0);
+    let (status, override_result) = post(
+        &client,
+        &format!("{ns}/query"),
+        json!({
+            "rank_by":["vector","ANN",[1,1]],"limit":2,
+            "distance_metric":"cosine_distance"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(override_result["rows"][0]["id"], 2);
+    assert_eq!(override_result["rows"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
