@@ -1,0 +1,17 @@
+[package]
+name = "minifugu"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A keyless local emulator for a practical subset of the Turbopuffer HTTP API"
+
+[dependencies]
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
