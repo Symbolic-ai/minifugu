@@ -133,6 +133,15 @@ async fn failed_write_does_not_partially_change_rows() {
     .await;
     assert_eq!(result["rows"][0]["id"], 1);
     assert_eq!(result["rows"][0]["tag"], "old");
+    let (status, _) = post(
+        &client,
+        &ns,
+        json!({
+            "patch_by_filter":{"filters":["id","Eq",1],"patch":{"id":3}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

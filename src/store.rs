@@ -97,6 +97,9 @@ impl Namespace {
                 .get("patch")
                 .and_then(Value::as_object)
                 .ok_or("patch_by_filter requires a patch object")?;
+            if values.contains_key("id") {
+                return Err("patch_by_filter cannot change id".into());
+            }
             validate_filter(filter, &self.schema)?;
             self.validate_patch(values)?;
             for row in self.rows.values_mut() {
