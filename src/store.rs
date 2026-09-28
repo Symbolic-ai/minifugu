@@ -55,16 +55,32 @@ impl Namespace {
                     "only cosine_distance is supported".into(),
                 ));
             }
-            if !self
-                .schema
-                .values()
-                .any(|v| field_type(v).starts_with('[') || has_embed(v))
-            {
+            if !self.schema.values().any(|v| {
+                field_type(v).ends_with("]f16") || field_type(v).ends_with("]f32") || has_embed(v)
+            }) {
                 return Err(WriteError::Invalid(
                     "distance_metric requires a vector attribute".into(),
                 ));
             }
             self.distance_metric = Some(metric.into());
+        }
+        for (condition, operations) in [
+            ("upsert_condition", &["upsert_rows", "upsert_columns"][..]),
+            (
+                "patch_condition",
+                &["patch_rows", "patch_columns", "patch_by_filter"][..],
+            ),
+            ("delete_condition", &["deletes", "delete_by_filter"][..]),
+        ] {
+            if let Some(filter) = object.get(condition) {
+                if !operations
+                    .iter()
+                    .any(|operation| object.contains_key(*operation))
+                {
+                    return Err(format!("{condition} requires a matching write operation").into());
+                }
+                validate_filter(filter, &self.schema)?;
+            }
         }
         let mut upserted_ids = Vec::new();
         let mut patched_ids = Vec::new();
@@ -72,7 +88,9 @@ impl Namespace {
         if let Some(filter) = object.get("delete_by_filter") {
             validate_filter(filter, &self.schema)?;
             self.rows.retain(|_, row| {
-                if filter_matches(filter, row) {
+                if filter_matches(filter, row)
+                    && condition_matches(object, "delete_condition", Some(row))
+                {
                     deleted_ids.push(row["id"].clone());
                     false
                 } else {
@@ -83,7 +101,10 @@ impl Namespace {
         if let Some(deletes) = object.get("deletes") {
             let deletes = deletes.as_array().ok_or("deletes must be an array")?;
             for id in deletes {
-                if self.rows.remove(&id_key(id)?).is_some() {
+                let key = id_key(id)?;
+                if condition_matches(object, "delete_condition", self.rows.get(&key))
+                    && self.rows.remove(&key).is_some()
+                {
                     deleted_ids.push(id.clone());
                 }
             }
@@ -99,10 +120,15 @@ impl Namespace {
                 .get("patch")
                 .and_then(Value::as_object)
                 .ok_or("patch_by_filter requires a patch object")?;
+            if values.contains_key("id") {
+                return Err("patch_by_filter cannot change id".into());
+            }
             validate_filter(filter, &self.schema)?;
             self.validate_patch(values)?;
             for row in self.rows.values_mut() {
-                if filter_matches(filter, row) {
+                if filter_matches(filter, row)
+                    && condition_matches(object, "patch_condition", Some(row))
+                {
                     for (field, value) in values {
                         row.insert(field.clone(), value.clone());
                     }
@@ -110,15 +136,19 @@ impl Namespace {
                 }
             }
         }
-        if let Some(rows) = object.get("patch_rows") {
-            for patch in rows.as_array().ok_or("patch_rows must be an array")? {
+        if let Some(rows) = write_rows(object, "patch_rows", "patch_columns")? {
+            for patch in &rows {
                 let patch = patch
                     .as_object()
                     .ok_or("each patch row must be an object")?;
                 let id = patch.get("id").ok_or("patch row requires id")?;
                 validate_id(id, self.schema.get("id"))?;
                 self.validate_patch(patch)?;
-                if let Some(row) = self.rows.get_mut(&id_key(id)?) {
+                let key = id_key(id)?;
+                if !condition_matches(object, "patch_condition", self.rows.get(&key)) {
+                    continue;
+                }
+                if let Some(row) = self.rows.get_mut(&key) {
                     for (field, value) in patch {
                         if field != "id" {
                             row.insert(field.clone(), value.clone());
@@ -128,15 +158,17 @@ impl Namespace {
                 }
             }
         }
-        if let Some(rows) = object.get("upsert_rows") {
-            let rows = rows.as_array().ok_or("upsert_rows must be an array")?;
-            for row in rows {
+        if let Some(rows) = write_rows(object, "upsert_rows", "upsert_columns")? {
+            for row in &rows {
                 let mut row = row
                     .as_object()
                     .ok_or("each upsert row must be an object")?
                     .clone();
                 let id = row.get("id").ok_or("upsert row requires id")?.clone();
                 validate_id(&id, self.schema.get("id"))?;
+                if !condition_matches(object, "upsert_condition", self.rows.get(&id_key(&id)?)) {
+                    continue;
+                }
                 for (field, value) in &row {
                     if !self.schema.contains_key(field) {
                         self.schema.insert(field.clone(), infer_type(value)?);
@@ -208,6 +240,16 @@ impl Namespace {
     }
 }
 
+fn condition_matches(
+    object: &Map<String, Value>,
+    condition: &str,
+    current: Option<&Map<String, Value>>,
+) -> bool {
+    object
+        .get(condition)
+        .is_none_or(|filter| filter_matches(filter, current.unwrap_or(&Map::new())))
+}
+
 pub(crate) fn validate_write_keys(object: &Map<String, Value>) -> Result<(), String> {
     for key in object.keys() {
         if !matches!(
@@ -218,13 +260,58 @@ pub(crate) fn validate_write_keys(object: &Map<String, Value>) -> Result<(), Str
                 | "deletes"
                 | "patch_by_filter"
                 | "patch_rows"
+                | "patch_columns"
                 | "upsert_rows"
+                | "upsert_columns"
                 | "return_affected_ids"
+                | "upsert_condition"
+                | "patch_condition"
+                | "delete_condition"
+                | "branch_from_namespace"
+                | "copy_from_namespace"
         ) {
             return Err(format!("unsupported write field {key}"));
         }
     }
     Ok(())
+}
+
+fn write_rows(
+    object: &Map<String, Value>,
+    row_key: &str,
+    column_key: &str,
+) -> Result<Option<Vec<Value>>, WriteError> {
+    match (object.get(row_key), object.get(column_key)) {
+        (Some(_), Some(_)) => Err(format!("{row_key} and {column_key} cannot be combined").into()),
+        (Some(rows), None) => Ok(Some(
+            rows.as_array()
+                .ok_or_else(|| format!("{row_key} must be an array"))?
+                .clone(),
+        )),
+        (None, Some(columns)) => Ok(Some(rows_from_columns(columns)?)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn rows_from_columns(columns: &Value) -> Result<Vec<Value>, WriteError> {
+    let columns = columns.as_object().ok_or("columns must be an object")?;
+    let ids = columns
+        .get("id")
+        .and_then(Value::as_array)
+        .ok_or("columns require an id array")?;
+    let mut rows = vec![Map::new(); ids.len()];
+    for (field, values) in columns {
+        let values = values
+            .as_array()
+            .ok_or_else(|| format!("column {field} must be an array"))?;
+        if values.len() != rows.len() {
+            return Err(format!("column {field} length must match id length").into());
+        }
+        for (row, value) in rows.iter_mut().zip(values) {
+            row.insert(field.clone(), value.clone());
+        }
+    }
+    Ok(rows.into_iter().map(Value::Object).collect())
 }
 
 pub(crate) fn field_type(definition: &Value) -> &str {
@@ -246,6 +333,44 @@ pub(crate) fn known_field(schema: &Map<String, Value>, field: &str) -> bool {
 }
 
 fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
+    if let Some(config) = definition.as_object() {
+        for (option, value) in config {
+            match option.as_str() {
+                "type" if !value.is_string() => {
+                    return Err(format!(
+                        "schema option type must be a string for attribute {field}"
+                    ));
+                }
+                "filterable" | "ann" | "regex" | "glob" | "full_text_search"
+                    if !value.is_boolean() =>
+                {
+                    return Err(format!(
+                        "schema option {option} must be a boolean for attribute {field}"
+                    ));
+                }
+                "embed" if !value.is_object() => {
+                    return Err(format!(
+                        "schema option embed must be an object for attribute {field}"
+                    ));
+                }
+                "embed" => {
+                    if value.as_object().is_some_and(|embed| {
+                        embed
+                            .keys()
+                            .any(|key| !matches!(key.as_str(), "model" | "dims"))
+                    }) {
+                        return Err(format!("unsupported embed option for attribute {field}"));
+                    }
+                }
+                "type" | "filterable" | "ann" | "regex" | "glob" | "full_text_search" => {}
+                _ => {
+                    return Err(format!(
+                        "unsupported schema option {option} for attribute {field}"
+                    ))
+                }
+            }
+        }
+    }
     if let Some(embed) = definition.get("embed") {
         if !embed.get("model").is_some_and(Value::is_string)
             || !embed
@@ -257,8 +382,20 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
         }
     }
     match field_type(definition) {
-        "uuid" | "uint" | "int" | "float" | "string" | "bool" | "datetime" | "[1536]f16" => Ok(()),
-        value if value.starts_with('[') && value.ends_with("]f16") => Ok(()),
+        "uuid" | "uint" | "int" | "float" | "string" | "bool" | "datetime" | "[]uuid"
+        | "[]uint" | "[]int" | "[]float" | "[]string" | "[]bool" | "[]datetime" => Ok(()),
+        value
+            if value.starts_with('[')
+                && (value.ends_with("]f16") || value.ends_with("]f32"))
+                && value
+                    .trim_start_matches('[')
+                    .split(']')
+                    .next()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .is_some_and(|n| n > 0 && n <= 3072) =>
+        {
+            Ok(())
+        }
         _ => Err(format!("unsupported schema type for attribute {field}")),
     }
 }
@@ -302,7 +439,25 @@ fn validate_value(field: &str, value: &Value, definition: &Value) -> Result<(), 
         "float" => value.is_number(),
         "string" | "datetime" => value.is_string(),
         "bool" => value.is_boolean(),
-        vector if vector.starts_with('[') => {
+        "[]uuid" => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(|v| v.as_str().is_some_and(uuid_like))),
+        "[]uint" => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(|v| v.as_u64().is_some())),
+        "[]int" => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(|v| v.as_i64().is_some())),
+        "[]float" => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(Value::is_number)),
+        "[]string" | "[]datetime" => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(Value::is_string)),
+        "[]bool" => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(Value::is_boolean)),
+        vector if vector.ends_with("]f16") || vector.ends_with("]f32") => {
             let expected = vector
                 .trim_start_matches('[')
                 .split(']')

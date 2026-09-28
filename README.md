@@ -19,13 +19,14 @@ cargo run --release
 Use a dummy token and point your client's Turbopuffer base URL at `http://127.0.0.1:8787`:
 
 ```sh
+MINIFUGU_TOKEN=local-test
 curl -sS http://127.0.0.1:8787/v2/namespaces/demo \
-  -H 'Authorization: Bearer local-test' -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $MINIFUGU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"schema":{"id":"uint","title":{"type":"string","full_text_search":true},"vector":{"type":"[2]f16","ann":true}},"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"title":"small fugu","vector":[1,0]},{"id":2,"title":"blue whale","vector":[0,1]}]}'
 
 curl -sS http://127.0.0.1:8787/v2/namespaces/demo/query \
-  -H 'Authorization: Bearer local-test' -H 'Content-Type: application/json' \
-  -d '{"queries":[{"rank_by":["vector","ANN",[1,0]],"limit":2},{"rank_by":["title","BM25","fugu"],"limit":2}]}'
+  -H "Authorization: Bearer $MINIFUGU_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"queries":[{"rank_by":["vector","ANN",[1,0]],"limit":2},{"rank_by":["title","BM25","fugu"],"limit":2}],"rerank_by":["RRF"],"limit":2}'
 ```
 
 Set `MINIFUGU_LISTEN=0.0.0.0:8787` to listen on another address. The default binds localhost.
@@ -64,14 +65,14 @@ MiniFugu calls OpenAI's embeddings endpoint for native `embed` fields, using the
 
 | Route | Behavior |
 | --- | --- |
-| `POST /v2/namespaces/{name}` | Schema and cosine metric, row upserts, row patches, ID deletes, patch/delete by filter, affected IDs |
-| `POST /v2/namespaces/{name}/query` | Single and multiqueries, exact ANN, BM25, filters, ordering, `limit`/`top_k`, offset, attribute selection |
+| `POST /v2/namespaces/{name}` | Schema and cosine metric, row/column upserts and patches, conditional writes, ID deletes, patch/delete by filter, affected IDs, local copy/branch |
+| `POST /v2/namespaces/{name}/query` | Single and multiqueries, exact ANN and filtered kNN, BM25, RRF fusion, text filters, ranking expressions, ordering, `limit`/`top_k`, offset, attribute selection, computed BM25/vector scores, Count/Sum aggregations |
 | `DELETE /v2/namespaces/{name}` | Delete a namespace |
-| `GET /v1/namespaces` | List namespace IDs |
+| `GET /v1/namespaces` | List namespace IDs with prefix, cursor, and page size |
 | `GET/POST /v1/namespaces/{name}/schema` | Read and extend a schema |
 | `GET /v2/namespaces/{name}/metadata` | Read schema and local row count |
 
-Supported filters are `And`, `Or`, `Not`, `Eq`, `NotEq`, `In`, `Gte`, and `Lte`. Queries validate referenced attributes even when no rows match. Unsupported request fields return HTTP 400. This prevents a test from silently passing when MiniFugu cannot emulate the operation. See [API coverage](docs/api-coverage.md) for exact details.
+Supported filters include `And`, `Or`, `Not`, equality, `In`/`NotIn`, numeric/date ranges, array containment, and full-text token matching. Queries validate referenced attributes even when no rows match. Unsupported request fields return HTTP 400. This prevents a test from silently passing when MiniFugu cannot emulate the operation. See [API coverage](docs/api-coverage.md) for exact details and remaining gaps.
 
 ## Development and compatibility checks
 

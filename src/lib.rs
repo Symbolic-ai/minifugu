@@ -6,7 +6,7 @@ mod query;
 mod store;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
@@ -111,14 +111,32 @@ fn router_with_state(
 async fn list_namespaces(
     State(state): State<Shared>,
     headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     authorized(&headers)?;
+    let page_size = params.get("page_size").map_or(Ok(1000), |raw| {
+        raw.parse::<usize>().map_err(|_| bad("invalid page_size"))
+    })?;
+    if !(1..=1000).contains(&page_size) {
+        return Err(bad("page_size must be between 1 and 1000"));
+    }
     let guard = state.namespaces.read().await;
-    let mut names = guard.keys().collect::<Vec<_>>();
+    let mut names = guard
+        .keys()
+        .filter(|name| {
+            params
+                .get("prefix")
+                .is_none_or(|prefix| name.starts_with(prefix))
+        })
+        .filter(|name| params.get("cursor").is_none_or(|cursor| *name > cursor))
+        .collect::<Vec<_>>();
     names.sort();
-    Ok(Json(
-        json!({"namespaces": names.iter().map(|id| json!({"id":id})).collect::<Vec<_>>()}),
-    ))
+    let next_cursor = (names.len() > page_size).then(|| (*names[page_size - 1]).clone());
+    let mut response = json!({"namespaces": names.iter().take(page_size).map(|id| json!({"id":id})).collect::<Vec<_>>()});
+    if let Some(cursor) = next_cursor {
+        response["next_cursor"] = json!(cursor);
+    }
+    Ok(Json(response))
 }
 
 async fn get_schema(
@@ -211,11 +229,50 @@ async fn write(
         .ok_or_else(|| bad("write body must be an object"))?;
     store::validate_write_keys(object).map_err(bad)?;
     let mut guard = state.namespaces.write().await;
+    if let Some(source) = object
+        .get("branch_from_namespace")
+        .or_else(|| object.get("copy_from_namespace"))
+    {
+        if object.len() != 1 {
+            return Err(bad(
+                "namespace copy cannot be combined with other write fields",
+            ));
+        }
+        if source
+            .as_object()
+            .is_some_and(|config| config.len() != 1 || !config.contains_key("source_namespace"))
+        {
+            return Err(bad("only local source_namespace copies are supported"));
+        }
+        let source = source
+            .as_str()
+            .or_else(|| source.get("source_namespace").and_then(Value::as_str))
+            .ok_or_else(|| bad("copy source_namespace is required"))?;
+        namespace_name(source)?;
+        if guard.contains_key(&name) {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "destination namespace already exists".into(),
+            ));
+        }
+        let namespace = guard.get(source).cloned().ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                "source namespace does not exist".into(),
+            )
+        })?;
+        let rows = namespace.rows.len();
+        persist_namespace(&state, &mut guard, name, namespace)?;
+        return Ok(Json(
+            json!({"status":"OK","message":"success","rows_affected":rows,"billing":{"billable_logical_bytes_written":0}}),
+        ));
+    }
     if !guard.contains_key(&name)
         && body
             .get("upsert_rows")
             .and_then(Value::as_array)
             .is_none_or(Vec::is_empty)
+        && !object.contains_key("upsert_columns")
     {
         return Err(ApiError(
             StatusCode::NOT_FOUND,
