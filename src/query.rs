@@ -613,6 +613,27 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
     let op = parts[1]
         .as_str()
         .ok_or("filter operator must be a string")?;
+    let definition = &schema[field];
+    let full_text_search = definition.get("full_text_search") == Some(&Value::Bool(true));
+    let filterable = definition
+        .get("filterable")
+        .and_then(Value::as_bool)
+        .unwrap_or(!full_text_search);
+    if !filterable
+        && !matches!(
+            op,
+            "ContainsAllTokens"
+                | "ContainsAnyToken"
+                | "ContainsTokenSequence"
+                | "Glob"
+                | "NotGlob"
+                | "IGlob"
+                | "NotIGlob"
+                | "Regex"
+        )
+    {
+        return Err(format!("attribute {field} is not filterable"));
+    }
     if matches!(
         op,
         "Contains" | "NotContains" | "ContainsAny" | "NotContainsAny"
@@ -951,6 +972,12 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
                 return Err(format!(
                     "query vector has wrong dimensions for attribute {field}"
                 ));
+            }
+            if operator == "ANN"
+                && !field.starts_with("embed_")
+                && schema[field].get("ann") != Some(&Value::Bool(true))
+            {
+                return Err(format!("attribute {field} does not enable ANN"));
             }
             Ok(())
         }

@@ -321,6 +321,17 @@ async fn unsupported_fields_fail_loudly() {
     assert!(body["error"].as_str().unwrap().contains("upsert_condition"));
     let (status, body) = post(
         &client,
+        &ns,
+        json!({"schema":{"title":{"type":"string","fuzzy":true}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("unsupported schema option fuzzy"));
+    let (status, body) = post(
+        &client,
         &format!("{ns}/query"),
         json!({
             "rank_by":["id","asc"],"limit":1,"aggregate_by":{"count":["Count"]}
@@ -340,7 +351,7 @@ async fn column_writes_array_filters_and_group_limits_work() {
         &client,
         &ns,
         json!({
-        "schema":{"id":"uint","group":"string","tags":"[]string","score":"uint","vector":"[2]f32"},
+        "schema":{"id":"uint","group":"string","tags":"[]string","score":"uint","vector":{"type":"[2]f32","ann":true}},
             "distance_metric":"cosine_distance",
             "upsert_columns":{
                 "id":[1,2,3],"group":["a","a","b"],

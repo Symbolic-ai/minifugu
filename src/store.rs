@@ -333,6 +333,44 @@ pub(crate) fn known_field(schema: &Map<String, Value>, field: &str) -> bool {
 }
 
 fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
+    if let Some(config) = definition.as_object() {
+        for (option, value) in config {
+            match option.as_str() {
+                "type" if !value.is_string() => {
+                    return Err(format!(
+                        "schema option type must be a string for attribute {field}"
+                    ));
+                }
+                "filterable" | "ann" | "regex" | "glob" | "full_text_search"
+                    if !value.is_boolean() =>
+                {
+                    return Err(format!(
+                        "schema option {option} must be a boolean for attribute {field}"
+                    ));
+                }
+                "embed" if !value.is_object() => {
+                    return Err(format!(
+                        "schema option embed must be an object for attribute {field}"
+                    ));
+                }
+                "embed" => {
+                    if value.as_object().is_some_and(|embed| {
+                        embed
+                            .keys()
+                            .any(|key| !matches!(key.as_str(), "model" | "dims"))
+                    }) {
+                        return Err(format!("unsupported embed option for attribute {field}"));
+                    }
+                }
+                "type" | "filterable" | "ann" | "regex" | "glob" | "full_text_search" => {}
+                _ => {
+                    return Err(format!(
+                        "unsupported schema option {option} for attribute {field}"
+                    ))
+                }
+            }
+        }
+    }
     if let Some(embed) = definition.get("embed") {
         if !embed.get("model").is_some_and(Value::is_string)
             || !embed
