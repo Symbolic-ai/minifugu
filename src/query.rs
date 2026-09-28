@@ -148,6 +148,9 @@ impl Namespace {
         if object.contains_key("limit") && object.contains_key("top_k") {
             return Err("limit and top_k cannot be combined".into());
         }
+        if object.get("top_k").is_some_and(|value| !value.is_number()) {
+            return Err("top_k must be an integer".into());
+        }
         let limit = object.get("limit").or_else(|| object.get("top_k"));
         match limit {
             Some(Value::Number(n)) if n.as_u64().is_some_and(|v| v <= 10_000) => (),
@@ -156,8 +159,17 @@ impl Namespace {
                     .and_then(Value::as_u64)
                     .is_some_and(|n| n <= 10_000) =>
             {
+                if v.keys().any(|key| !matches!(key.as_str(), "total" | "per")) {
+                    return Err("unsupported limit field".into());
+                }
                 if let Some(per) = v.get("per") {
                     let per = per.as_object().ok_or("limit.per must be an object")?;
+                    if per
+                        .keys()
+                        .any(|key| !matches!(key.as_str(), "attributes" | "limit"))
+                    {
+                        return Err("unsupported limit.per field".into());
+                    }
                     let fields = per
                         .get("attributes")
                         .and_then(Value::as_array)
@@ -366,7 +378,15 @@ impl Namespace {
                 if !known_field(&self.schema, field) {
                     return Err(format!("attribute {field} does not exist in schema"));
                 }
+                if aggregates.contains_key(field) {
+                    return Err(format!(
+                        "aggregate name {field} conflicts with a group field"
+                    ));
+                }
             }
+        }
+        if object.contains_key("top_k") && !object.contains_key("group_by") {
+            return Err("top_k requires group_by for aggregation".into());
         }
         if object
             .get("top_k")
@@ -420,8 +440,26 @@ impl Namespace {
             .get("top_k")
             .and_then(Value::as_u64)
             .unwrap_or(10_000) as usize;
-        let groups = grouped
-            .into_values()
+        let mut groups = grouped.into_values().collect::<Vec<_>>();
+        groups.sort_by(|(left, _), (right, _)| {
+            for field in fields {
+                let field = field.as_str().unwrap();
+                let left = left.get(field).unwrap_or(&Value::Null);
+                let right = right.get(field).unwrap_or(&Value::Null);
+                let order = match (left.is_null(), right.is_null()) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    (false, false) => compare_values(left, right).unwrap_or(0).cmp(&0),
+                };
+                if order != std::cmp::Ordering::Equal {
+                    return order;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        let groups = groups
+            .into_iter()
             .take(limit)
             .map(|(mut attrs, rows)| {
                 attrs.extend(aggregate_values(aggregates, &rows));
@@ -651,9 +689,7 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
             return Err(format!("attribute {field} is not a text field"));
         }
         if !schema.get(field).is_some_and(|definition| {
-            definition
-                .get("full_text_search")
-                .is_some_and(|value| value == true || value.is_object())
+            definition.get("full_text_search") == Some(&Value::Bool(true))
         }) {
             return Err(format!(
                 "attribute {field} is not configured for full-text search"
@@ -754,16 +790,16 @@ pub(crate) fn filter_matches(filter: &Value, row: &Map<String, Value>) -> bool {
         "In" => right.as_array().unwrap().contains(left),
         "NotIn" => !right.as_array().unwrap().contains(left),
         "Contains" => left.as_array().is_some_and(|a| a.contains(right)),
-        "NotContains" => left.as_array().is_some_and(|a| !a.contains(right)),
+        "NotContains" => left.as_array().is_none_or(|a| !a.contains(right)),
         "ContainsAny" => left
             .as_array()
             .is_some_and(|a| a.iter().any(|v| right.as_array().unwrap().contains(v))),
         "NotContainsAny" => left
             .as_array()
-            .is_some_and(|a| a.iter().all(|v| !right.as_array().unwrap().contains(v))),
+            .is_none_or(|a| a.iter().all(|v| !right.as_array().unwrap().contains(v))),
         "Gt" => !left.is_null() && compare_values(left, right).is_some_and(|o| o > 0),
         "Gte" => !left.is_null() && compare_values(left, right).is_some_and(|o| o >= 0),
-        "Lt" => !left.is_null() && compare_values(left, right).is_some_and(|o| o < 0),
+        "Lt" => left.is_null() || compare_values(left, right).is_some_and(|o| o < 0),
         "Lte" => left.is_null() || compare_values(left, right).is_some_and(|o| o <= 0),
         "AnyGt" | "AnyGte" | "AnyLt" | "AnyLte" => left.as_array().is_some_and(|values| {
             values.iter().any(|value| match parts[1].as_str().unwrap() {
@@ -984,9 +1020,7 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
         "BM25" if parts.len() == 3 && parts[2].is_string() => {
             let definition = &schema[field];
             if !matches!(field_type(definition), "string" | "[]string")
-                || !definition
-                    .get("full_text_search")
-                    .is_some_and(|value| value == true || value.is_object())
+                || definition.get("full_text_search") != Some(&Value::Bool(true))
             {
                 return Err(format!("attribute {field} has no full-text index"));
             }
@@ -1136,7 +1170,6 @@ fn score_rank(
         "Eq" | "NotEq" | "In" | "NotIn" | "Gt" | "Gte" | "Lt" | "Lte" => {
             f64::from(filter_matches(rank, row))
         }
-        "asc" | "desc" => row.get(field).and_then(Value::as_f64).unwrap_or(0.0),
         _ => 0.0,
     }
 }

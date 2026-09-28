@@ -272,11 +272,7 @@ async fn write(
             .get("upsert_rows")
             .and_then(Value::as_array)
             .is_none_or(Vec::is_empty)
-        && body
-            .get("upsert_columns")
-            .and_then(|columns| columns.get("id"))
-            .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty)
+        && !object.contains_key("upsert_columns")
     {
         return Err(ApiError(
             StatusCode::NOT_FOUND,

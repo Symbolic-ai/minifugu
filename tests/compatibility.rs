@@ -332,9 +332,168 @@ async fn extended_contract(base: &str, token: &str) {
     );
     assert_eq!(product.1["rows"][0]["id"], 1);
     assert_eq!(copied.0, StatusCode::OK);
+    assert_eq!(copied.1["rows_affected"], 2);
+    assert!(copied.1.get("rows_upserted").is_none());
     assert_eq!(copied_query.1["rows"][0]["id"], 1);
     assert_eq!(copy_cleanup.status(), StatusCode::OK);
     assert_eq!(source_cleanup.status(), StatusCode::OK);
+}
+
+async fn grouping_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-grouping-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let write = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","grp":"string","gnum":"uint"},
+            "upsert_rows":[
+                {"id":1,"grp":"a","gnum":5},
+                {"id":2,"grp":"a","gnum":10},
+                {"id":3,"grp":"b","gnum":20},
+                {"id":4,"grp":"b","gnum":20}
+            ]
+        }),
+    )
+    .await;
+    let per_group = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["id","asc"],"limit":{"total":4,"per":{"attributes":["grp"],"limit":1}},
+            "include_attributes":["grp"]
+        }),
+    )
+    .await;
+    let ordered = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":[["grp","asc"],["id","desc"]],"limit":4
+        }),
+    )
+    .await;
+    let grouped = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "aggregate_by":{"count":["Count"]},"group_by":["gnum"],"top_k":2
+        }),
+    )
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(write.0, StatusCode::OK, "grouping write: {:?}", write.1);
+    assert_eq!(
+        per_group.0,
+        StatusCode::OK,
+        "per-group response: {:?}",
+        per_group.1
+    );
+    assert_eq!(
+        per_group.1["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| &row["id"])
+            .collect::<Vec<_>>(),
+        vec![&json!(1), &json!(3)]
+    );
+    assert_eq!(
+        ordered.0,
+        StatusCode::OK,
+        "ordering response: {:?}",
+        ordered.1
+    );
+    assert_eq!(
+        ordered.1["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| &row["id"])
+            .collect::<Vec<_>>(),
+        vec![&json!(2), &json!(1), &json!(4), &json!(3)]
+    );
+    assert_eq!(
+        grouped.0,
+        StatusCode::OK,
+        "grouped response: {:?}",
+        grouped.1
+    );
+    assert_eq!(
+        grouped.1["aggregation_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| &group["gnum"])
+            .collect::<Vec<_>>(),
+        vec![&json!(5), &json!(10)]
+    );
+    assert_eq!(cleanup.status(), StatusCode::OK);
+}
+
+async fn null_filter_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-null-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let write = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","n":"int","tags":"[]string"},
+            "upsert_rows":[
+                {"id":1,"n":null,"tags":null},
+                {"id":2,"n":5,"tags":["x"]},
+                {"id":3,"n":10,"tags":["y"]}
+            ]
+        }),
+    )
+    .await;
+    let mut results = Vec::new();
+    for filter in [
+        json!(["n", "Lt", 5]),
+        json!(["n", "Lte", 5]),
+        json!(["tags", "NotContains", "x"]),
+        json!(["tags", "NotContainsAny", ["x"]]),
+    ] {
+        let result = response(
+            &client,
+            token,
+            &format!("{url}/query"),
+            json!({
+                "rank_by":["id","asc"],"filters":filter,"limit":10
+            }),
+        )
+        .await;
+        results.push(result);
+    }
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(write.0, StatusCode::OK, "null fixture write: {:?}", write.1);
+    for (result, expected) in
+        results
+            .iter()
+            .zip([json!([1]), json!([1, 2]), json!([1, 3]), json!([1, 3])])
+    {
+        assert_eq!(
+            result.0,
+            StatusCode::OK,
+            "null filter response: {:?}",
+            result.1
+        );
+        let ids = result.1["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(Value::Array(ids), expected);
+    }
+    assert_eq!(cleanup.status(), StatusCode::OK);
 }
 
 async fn conditional_contract(base: &str, token: &str) {
@@ -430,6 +589,8 @@ async fn local_contract() {
     tokio::spawn(async move { axum::serve(listener, minifugu::router()).await.unwrap() });
     contract(&format!("http://{address}"), "dummy").await;
     extended_contract(&format!("http://{address}"), "dummy").await;
+    grouping_contract(&format!("http://{address}"), "dummy").await;
+    null_filter_contract(&format!("http://{address}"), "dummy").await;
     conditional_contract(&format!("http://{address}"), "dummy").await;
 }
 
@@ -443,5 +604,7 @@ async fn optional_real_turbopuffer_contract() {
     };
     contract(base.trim_end_matches('/'), &token).await;
     extended_contract(base.trim_end_matches('/'), &token).await;
+    grouping_contract(base.trim_end_matches('/'), &token).await;
+    null_filter_contract(base.trim_end_matches('/'), &token).await;
     conditional_contract(base.trim_end_matches('/'), &token).await;
 }

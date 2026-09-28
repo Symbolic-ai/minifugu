@@ -187,6 +187,13 @@ async fn failed_write_does_not_partially_change_rows() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, result) = post(
+        &client,
+        &format!("{ns}/query"),
+        json!({"rank_by":["id","asc"],"limit":10,"include_attributes":true}),
+    )
+    .await;
+    assert_eq!(result["rows"], json!([{"id":1,"tag":"old"}]));
 }
 
 #[tokio::test]
@@ -340,6 +347,43 @@ async fn unsupported_fields_fail_loudly() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].as_str().unwrap().contains("aggregation"));
+    for (query, expected) in [
+        (
+            json!({"rank_by":["id","asc"],"top_k":{"total":1,"per":{"attributes":["title"],"limit":1}},"include_attributes":["title"]}),
+            "top_k must",
+        ),
+        (
+            json!({"rank_by":["id","asc"],"limit":{"total":1,"extra":true}}),
+            "unsupported limit field",
+        ),
+        (
+            json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["title"],"limit":1,"extra":true}},"include_attributes":["title"]}),
+            "unsupported limit.per field",
+        ),
+        (
+            json!({"aggregate_by":{"count":["Count"]},"top_k":1}),
+            "top_k requires group_by",
+        ),
+        (
+            json!({"aggregate_by":{"title":["Count"]},"group_by":["title"],"top_k":1}),
+            "conflicts with a group field",
+        ),
+    ] {
+        let (status, body) = post(&client, &format!("{ns}/query"), query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains(expected), "{body}");
+    }
+    let (status, body) = post(
+        &client,
+        &format!("{base}/bad-columns"),
+        json!({"upsert_columns":{"title":["x"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("columns require an id array"));
 }
 
 #[tokio::test]
