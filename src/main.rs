@@ -20,7 +20,12 @@ async fn main() {
         Ok("deterministic") | Err(_) => minifugu::EmbeddingMode::Deterministic,
         Ok(_) => panic!("MINIFUGU_EMBEDDING_PROVIDER must be deterministic or openai"),
     };
-    axum::serve(listener, minifugu::router_with_mode(embedding))
-        .await
-        .unwrap();
+    let router = match std::env::var("MINIFUGU_DATA_DIR") {
+        Ok(directory) => {
+            minifugu::router_with_data_dir(embedding, std::path::Path::new(&directory))
+                .expect("failed to open MiniFugu data directory")
+        }
+        Err(_) => minifugu::router_with_mode(embedding),
+    };
+    axum::serve(listener, router).await.unwrap();
 }

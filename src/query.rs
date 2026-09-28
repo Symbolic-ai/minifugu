@@ -27,8 +27,23 @@ impl Namespace {
 
     fn validate_query(&self, body: &Value) -> Result<(), String> {
         let object = body.as_object().ok_or("subquery must be an object")?;
-        let rank = object.get("rank_by").ok_or("rank_by is required")?;
-        validate_rank(rank, &self.schema)?;
+        for key in object.keys() {
+            if !matches!(
+                key.as_str(),
+                "rank_by"
+                    | "filters"
+                    | "include_attributes"
+                    | "exclude_attributes"
+                    | "limit"
+                    | "top_k"
+                    | "offset"
+            ) {
+                return Err(format!("unsupported query field {key}"));
+            }
+        }
+        if let Some(rank) = object.get("rank_by") {
+            validate_rank(rank, &self.schema)?;
+        }
         if let Some(filter) = object.get("filters") {
             validate_filter(filter, &self.schema)?;
         }
@@ -47,18 +62,38 @@ impl Namespace {
                 }
             }
         }
-        match object.get("limit") {
+        if let Some(exclude) = object.get("exclude_attributes") {
+            let fields = exclude
+                .as_array()
+                .ok_or("exclude_attributes must be an array")?;
+            if fields.iter().any(|field| !field.is_string()) {
+                return Err("exclude_attributes entries must be strings".into());
+            }
+        }
+        if object.contains_key("include_attributes") && object.contains_key("exclude_attributes") {
+            return Err("include_attributes and exclude_attributes cannot be combined".into());
+        }
+        let limit = object.get("limit").or_else(|| object.get("top_k"));
+        match limit {
             Some(Value::Number(n)) if n.as_u64().is_some_and(|v| v <= 10_000) => (),
-            _ => return Err("limit must be an integer at most 10000".into()),
+            Some(Value::Object(v))
+                if v.get("type") == Some(&json!("rows"))
+                    && v.get("value")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|n| n <= 10_000) => {}
+            _ => return Err("limit or top_k must be an integer at most 10000".into()),
+        }
+        if object.get("offset").is_some_and(|v| v.as_u64().is_none()) {
+            return Err("offset must be a nonnegative integer".into());
         }
         Ok(())
     }
 
     fn execute_query(&self, body: &Value) -> Value {
         let object = body.as_object().unwrap();
-        let rank = &object["rank_by"];
+        let rank = object.get("rank_by");
         let filter = object.get("filters");
-        let ascending = is_ann(rank) || is_ascending(rank);
+        let ascending = rank.is_none_or(|rank| is_ann(rank) || is_ascending(rank));
         let mut scored = self
             .rows
             .values()
@@ -66,8 +101,10 @@ impl Namespace {
                 if filter.is_some_and(|f| !filter_matches(f, row)) {
                     return None;
                 }
-                let score = score_rank(rank, row, &self.rows);
-                if !score.is_finite() || (!is_ascending(rank) && score <= 0.0 && !is_ann(rank)) {
+                let score = rank.map_or(0.0, |rank| score_rank(rank, row, &self.rows));
+                if !score.is_finite()
+                    || rank.is_some_and(|rank| !is_ascending(rank) && score <= 0.0 && !is_ann(rank))
+                {
                     return None;
                 }
                 Some((score, row))
@@ -79,7 +116,14 @@ impl Namespace {
                 .then_with(|| row_a["id"].to_string().cmp(&row_b["id"].to_string()))
         });
         let offset = object.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let limit = object["limit"].as_u64().unwrap() as usize;
+        let limit = object
+            .get("limit")
+            .or_else(|| object.get("top_k"))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.get("value").and_then(Value::as_u64))
+            })
+            .unwrap() as usize;
         let rows = scored
             .into_iter()
             .skip(offset)
@@ -103,7 +147,14 @@ impl Namespace {
                     }
                     _ => (),
                 }
-                if !is_ascending(rank) {
+                if let Some(Value::Array(fields)) = object.get("exclude_attributes") {
+                    for (field, value) in row {
+                        if field != "id" && !fields.contains(&Value::String(field.clone())) {
+                            result.insert(field.clone(), value.clone());
+                        }
+                    }
+                }
+                if rank.is_some_and(|rank| !is_ascending(rank)) {
                     result.insert("$dist".into(), json!(score));
                 }
                 Value::Object(result)
@@ -115,12 +166,15 @@ impl Namespace {
 
 pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Result<(), String> {
     let parts = filter.as_array().ok_or("filter must be an array")?;
-    if parts.len() == 2 && parts[0] == "And" {
-        let children = parts[1].as_array().ok_or("And requires an array")?;
+    if parts.len() == 2 && (parts[0] == "And" || parts[0] == "Or") {
+        let children = parts[1].as_array().ok_or("And/Or requires an array")?;
         for child in children {
             validate_filter(child, schema)?;
         }
         return Ok(());
+    }
+    if parts.len() == 2 && parts[0] == "Not" {
+        return validate_filter(&parts[1], schema);
     }
     if parts.len() != 3 {
         return Err("filter must have three elements".into());
@@ -145,11 +199,20 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
 pub(crate) fn filter_matches(filter: &Value, row: &Map<String, Value>) -> bool {
     let parts = filter.as_array().unwrap();
     if parts.len() == 2 {
-        return parts[1]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|f| filter_matches(f, row));
+        return match parts[0].as_str().unwrap() {
+            "And" => parts[1]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|f| filter_matches(f, row)),
+            "Or" => parts[1]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| filter_matches(f, row)),
+            "Not" => !filter_matches(&parts[1], row),
+            _ => false,
+        };
     }
     let field = parts[0].as_str().unwrap();
     let left = row.get(field).unwrap_or(&Value::Null);

@@ -1,92 +1,90 @@
-# MiniFugu
+<p align="center"><img src="assets/logo.svg" alt="MiniFugu pixel-art fish logo" width="160"></p>
+<h1 align="center">MiniFugu</h1>
+<p align="center">A small, persistent, keyless Turbopuffer API emulator in Rust.</p>
+<p align="center"><a href="https://github.com/Symbolic-ai/minifugu/actions/workflows/ci.yml"><img src="https://github.com/Symbolic-ai/minifugu/actions/workflows/ci.yml/badge.svg" alt="CI"></a> <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a> <img src="https://img.shields.io/badge/Rust-1.98%2B-orange.svg" alt="Rust 1.98 or newer"></p>
 
-MiniFugu is a small, MIT licensed Rust HTTP emulator for a useful subset of the [Turbopuffer](https://turbopuffer.com/docs/api-overview) v2 API. It is intended for local development and contract tests. It accepts any nonempty bearer token, so ordinary tests need no Turbopuffer account.
+MiniFugu lets local apps and CI exercise real HTTP writes, schema validation, filters, vector search, and text search without a Turbopuffer account. It ranks small collections with **exact cosine distance** and **BM25**. It accepts any nonempty bearer token; no network service or API key is needed in its default mode.
 
-It stores rows in memory, validates query fields against namespace schemas, and runs actual exact cosine and BM25 ranking over small datasets. A missing field returns HTTP 400 even if a filter would otherwise match no rows. That catches schema mistakes hidden by mocked client responses.
+MiniFugu is an independent open source project and is not affiliated with Turbopuffer. See [API coverage](docs/api-coverage.md) for precise compatibility and known differences.
 
-## Start
+## Quick start
 
 Requires Rust 1.98 or newer.
 
 ```sh
-cargo run
-# listening on http://127.0.0.1:8787
+cargo run --release
+# http://127.0.0.1:8787
 ```
 
-Set `MINIFUGU_LISTEN=0.0.0.0:8787` to change the listen address. Each process starts with an empty store; stopping it removes all namespaces and rows.
+Use a dummy token and point your client's Turbopuffer base URL at `http://127.0.0.1:8787`:
 
 ```sh
 curl -sS http://127.0.0.1:8787/v2/namespaces/demo \
-  -H 'Authorization: Bearer dummy' -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer local-test' -H 'Content-Type: application/json' \
   -d '{"schema":{"id":"uint","title":{"type":"string","full_text_search":true},"vector":{"type":"[2]f16","ann":true}},"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"title":"small fugu","vector":[1,0]},{"id":2,"title":"blue whale","vector":[0,1]}]}'
 
 curl -sS http://127.0.0.1:8787/v2/namespaces/demo/query \
-  -H 'Authorization: Bearer dummy' -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer local-test' -H 'Content-Type: application/json' \
   -d '{"queries":[{"rank_by":["vector","ANN",[1,0]],"limit":2},{"rank_by":["title","BM25","fugu"],"limit":2}]}'
 ```
 
-The base URL is `http://127.0.0.1:8787`. Point your client at it and use any dummy token. For example, configure a client whose default URL is `https://aws-us-west-2.turbopuffer.com` to use MiniFugu's base URL in tests.
+Set `MINIFUGU_LISTEN=0.0.0.0:8787` to listen on another address. The default binds localhost.
+
+## Keep data across restarts
+
+Set `MINIFUGU_DATA_DIR` to store all namespaces in a local JSON snapshot:
+
+```sh
+MINIFUGU_DATA_DIR="$HOME/.local/share/minifugu" cargo run --release
+```
+
+Writes use a temporary file, file sync, and rename before the HTTP request succeeds. On startup, a corrupt snapshot stops the server instead of clearing data. On Unix, MiniFugu sets the data directory to `0700` and the snapshot file to `0600`. This is intended for a single small local instance; it does not provide concurrent process access, sharding, or large-scale indexing. Leave the variable unset for an empty in-memory store on every start.
 
 ## Embeddings
 
-Rows with explicit vector attributes are ranked by exact cosine distance. For schemas with a native `embed` field, MiniFugu creates an `embed_<field>` vector when writing text. For example:
+Explicit vector fields work offline. A schema can also ask MiniFugu to generate an `embed_<field>` vector from text:
 
 ```json
 {"content":{"type":"string","full_text_search":true,"embed":{"model":"openai/text-embedding-3-small","dims":1536}}}
 ```
 
-The default embedding mode uses deterministic token hashing. It makes CI keyless and reproducible. It is useful for API behavior tests, but its vectors are **not semantic embeddings**. For an offline query, use `minifugu::deterministic_embedding(query, dims)` to produce a vector in the same space.
+The default provider hashes tokens deterministically. This keeps CI reproducible and keyless; these vectors are **not semantic embeddings**. For a local query, `minifugu::deterministic_embedding(query, dims)` produces a vector in the same space.
 
-For real semantic embeddings, opt in to OpenAI mode:
+For semantic embeddings, opt in to OpenAI:
 
 ```sh
 export MINIFUGU_EMBEDDING_PROVIDER=openai
-export OPENAI_API_KEY=... # load from your secret manager; never commit the value
-cargo run
+export OPENAI_API_KEY="$(your-secret-manager-command)"
+cargo run --release
 ```
 
-This sends text in native `embed` fields to OpenAI's `/v1/embeddings` endpoint using the model named in the schema. Symbolic currently uses `openai/text-embedding-3-small` with 1536 dimensions for its external chunks. The querying client must provide a vector produced by the same model. The endpoint can be changed with `MINIFUGU_OPENAI_BASE_URL` for a local test server. No provider call occurs when writing explicit vectors. See [OpenAI's embedding guide](https://developers.openai.com/api/docs/guides/embeddings).
+MiniFugu calls OpenAI's embeddings endpoint for native `embed` fields, using the schema model and dimensions. `MINIFUGU_OPENAI_BASE_URL` can point at a compatible local test server. The querying client supplies a vector from the same model. Explicit vectors never make provider calls. [OpenAI's embedding guide](https://developers.openai.com/api/docs/guides/embeddings) documents the model and endpoint.
 
-## Supported API
+## API surface
 
-| Endpoint or feature | Behavior |
+| Route | Behavior |
 | --- | --- |
-| `POST /v2/namespaces/:namespace` | Atomic upserts, ID deletes, delete by filter, schema declarations, cosine distance metric, `rows_affected` |
-| `POST /v2/namespaces/:namespace/query` | Single and multi-query responses, `rows`, `$dist`, `include_attributes`, `limit`, `offset` |
-| `DELETE /v2/namespaces/:namespace` | Removes a namespace and all its rows |
-| Filters | `And`, `Eq`, `NotEq`, `In`, `Gte`, `Lte`; RFC 3339 timestamps compare as instants |
-| Ranking | Exact cosine for `ANN`; BM25 on full-text fields; `Sum` and weighted `Product` of BM25 clauses |
-| Errors | JSON `{ "status": "error", "error": "..." }`; missing bearer token 401, missing namespace 404, invalid schema/query 400 |
+| `POST /v2/namespaces/{name}` | Schema and cosine metric, row upserts, row patches, ID deletes, patch/delete by filter, affected IDs |
+| `POST /v2/namespaces/{name}/query` | Single and multiqueries, exact ANN, BM25, filters, ordering, `limit`/`top_k`, offset, attribute selection |
+| `DELETE /v2/namespaces/{name}` | Delete a namespace |
+| `GET /v1/namespaces` | List namespace IDs |
+| `GET/POST /v1/namespaces/{name}/schema` | Read and extend a schema |
+| `GET /v2/namespaces/{name}/metadata` | Read schema and local row count |
 
-The write endpoint accepts `uint`, `uuid`, `string`, `bool`, `datetime`, numeric, and fixed-length f16 vector schemas. It infers simple scalar fields when no declaration is supplied. Namespace state is isolated by name.
+Supported filters are `And`, `Or`, `Not`, `Eq`, `NotEq`, `In`, `Gte`, and `Lte`. Queries validate referenced attributes even when no rows match. Unsupported request fields return HTTP 400. This prevents a test from silently passing when MiniFugu cannot emulate the operation. See [API coverage](docs/api-coverage.md) for exact details.
 
-## Known differences
-
-- Exact cosine replaces Turbopuffer's approximate ANN. This is appropriate for small fixtures, not performance comparisons.
-- BM25 uses a simple Unicode alphanumeric tokenizer. It has no stemming, language-specific segmentation, or Turbopuffer index tuning, so scores and some ranks differ.
-- Default native embeddings are deterministic hashes. OpenAI mode uses real embeddings but still has no Turbopuffer index behavior.
-- State is in memory only. There is no disk persistence, sharding, cache, durability, rate limiting, or production-scale indexing.
-- Unsupported operations include patching, aggregations, RRF server-side reranking, `Or`/`Not` filters, namespace metadata, and export. They are not needed by the current contract suite.
-- Error wording is not byte-for-byte compatible. Tests should assert status and `status`/`error` shape, plus the relevant field name.
-
-## Test
+## Development and compatibility checks
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --locked
 ```
 
-`tests/compatibility.rs` runs the same disposable-namespace contract against MiniFugu and, when both environment variables are set, the real service:
+All ordinary tests are local and keyless. `tests/compatibility.rs` can also run its disposable synthetic namespace against a real Turbopuffer development account when `TURBOPUFFER_BASE_URL` and `TURBOPUFFER_API_KEY` are set. It deletes the test namespace when finished. `tests/openai_live.rs` similarly requires `MINIFUGU_LIVE_OPENAI=1` and `OPENAI_API_KEY`. Neither live test runs in CI.
 
-```sh
-TURBOPUFFER_BASE_URL=https://aws-us-west-2.turbopuffer.com \
-TURBOPUFFER_API_KEY=<load-from-secret-manager> \
-cargo test --test compatibility optional_real_turbopuffer_contract
-```
-
-The compatibility test deletes its namespace before asserting results. It writes only synthetic rows and uses a fresh random name. For a separate live OpenAI smoke test, set `MINIFUGU_LIVE_OPENAI=1` and `OPENAI_API_KEY`, then run `cargo test --test openai_live`. Ordinary CI runs have neither live-test flag and never call Turbopuffer or OpenAI.
+Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Please report security issues privately as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
-[MIT](LICENSE). MiniFugu is an independent test tool and is not affiliated with Turbopuffer.
+The software and documentation are [MIT licensed](LICENSE). The MiniFugu logo is separate project artwork; see [assets/README.md](assets/README.md).

@@ -1,9 +1,10 @@
 use crate::embedding::EmbeddingMode;
 use crate::query::{filter_matches, validate_filter};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Namespace {
     pub(crate) schema: Map<String, Value>,
     pub(crate) rows: BTreeMap<String, Map<String, Value>>,
@@ -34,6 +35,7 @@ impl Namespace {
         embedder: &EmbeddingMode,
     ) -> Result<Value, WriteError> {
         let object = body.as_object().ok_or("write body must be an object")?;
+        validate_write_keys(object)?;
         if let Some(schema) = object.get("schema") {
             let schema = schema.as_object().ok_or("schema must be an object")?;
             for (field, definition) in schema {
@@ -64,18 +66,65 @@ impl Namespace {
             }
             self.distance_metric = Some(metric.into());
         }
-        let mut affected = 0;
+        let mut upserted_ids = Vec::new();
+        let mut patched_ids = Vec::new();
+        let mut deleted_ids = Vec::new();
         if let Some(filter) = object.get("delete_by_filter") {
             validate_filter(filter, &self.schema)?;
-            let old_count = self.rows.len();
-            self.rows.retain(|_, row| !filter_matches(filter, row));
-            affected += old_count - self.rows.len();
+            self.rows.retain(|_, row| {
+                if filter_matches(filter, row) {
+                    deleted_ids.push(row["id"].clone());
+                    false
+                } else {
+                    true
+                }
+            });
         }
         if let Some(deletes) = object.get("deletes") {
             let deletes = deletes.as_array().ok_or("deletes must be an array")?;
             for id in deletes {
                 if self.rows.remove(&id_key(id)?).is_some() {
-                    affected += 1;
+                    deleted_ids.push(id.clone());
+                }
+            }
+        }
+        if let Some(patch) = object.get("patch_by_filter") {
+            let patch = patch
+                .as_object()
+                .ok_or("patch_by_filter must be an object")?;
+            let filter = patch
+                .get("filters")
+                .ok_or("patch_by_filter requires filters")?;
+            let values = patch
+                .get("patch")
+                .and_then(Value::as_object)
+                .ok_or("patch_by_filter requires a patch object")?;
+            validate_filter(filter, &self.schema)?;
+            self.validate_patch(values)?;
+            for row in self.rows.values_mut() {
+                if filter_matches(filter, row) {
+                    for (field, value) in values {
+                        row.insert(field.clone(), value.clone());
+                    }
+                    patched_ids.push(row["id"].clone());
+                }
+            }
+        }
+        if let Some(rows) = object.get("patch_rows") {
+            for patch in rows.as_array().ok_or("patch_rows must be an array")? {
+                let patch = patch
+                    .as_object()
+                    .ok_or("each patch row must be an object")?;
+                let id = patch.get("id").ok_or("patch row requires id")?;
+                validate_id(id, self.schema.get("id"))?;
+                self.validate_patch(patch)?;
+                if let Some(row) = self.rows.get_mut(&id_key(id)?) {
+                    for (field, value) in patch {
+                        if field != "id" {
+                            row.insert(field.clone(), value.clone());
+                        }
+                    }
+                    patched_ids.push(id.clone());
                 }
             }
         }
@@ -116,11 +165,66 @@ impl Namespace {
                     }
                 }
                 self.rows.insert(id_key(&id)?, row);
-                affected += 1;
+                upserted_ids.push(id);
             }
         }
-        Ok(json!({"rows_affected": affected}))
+        let mut result = json!({
+            "status":"OK", "message":"success",
+            "rows_affected": upserted_ids.len() + patched_ids.len() + deleted_ids.len(),
+            "rows_upserted": upserted_ids.len(),
+            "rows_patched": patched_ids.len(),
+            "rows_deleted": deleted_ids.len(),
+            "billing":{"billable_logical_bytes_written":0}
+        });
+        if object.get("return_affected_ids") == Some(&Value::Bool(true)) {
+            if !upserted_ids.is_empty() {
+                result["upserted_ids"] = json!(upserted_ids);
+            }
+            if !patched_ids.is_empty() {
+                result["patched_ids"] = json!(patched_ids);
+            }
+            if !deleted_ids.is_empty() {
+                result["deleted_ids"] = json!(deleted_ids);
+            }
+        }
+        Ok(result)
     }
+
+    fn validate_patch(&self, values: &Map<String, Value>) -> Result<(), WriteError> {
+        for (field, value) in values {
+            if field == "id" {
+                continue;
+            }
+            let definition = self
+                .schema
+                .get(field)
+                .ok_or_else(|| format!("attribute {field} does not exist in schema"))?;
+            if has_embed(definition) {
+                return Err(format!("patching embedded attribute {field} is unsupported").into());
+            }
+            validate_value(field, value, definition)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_write_keys(object: &Map<String, Value>) -> Result<(), String> {
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "schema"
+                | "distance_metric"
+                | "delete_by_filter"
+                | "deletes"
+                | "patch_by_filter"
+                | "patch_rows"
+                | "upsert_rows"
+                | "return_affected_ids"
+        ) {
+            return Err(format!("unsupported write field {key}"));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn field_type(definition: &Value) -> &str {

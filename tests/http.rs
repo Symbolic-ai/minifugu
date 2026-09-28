@@ -168,3 +168,111 @@ async fn bearer_is_required_and_errors_have_api_shape() {
     assert_eq!(body["status"], "error");
     assert!(body["error"].is_string());
 }
+
+#[tokio::test]
+async fn patches_filters_and_namespace_inspection_work() {
+    let base = server().await;
+    let client = Client::new();
+    let origin = base.trim_end_matches("/v2/namespaces");
+    let ns = format!("{base}/inspection");
+    let (status, result) = post(
+        &client,
+        &ns,
+        json!({
+            "schema":{"id":"uint","tag":"string","count":"uint"},
+            "upsert_rows":[{"id":1,"tag":"fugu","count":1},{"id":2,"tag":"fish","count":2}],
+            "return_affected_ids":true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["status"], "OK");
+    assert_eq!(result["upserted_ids"], json!([1, 2]));
+
+    let (status, result) = post(
+        &client,
+        &ns,
+        json!({
+            "patch_rows":[{"id":1,"count":3}],
+            "patch_by_filter":{"filters":["tag","Eq","fish"],"patch":{"count":4}},
+            "return_affected_ids":true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows_patched"], 2);
+    assert_eq!(result["patched_ids"], json!([2, 1]));
+
+    let (status, result) = post(
+        &client,
+        &format!("{ns}/query"),
+        json!({
+            "filters":["Or",[["tag","Eq","fugu"],["Not",["count","Lte",3]]]],
+            "top_k":2,"exclude_attributes":["tag"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"].as_array().unwrap().len(), 2);
+    assert!(result["rows"][0].get("tag").is_none());
+
+    let response = client
+        .get(format!("{origin}/v1/namespaces"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["namespaces"][0]["id"], "inspection");
+
+    let url = format!("{origin}/v2/namespaces/inspection/metadata");
+    let response = client.get(url).bearer_auth("dummy").send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["approx_row_count"], 2);
+    assert_eq!(body["schema"]["tag"], "string");
+
+    let url = format!("{origin}/v1/namespaces/inspection/schema");
+    let response = client.get(&url).bearer_auth("dummy").send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = client
+        .post(&url)
+        .bearer_auth("dummy")
+        .json(&json!({"new":"string"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["new"], "string");
+}
+
+#[tokio::test]
+async fn unsupported_fields_fail_loudly() {
+    let base = server().await;
+    let client = Client::new();
+    let ns = format!("{base}/unsupported");
+    let (status, body) = post(&client, &ns, json!({"upsert_columns":{"id":[1]}})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["status"], "error");
+    post(
+        &client,
+        &ns,
+        json!({"upsert_rows":[{"id":1,"title":"fugu"}]}),
+    )
+    .await;
+    let (status, body) = post(&client, &ns, json!({"upsert_columns":{"id":[2]}})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("upsert_columns"));
+    let (status, body) = post(
+        &client,
+        &format!("{ns}/query"),
+        json!({
+            "rank_by":["id","asc"],"limit":1,"aggregate_by":{"count":["Count"]}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("aggregate_by"));
+}
