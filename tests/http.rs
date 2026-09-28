@@ -253,7 +253,7 @@ async fn unsupported_fields_fail_loudly() {
     let base = server().await;
     let client = Client::new();
     let ns = format!("{base}/unsupported");
-    let (status, body) = post(&client, &ns, json!({"upsert_columns":{"id":[1]}})).await;
+    let (status, body) = post(&client, &ns, json!({"upsert_condition":["id","Eq",1]})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["status"], "error");
     post(
@@ -262,9 +262,9 @@ async fn unsupported_fields_fail_loudly() {
         json!({"upsert_rows":[{"id":1,"title":"fugu"}]}),
     )
     .await;
-    let (status, body) = post(&client, &ns, json!({"upsert_columns":{"id":[2]}})).await;
+    let (status, body) = post(&client, &ns, json!({"upsert_condition":["id","Eq",2]})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body["error"].as_str().unwrap().contains("upsert_columns"));
+    assert!(body["error"].as_str().unwrap().contains("upsert_condition"));
     let (status, body) = post(
         &client,
         &format!("{ns}/query"),
@@ -274,5 +274,209 @@ async fn unsupported_fields_fail_loudly() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body["error"].as_str().unwrap().contains("aggregate_by"));
+    assert!(body["error"].as_str().unwrap().contains("aggregation"));
+}
+
+#[tokio::test]
+async fn column_writes_array_filters_and_group_limits_work() {
+    let base = server().await;
+    let client = Client::new();
+    let ns = format!("{base}/columns");
+    let (status, write) = post(
+        &client,
+        &ns,
+        json!({
+        "schema":{"id":"uint","group":"string","tags":"[]string","score":"uint","vector":"[2]f32"},
+            "distance_metric":"cosine_distance",
+            "upsert_columns":{
+                "id":[1,2,3],"group":["a","a","b"],
+            "tags":[["fugu","fish"],["whale"],["fugu"]],"score":[3,5,7],
+                "vector":[[1,0],[0,1],[1,1]]
+            },
+            "return_affected_ids":true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(write["upserted_ids"], json!([1, 2, 3]));
+
+    let (status, patch) = post(
+        &client,
+        &ns,
+        json!({
+            "patch_columns":{"id":[2],"tags":[["fugu","whale"]]},
+            "return_affected_ids":true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(patch["patched_ids"], json!([2]));
+
+    let (status, result) = post(
+        &client,
+        &format!("{ns}/query"),
+        json!({
+            "rank_by":["id","asc"],"filters":["And",[
+                ["tags","Contains","fugu"],["id","Gt",0],["id","Lt",4]
+            ]],"limit":{"total":3,"per":{"attributes":["group"],"limit":1}},
+            "include_attributes":["tags","group"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(result["rows"][0]["id"], 1);
+    assert_eq!(result["rows"][1]["id"], 3);
+
+    let (status, error) = post(
+        &client,
+        &format!("{ns}/query"),
+        json!({
+            "rank_by":["id","asc"],
+            "limit":{"total":3,"per":{"attributes":["group"],"limit":1}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error["error"].as_str().unwrap().contains("group"));
+
+    let (status, result) = post(&client, &format!("{ns}/query"), json!({
+        "rank_by":["vector","ANN",[0.0,1.0]],"filters":["tags","ContainsAny",["whale"]],"top_k":1
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"][0]["id"], 2);
+
+    let (status, aggregate) = post(
+        &client,
+        &format!("{ns}/query"),
+        json!({
+            "aggregate_by":{"count":["Count"],"sum":["Sum","score"]}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(aggregate["aggregations"], json!({"count":3,"sum":15}));
+    let (status, grouped) = post(
+        &client,
+        &format!("{ns}/query"),
+        json!({
+            "aggregate_by":{"count":["Count"],"sum":["Sum","score"]},
+            "group_by":["group"],"top_k":2
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        grouped["aggregation_groups"],
+        json!([
+            {"group":"a","count":2,"sum":8},{"group":"b","count":1,"sum":7}
+        ])
+    );
+    let (status, ordered) = post(
+        &client,
+        &format!("{ns}/query"),
+        json!({
+            "rank_by":[["group","asc"],["id","desc"]],"limit":3
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        ordered["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![2, 1, 3]
+    );
+}
+
+#[tokio::test]
+async fn namespaces_can_be_copied_and_then_diverge() {
+    let base = server().await;
+    let client = Client::new();
+    let source = format!("{base}/source");
+    let branch = format!("{base}/branch");
+    let copy = format!("{base}/copy");
+    post(
+        &client,
+        &source,
+        json!({"upsert_rows":[{"id":1,"title":"fugu"}]}),
+    )
+    .await;
+    let (status, result) = post(&client, &branch, json!({"branch_from_namespace":"source"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows_affected"], 1);
+    let (status, _) = post(
+        &client,
+        &copy,
+        json!({"copy_from_namespace":{"source_namespace":"source"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    post(
+        &client,
+        &branch,
+        json!({"upsert_rows":[{"id":2,"title":"branch only"}]}),
+    )
+    .await;
+    let (_, source_rows) = post(
+        &client,
+        &format!("{source}/query"),
+        json!({"rank_by":["id","asc"],"limit":10}),
+    )
+    .await;
+    let (_, branch_rows) = post(
+        &client,
+        &format!("{branch}/query"),
+        json!({"rank_by":["id","asc"],"limit":10}),
+    )
+    .await;
+    let (_, copy_rows) = post(
+        &client,
+        &format!("{copy}/query"),
+        json!({"rank_by":["id","asc"],"limit":10}),
+    )
+    .await;
+    assert_eq!(source_rows["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(copy_rows["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(branch_rows["rows"].as_array().unwrap().len(), 2);
+    let (status, _) = post(&client, &branch, json!({"branch_from_namespace":"source"})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let origin = base.trim_end_matches("/v2/namespaces");
+    let first: Value = client
+        .get(format!("{origin}/v1/namespaces?page_size=2"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first["namespaces"].as_array().unwrap().len(), 2);
+    assert!(first["next_cursor"].is_string());
+    let second: Value = client
+        .get(format!(
+            "{origin}/v1/namespaces?page_size=2&cursor={}",
+            first["next_cursor"].as_str().unwrap()
+        ))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second["namespaces"].as_array().unwrap().len(), 1);
+    let prefix: Value = client
+        .get(format!("{origin}/v1/namespaces?prefix=bra"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(prefix["namespaces"][0]["id"], "branch");
 }

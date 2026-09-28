@@ -55,11 +55,9 @@ impl Namespace {
                     "only cosine_distance is supported".into(),
                 ));
             }
-            if !self
-                .schema
-                .values()
-                .any(|v| field_type(v).starts_with('[') || has_embed(v))
-            {
+            if !self.schema.values().any(|v| {
+                field_type(v).ends_with("]f16") || field_type(v).ends_with("]f32") || has_embed(v)
+            }) {
                 return Err(WriteError::Invalid(
                     "distance_metric requires a vector attribute".into(),
                 ));
@@ -110,8 +108,8 @@ impl Namespace {
                 }
             }
         }
-        if let Some(rows) = object.get("patch_rows") {
-            for patch in rows.as_array().ok_or("patch_rows must be an array")? {
+        if let Some(rows) = write_rows(object, "patch_rows", "patch_columns")? {
+            for patch in &rows {
                 let patch = patch
                     .as_object()
                     .ok_or("each patch row must be an object")?;
@@ -128,9 +126,8 @@ impl Namespace {
                 }
             }
         }
-        if let Some(rows) = object.get("upsert_rows") {
-            let rows = rows.as_array().ok_or("upsert_rows must be an array")?;
-            for row in rows {
+        if let Some(rows) = write_rows(object, "upsert_rows", "upsert_columns")? {
+            for row in &rows {
                 let mut row = row
                     .as_object()
                     .ok_or("each upsert row must be an object")?
@@ -218,13 +215,55 @@ pub(crate) fn validate_write_keys(object: &Map<String, Value>) -> Result<(), Str
                 | "deletes"
                 | "patch_by_filter"
                 | "patch_rows"
+                | "patch_columns"
                 | "upsert_rows"
+                | "upsert_columns"
                 | "return_affected_ids"
+                | "branch_from_namespace"
+                | "copy_from_namespace"
         ) {
             return Err(format!("unsupported write field {key}"));
         }
     }
     Ok(())
+}
+
+fn write_rows(
+    object: &Map<String, Value>,
+    row_key: &str,
+    column_key: &str,
+) -> Result<Option<Vec<Value>>, WriteError> {
+    match (object.get(row_key), object.get(column_key)) {
+        (Some(_), Some(_)) => Err(format!("{row_key} and {column_key} cannot be combined").into()),
+        (Some(rows), None) => Ok(Some(
+            rows.as_array()
+                .ok_or_else(|| format!("{row_key} must be an array"))?
+                .clone(),
+        )),
+        (None, Some(columns)) => Ok(Some(rows_from_columns(columns)?)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn rows_from_columns(columns: &Value) -> Result<Vec<Value>, WriteError> {
+    let columns = columns.as_object().ok_or("columns must be an object")?;
+    let ids = columns
+        .get("id")
+        .and_then(Value::as_array)
+        .ok_or("columns require an id array")?;
+    let mut rows = vec![Map::new(); ids.len()];
+    for (field, values) in columns {
+        let values = values
+            .as_array()
+            .ok_or_else(|| format!("column {field} must be an array"))?;
+        if values.len() != rows.len() {
+            return Err(format!("column {field} length must match id length").into());
+        }
+        for (row, value) in rows.iter_mut().zip(values) {
+            row.insert(field.clone(), value.clone());
+        }
+    }
+    Ok(rows.into_iter().map(Value::Object).collect())
 }
 
 pub(crate) fn field_type(definition: &Value) -> &str {
@@ -257,8 +296,20 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
         }
     }
     match field_type(definition) {
-        "uuid" | "uint" | "int" | "float" | "string" | "bool" | "datetime" | "[1536]f16" => Ok(()),
-        value if value.starts_with('[') && value.ends_with("]f16") => Ok(()),
+        "uuid" | "uint" | "int" | "float" | "string" | "bool" | "datetime" | "[]uuid"
+        | "[]uint" | "[]int" | "[]float" | "[]string" | "[]bool" | "[]datetime" => Ok(()),
+        value
+            if value.starts_with('[')
+                && (value.ends_with("]f16") || value.ends_with("]f32"))
+                && value
+                    .trim_start_matches('[')
+                    .split(']')
+                    .next()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .is_some_and(|n| n > 0 && n <= 3072) =>
+        {
+            Ok(())
+        }
         _ => Err(format!("unsupported schema type for attribute {field}")),
     }
 }
@@ -302,7 +353,25 @@ fn validate_value(field: &str, value: &Value, definition: &Value) -> Result<(), 
         "float" => value.is_number(),
         "string" | "datetime" => value.is_string(),
         "bool" => value.is_boolean(),
-        vector if vector.starts_with('[') => {
+        "[]uuid" => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(|v| v.as_str().is_some_and(uuid_like))),
+        "[]uint" => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(|v| v.as_u64().is_some())),
+        "[]int" => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(|v| v.as_i64().is_some())),
+        "[]float" => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(Value::is_number)),
+        "[]string" | "[]datetime" => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(Value::is_string)),
+        "[]bool" => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(Value::is_boolean)),
+        vector if vector.ends_with("]f16") || vector.ends_with("]f32") => {
             let expected = vector
                 .trim_start_matches('[')
                 .split(']')
