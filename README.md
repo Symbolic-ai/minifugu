@@ -26,7 +26,7 @@ curl -sS http://127.0.0.1:8787/v2/namespaces/demo \
 
 curl -sS http://127.0.0.1:8787/v2/namespaces/demo/query \
   -H "Authorization: Bearer $MINIFUGU_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"queries":[{"rank_by":["vector","ANN",[1,0]],"limit":2},{"rank_by":["title","BM25","fugu"],"limit":2}]}'
+  -d '{"queries":[{"rank_by":["vector","ANN",[1,0]],"limit":2},{"rank_by":["title","BM25","fugu"],"limit":2}],"rerank_by":["RRF"],"limit":2}'
 ```
 
 Set `MINIFUGU_LISTEN=0.0.0.0:8787` to listen on another address. The default binds localhost.
@@ -65,14 +65,14 @@ MiniFugu calls OpenAI's embeddings endpoint for native `embed` fields, using the
 
 | Route | Behavior |
 | --- | --- |
-| `POST /v2/namespaces/{name}` | Schema and cosine metric, row/column upserts and patches, ID deletes, patch/delete by filter, affected IDs, local copy/branch |
-| `POST /v2/namespaces/{name}/query` | Single and multiqueries, exact ANN, BM25, filters, ordering, `limit`/`top_k`, offset, attribute selection, Count/Sum aggregations |
+| `POST /v2/namespaces/{name}` | Schema and cosine metric, row/column upserts and patches, conditional writes, ID deletes, patch/delete by filter, affected IDs, local copy/branch |
+| `POST /v2/namespaces/{name}/query` | Single and multiqueries, exact ANN and filtered kNN, BM25, RRF fusion, text filters, ranking expressions, ordering, `limit`/`top_k`, offset, attribute selection, computed BM25/vector scores, Count/Sum aggregations |
 | `DELETE /v2/namespaces/{name}` | Delete a namespace |
 | `GET /v1/namespaces` | List namespace IDs with prefix, cursor, and page size |
 | `GET/POST /v1/namespaces/{name}/schema` | Read and extend a schema |
 | `GET /v2/namespaces/{name}/metadata` | Read schema and local row count |
 
-Supported filters include `And`, `Or`, `Not`, equality, `In`, numeric/date ranges, and array containment. Queries validate referenced attributes even when no rows match. Unsupported request fields return HTTP 400. This prevents a test from silently passing when MiniFugu cannot emulate the operation. See [API coverage](docs/api-coverage.md) for exact details.
+Supported filters include `And`, `Or`, `Not`, equality, `In`/`NotIn`, numeric/date ranges, array containment, and full-text token matching. Queries validate referenced attributes even when no rows match. Unsupported request fields return HTTP 400. This prevents a test from silently passing when MiniFugu cannot emulate the operation. See [API coverage](docs/api-coverage.md) for exact details and remaining gaps.
 
 ## Development and compatibility checks
 

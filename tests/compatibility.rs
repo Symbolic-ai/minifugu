@@ -92,8 +92,9 @@ async fn extended_contract(base: &str, token: &str) {
     let source = format!("{base}/v2/namespaces/{name}");
     let copy = format!("{source}-copy");
     let write = response(&client, token, &source, json!({
-        "schema":{"id":"uint","group":"string","tags":"[]string","score":"uint","title":{"type":"string","full_text_search":true}},
-        "upsert_columns":{"id":[1,2],"group":["a","a"],"tags":[["fugu"],["whale"]],"score":[3,5],"title":["small fugu","blue whale"]},
+        "schema":{"id":"uint","group":"string","tags":{"type":"[]string","full_text_search":true,"filterable":true},"score":"uint","title":{"type":"string","full_text_search":true,"glob":true,"regex":true},"vector":{"type":"[2]f32","ann":true}},
+        "distance_metric":"cosine_distance",
+        "upsert_columns":{"id":[1,2],"group":["a","a"],"tags":[["fugu"],["whale"]],"score":[3,5],"title":["small fugu","blue whale"],"vector":[[1,0],[0,1]]},
         "return_affected_ids":true
     })).await;
     let query = response(
@@ -135,6 +136,94 @@ async fn extended_contract(base: &str, token: &str) {
         }),
     )
     .await;
+    let fused = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({
+            "queries":[
+                {"rank_by":["title","BM25","fugu"],"limit":2,"include_attributes":["title"]},
+                {"rank_by":["title","BM25","whale"],"limit":2,"include_attributes":["title"]}
+            ],
+            "rerank_by":["RRF",{"weights":[2,1],"rank_constant":10}],
+            "limit":{"total":2}
+        }),
+    )
+    .await;
+    let text_filter = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({"rank_by":["id","asc"],"filters":["title","ContainsAllTokens","small fu",{"last_as_prefix":true}],"limit":2}),
+    ).await;
+    let sequence_filter = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({"rank_by":["id","asc"],"filters":["title","ContainsTokenSequence","blue whale"],"limit":2}),
+    ).await;
+    let not_in = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({"rank_by":["id","asc"],"filters":["id","NotIn",[1]],"limit":2}),
+    )
+    .await;
+    let computed = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({"rank_by":["id","asc"],"limit":2,"compute_attributes":{"fugu_score":["title","BM25","fugu"],"vector_distance":["vector","VectorDist",[1,0]]},"consistency":{"level":"strong"}}),
+    )
+    .await;
+    let glob = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({"rank_by":["id","asc"],"filters":["title","IGlob","SMALL*"],"limit":2}),
+    )
+    .await;
+    let regex = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({"rank_by":["id","asc"],"filters":["title","Regex","^blue\\s+whale$"],"limit":2}),
+    )
+    .await;
+    let knn = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({"rank_by":["vector","kNN",[1,0]],"filters":["group","Eq","a"],"limit":2}),
+    )
+    .await;
+    let attribute_rank = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({"rank_by":["Attribute","score"],"limit":2}),
+    )
+    .await;
+    let max_rank = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({"rank_by":["Max",[["title","BM25","fugu"],["title","BM25","whale"]]],"limit":2}),
+    )
+    .await;
+    let filter_rank = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({"rank_by":["score","Gt",3],"limit":2}),
+    )
+    .await;
+    let array_text = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({"rank_by":["tags","BM25","fugu"],"filters":["tags","ContainsAnyToken","fugu"],"limit":2}),
+    ).await;
     let copied = response(&client, token, &copy, json!({"copy_from_namespace":name})).await;
     let copied_query = response(
         &client,
@@ -143,6 +232,13 @@ async fn extended_contract(base: &str, token: &str) {
         json!({
             "rank_by":["title","BM25","fugu"],"limit":1
         }),
+    )
+    .await;
+    let product = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({"rank_by":["Product",["title","BM25","fugu"],2],"limit":2}),
     )
     .await;
     let copy_cleanup = client
@@ -171,10 +267,160 @@ async fn extended_contract(base: &str, token: &str) {
     assert_eq!(ordered.0, StatusCode::OK);
     assert_eq!(ordered.1["rows"][0]["id"], 2);
     assert_eq!(ordered.1["rows"][1]["id"], 1);
+    assert_eq!(fused.0, StatusCode::OK, "RRF response: {:?}", fused.1);
+    assert_eq!(fused.1["results"][0]["rows"][0]["id"], 1);
+    assert_eq!(fused.1["results"][0]["rows"][1]["id"], 2);
+    assert!(fused.1["results"][0]["rows"][0]["$dist"].as_f64().unwrap() > 0.18);
+    assert_eq!(
+        text_filter.0,
+        StatusCode::OK,
+        "token filter response: {:?}",
+        text_filter.1
+    );
+    assert_eq!(text_filter.1["rows"][0]["id"], 1);
+    assert_eq!(
+        sequence_filter.0,
+        StatusCode::OK,
+        "sequence filter response: {:?}",
+        sequence_filter.1
+    );
+    assert_eq!(sequence_filter.1["rows"][0]["id"], 2);
+    assert_eq!(not_in.0, StatusCode::OK);
+    assert_eq!(not_in.1["rows"][0]["id"], 2);
+    assert_eq!(
+        computed.0,
+        StatusCode::OK,
+        "computed response: {:?}",
+        computed.1
+    );
+    assert!(computed.1["rows"][0]["fugu_score"].as_f64().unwrap() > 0.0);
+    assert_eq!(computed.1["rows"][0]["vector_distance"], 0.0);
+    assert_eq!(glob.0, StatusCode::OK, "glob response: {:?}", glob.1);
+    assert_eq!(glob.1["rows"][0]["id"], 1);
+    assert_eq!(regex.0, StatusCode::OK, "regex response: {:?}", regex.1);
+    assert_eq!(regex.1["rows"][0]["id"], 2);
+    assert_eq!(knn.0, StatusCode::OK, "kNN response: {:?}", knn.1);
+    assert_eq!(knn.1["rows"][0]["id"], 1);
+    assert_eq!(
+        attribute_rank.0,
+        StatusCode::OK,
+        "Attribute response: {:?}",
+        attribute_rank.1
+    );
+    assert_eq!(attribute_rank.1["rows"][0]["id"], 2);
+    assert_eq!(max_rank.0, StatusCode::OK, "Max response: {:?}", max_rank.1);
+    assert_eq!(max_rank.1["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        filter_rank.0,
+        StatusCode::OK,
+        "filter rank response: {:?}",
+        filter_rank.1
+    );
+    assert_eq!(filter_rank.1["rows"][0]["id"], 2);
+    assert_eq!(
+        array_text.0,
+        StatusCode::OK,
+        "array text response: {:?}",
+        array_text.1
+    );
+    assert_eq!(array_text.1["rows"][0]["id"], 1);
+    assert_eq!(
+        product.0,
+        StatusCode::OK,
+        "Product response: {:?}",
+        product.1
+    );
+    assert_eq!(product.1["rows"][0]["id"], 1);
     assert_eq!(copied.0, StatusCode::OK);
     assert_eq!(copied_query.1["rows"][0]["id"], 1);
     assert_eq!(copy_cleanup.status(), StatusCode::OK);
     assert_eq!(source_cleanup.status(), StatusCode::OK);
+}
+
+async fn conditional_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-conditional-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let initial = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","status":"string"},
+            "upsert_rows":[{"id":1,"status":"new"},{"id":2,"status":"locked"}]
+        }),
+    )
+    .await;
+    let upsert = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "upsert_condition":["status","Eq","new"],
+            "upsert_rows":[{"id":1,"status":"updated"},{"id":2,"status":"updated"}]
+        }),
+    )
+    .await;
+    let patch = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "patch_condition":["status","Eq","locked"],
+            "patch_rows":[{"id":1,"status":"patched"},{"id":2,"status":"patched"}]
+        }),
+    )
+    .await;
+    let delete = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "delete_condition":["status","Eq","patched"],"deletes":[1,2]
+        }),
+    )
+    .await;
+    let after = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["id","asc"],"include_attributes":["status"],"limit":2
+        }),
+    )
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+
+    assert_eq!(
+        initial.0,
+        StatusCode::OK,
+        "initial response: {:?}",
+        initial.1
+    );
+    assert_eq!(
+        upsert.0,
+        StatusCode::OK,
+        "conditional upsert response: {:?}",
+        upsert.1
+    );
+    assert_eq!(upsert.1["rows_affected"], 1);
+    assert_eq!(
+        patch.0,
+        StatusCode::OK,
+        "conditional patch response: {:?}",
+        patch.1
+    );
+    assert_eq!(patch.1["rows_affected"], 1);
+    assert_eq!(
+        delete.0,
+        StatusCode::OK,
+        "conditional delete response: {:?}",
+        delete.1
+    );
+    assert_eq!(delete.1["rows_affected"], 1);
+    assert_eq!(after.0, StatusCode::OK);
+    assert_eq!(after.1["rows"], json!([{"id":1,"status":"updated"}]));
+    assert_eq!(cleanup.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -184,6 +430,7 @@ async fn local_contract() {
     tokio::spawn(async move { axum::serve(listener, minifugu::router()).await.unwrap() });
     contract(&format!("http://{address}"), "dummy").await;
     extended_contract(&format!("http://{address}"), "dummy").await;
+    conditional_contract(&format!("http://{address}"), "dummy").await;
 }
 
 #[tokio::test]
@@ -196,4 +443,5 @@ async fn optional_real_turbopuffer_contract() {
     };
     contract(base.trim_end_matches('/'), &token).await;
     extended_contract(base.trim_end_matches('/'), &token).await;
+    conditional_contract(base.trim_end_matches('/'), &token).await;
 }

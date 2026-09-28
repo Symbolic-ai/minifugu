@@ -1,18 +1,64 @@
 use crate::store::{field_type, known_field, Namespace};
 use chrono::{DateTime, FixedOffset};
+use globset::GlobBuilder;
+use regex::Regex;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 impl Namespace {
     pub fn query(&self, body: &Value) -> Result<Value, String> {
         let object = body.as_object().ok_or("query body must be an object")?;
+        validate_query_options(object)?;
         if let Some(queries) = object.get("queries") {
-            if object.len() != 1 {
-                return Err("queries cannot be combined with other query fields".into());
-            }
             let queries = queries.as_array().ok_or("queries must be an array")?;
             for query in queries {
                 self.validate_query(query)?;
+            }
+            if object.contains_key("rerank_by") {
+                let (rank_constant, weights, limit, offset) = validate_rrf(object, queries)?;
+                let results = queries.iter().map(|q| self.execute_query(q));
+                let mut fused = BTreeMap::<String, (f64, Value)>::new();
+                for (result, weight) in results.zip(weights) {
+                    for (index, row) in result["rows"].as_array().unwrap().iter().enumerate() {
+                        let id = serde_json::to_string(&row["id"]).unwrap();
+                        let entry = fused.entry(id).or_insert_with(|| (0.0, row.clone()));
+                        entry.0 += weight / (rank_constant + index as f64 + 1.0);
+                        if let (Some(existing), Some(current)) =
+                            (entry.1.as_object_mut(), row.as_object())
+                        {
+                            for (key, value) in current {
+                                if key != "$dist" {
+                                    existing.insert(key.clone(), value.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut rows = fused.into_values().collect::<Vec<_>>();
+                rows.sort_by(|a, b| {
+                    b.0.total_cmp(&a.0)
+                        .then_with(|| a.1["id"].to_string().cmp(&b.1["id"].to_string()))
+                });
+                let rows = rows
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|(score, mut row)| {
+                        row["$dist"] = json!(score);
+                        row
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(
+                    json!({"results":[{"rows":rows}],"billing":{},"performance":{"server_total_ms":0}}),
+                );
+            }
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "queries" | "consistency"))
+            {
+                return Err(
+                    "queries cannot be combined with other query fields without rerank_by".into(),
+                );
             }
             let results = queries
                 .iter()
@@ -40,16 +86,39 @@ impl Namespace {
                     | "limit"
                     | "top_k"
                     | "offset"
+                    | "compute_attributes"
+                    | "consistency"
+                    | "distance_metric"
             ) {
                 return Err(format!("unsupported query field {key}"));
             }
         }
         if let Some(rank) = object.get("rank_by") {
             validate_rank(rank, &self.schema)?;
+            if contains_knn(rank) && !object.contains_key("filters") {
+                return Err("kNN requires filters".into());
+            }
         }
         if let Some(filter) = object.get("filters") {
             validate_filter(filter, &self.schema)?;
         }
+        if let Some(computed) = object.get("compute_attributes") {
+            let computed = computed
+                .as_object()
+                .ok_or("compute_attributes must be an object")?;
+            if computed.len() > 256 {
+                return Err("compute_attributes exceeds 256 fields".into());
+            }
+            for (name, expression) in computed {
+                if name == "id" || name == "$dist" || known_field(&self.schema, name) {
+                    return Err(format!(
+                        "computed attribute {name} conflicts with an existing field"
+                    ));
+                }
+                validate_computed(expression, &self.schema)?;
+            }
+        }
+        validate_query_options(object)?;
         if let Some(include) = object.get("include_attributes") {
             if !include.is_boolean() {
                 let fields = include
@@ -238,6 +307,13 @@ impl Namespace {
                 if rank.is_some_and(|rank| !is_attribute_order(rank) && !is_ascending(rank)) {
                     result.insert("$dist".into(), json!(score));
                 }
+                if let Some(computed) = object.get("compute_attributes").and_then(Value::as_object)
+                {
+                    for (name, expression) in computed {
+                        let value = computed_value(expression, row, &self.rows);
+                        result.insert(name.clone(), value);
+                    }
+                }
                 Value::Object(result)
             })
             .collect::<Vec<_>>();
@@ -356,6 +432,136 @@ impl Namespace {
     }
 }
 
+fn validate_query_options(object: &Map<String, Value>) -> Result<(), String> {
+    if let Some(consistency) = object.get("consistency") {
+        let consistency = consistency
+            .as_object()
+            .ok_or("consistency must be an object")?;
+        if consistency.len() != 1
+            || !matches!(
+                consistency.get("level").and_then(Value::as_str),
+                Some("strong" | "eventual")
+            )
+        {
+            return Err("consistency.level must be strong or eventual".into());
+        }
+    }
+    if object
+        .get("distance_metric")
+        .is_some_and(|value| value != "cosine_distance")
+    {
+        return Err("only cosine_distance is supported".into());
+    }
+    Ok(())
+}
+
+fn validate_computed(expression: &Value, schema: &Map<String, Value>) -> Result<(), String> {
+    let parts = expression
+        .as_array()
+        .ok_or("computed attribute expression must be an array")?;
+    if parts.len() != 3 {
+        return Err("computed attribute requires a three-part expression".into());
+    }
+    if parts[1] == "BM25" {
+        return validate_rank(expression, schema);
+    }
+    if parts[1] == "VectorDist" {
+        let mut rank = parts.clone();
+        rank[1] = json!("ANN");
+        return validate_rank(&Value::Array(rank), schema);
+    }
+    Err("only BM25 and VectorDist computed attributes are supported".into())
+}
+
+fn computed_value(
+    expression: &Value,
+    row: &Map<String, Value>,
+    corpus: &BTreeMap<String, Map<String, Value>>,
+) -> Value {
+    let mut rank = expression.clone();
+    if rank[1] == "VectorDist" {
+        rank[1] = json!("ANN");
+    }
+    let score = score_rank(&rank, row, corpus);
+    if score.is_finite() {
+        json!(score)
+    } else {
+        Value::Null
+    }
+}
+
+fn validate_rrf(
+    object: &Map<String, Value>,
+    queries: &[Value],
+) -> Result<(f64, Vec<f64>, usize, usize), String> {
+    if queries.len() < 2 || queries.iter().any(|q| q.get("aggregate_by").is_some()) {
+        return Err("RRF requires at least two non-aggregation queries".into());
+    }
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "queries" | "rerank_by" | "limit" | "offset" | "consistency"
+        )
+    }) {
+        return Err("unsupported multi-query field".into());
+    }
+    let parts = object["rerank_by"]
+        .as_array()
+        .ok_or("rerank_by must be an array")?;
+    if parts.is_empty() || parts.len() > 2 || parts[0] != "RRF" {
+        return Err("only RRF reranking is supported".into());
+    }
+    let config = match parts.get(1) {
+        Some(value) => Some(value.as_object().ok_or("RRF config must be an object")?),
+        None => None,
+    };
+    if config.is_some_and(|config| {
+        config
+            .keys()
+            .any(|key| !matches!(key.as_str(), "weights" | "rank_constant"))
+    }) {
+        return Err("unsupported RRF config field".into());
+    }
+    let rank_constant = config
+        .and_then(|c| c.get("rank_constant"))
+        .map_or(Ok(60), |v| {
+            v.as_u64()
+                .filter(|v| *v > 0)
+                .ok_or("rank_constant must be a positive integer")
+        })? as f64;
+    let weights = if let Some(values) = config.and_then(|c| c.get("weights")) {
+        let values = values.as_array().ok_or("weights must be an array")?;
+        if values.len() != queries.len() {
+            return Err("weights must match the number of queries".into());
+        }
+        values
+            .iter()
+            .map(|value| {
+                value
+                    .as_f64()
+                    .filter(|weight| weight.is_finite() && *weight > 0.0)
+                    .ok_or("weights must be positive numbers".into())
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        vec![1.0; queries.len()]
+    };
+    let limit_value = object.get("limit").ok_or("RRF requires a limit")?;
+    let limit = match limit_value {
+        Value::Number(number) => number.as_u64(),
+        Value::Object(config) if config.len() == 1 => config.get("total").and_then(Value::as_u64),
+        _ => None,
+    }
+    .ok_or("RRF limit must be an integer or {total: integer}")?;
+    if limit > 10_000 {
+        return Err("RRF limit must be at most 10000".into());
+    }
+    let offset = object.get("offset").map_or(Ok(0), |v| {
+        v.as_u64().ok_or("offset must be a nonnegative integer")
+    })?;
+    Ok((rank_constant, weights, limit as usize, offset as usize))
+}
+
 fn aggregate_values(
     aggregates: &Map<String, Value>,
     rows: &[&Map<String, Value>],
@@ -395,8 +601,8 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
     if parts.len() == 2 && parts[0] == "Not" {
         return validate_filter(&parts[1], schema);
     }
-    if parts.len() != 3 {
-        return Err("filter must have three elements".into());
+    if parts.len() != 3 && parts.len() != 4 {
+        return Err("filter must have three or four elements".into());
     }
     let field = parts[0]
         .as_str()
@@ -416,10 +622,86 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
     {
         return Err(format!("attribute {field} is not an array"));
     }
+    if matches!(
+        op,
+        "ContainsAllTokens" | "ContainsAnyToken" | "ContainsTokenSequence"
+    ) {
+        if !matches!(field_type(&schema[field]), "string" | "[]string") {
+            return Err(format!("attribute {field} is not a text field"));
+        }
+        if !schema.get(field).is_some_and(|definition| {
+            definition
+                .get("full_text_search")
+                .is_some_and(|value| value == true || value.is_object())
+        }) {
+            return Err(format!(
+                "attribute {field} is not configured for full-text search"
+            ));
+        }
+        if !parts[2].is_string()
+            && !parts[2]
+                .as_array()
+                .is_some_and(|tokens| tokens.iter().all(Value::is_string))
+        {
+            return Err(format!("{op} requires a string or string array"));
+        }
+        if parts.len() == 4 {
+            if op == "ContainsTokenSequence" {
+                return Err("ContainsTokenSequence does not take options".into());
+            }
+            let options = parts[3]
+                .as_object()
+                .ok_or("token filter options must be an object")?;
+            if options.keys().any(|key| key != "last_as_prefix")
+                || options
+                    .get("last_as_prefix")
+                    .is_some_and(|value| !value.is_boolean())
+            {
+                return Err("only boolean last_as_prefix is supported".into());
+            }
+        }
+        return Ok(());
+    }
+    if matches!(op, "Glob" | "NotGlob" | "IGlob" | "NotIGlob" | "Regex") {
+        if parts.len() != 3 || field_type(&schema[field]) != "string" {
+            return Err(format!(
+                "{op} requires a string attribute and a three-part filter"
+            ));
+        }
+        let capability = if op == "Regex" { "regex" } else { "glob" };
+        if schema[field].get(capability) != Some(&Value::Bool(true)) {
+            return Err(format!(
+                "attribute {field} does not enable {capability} filters"
+            ));
+        }
+        let pattern = parts[2].as_str().ok_or("pattern must be a string")?;
+        if op == "Regex" {
+            Regex::new(pattern).map_err(|error| format!("invalid regex: {error}"))?;
+        } else {
+            GlobBuilder::new(pattern)
+                .case_insensitive(matches!(op, "IGlob" | "NotIGlob"))
+                .build()
+                .map_err(|error| format!("invalid glob: {error}"))?;
+        }
+        return Ok(());
+    }
+    if parts.len() == 4 {
+        return Err(format!("{op} does not take options"));
+    }
     match op {
         "Eq" | "NotEq" | "Gt" | "Gte" | "Lt" | "Lte" | "Contains" | "NotContains" => Ok(()),
-        "In" | "ContainsAny" | "NotContainsAny" if parts[2].is_array() => Ok(()),
-        "In" | "ContainsAny" | "NotContainsAny" => Err(format!("{op} requires an array")),
+        "In" | "NotIn" | "ContainsAny" | "NotContainsAny" if parts[2].is_array() => Ok(()),
+        "In" | "NotIn" | "ContainsAny" | "NotContainsAny" => Err(format!("{op} requires an array")),
+        "AnyGt" | "AnyGte" | "AnyLt" | "AnyLte"
+            if schema
+                .get(field)
+                .is_some_and(|definition| field_type(definition).starts_with("[]")) =>
+        {
+            Ok(())
+        }
+        "AnyGt" | "AnyGte" | "AnyLt" | "AnyLte" => {
+            Err(format!("attribute {field} is not an array"))
+        }
         _ => Err(format!("unsupported filter operator {op}")),
     }
 }
@@ -449,6 +731,7 @@ pub(crate) fn filter_matches(filter: &Value, row: &Map<String, Value>) -> bool {
         "Eq" => left == right,
         "NotEq" => left != right,
         "In" => right.as_array().unwrap().contains(left),
+        "NotIn" => !right.as_array().unwrap().contains(left),
         "Contains" => left.as_array().is_some_and(|a| a.contains(right)),
         "NotContains" => left.as_array().is_some_and(|a| !a.contains(right)),
         "ContainsAny" => left
@@ -461,6 +744,74 @@ pub(crate) fn filter_matches(filter: &Value, row: &Map<String, Value>) -> bool {
         "Gte" => !left.is_null() && compare_values(left, right).is_some_and(|o| o >= 0),
         "Lt" => !left.is_null() && compare_values(left, right).is_some_and(|o| o < 0),
         "Lte" => left.is_null() || compare_values(left, right).is_some_and(|o| o <= 0),
+        "AnyGt" | "AnyGte" | "AnyLt" | "AnyLte" => left.as_array().is_some_and(|values| {
+            values.iter().any(|value| match parts[1].as_str().unwrap() {
+                "AnyGt" => compare_values(value, right).is_some_and(|order| order > 0),
+                "AnyGte" => compare_values(value, right).is_some_and(|order| order >= 0),
+                "AnyLt" => compare_values(value, right).is_some_and(|order| order < 0),
+                _ => compare_values(value, right).is_some_and(|order| order <= 0),
+            })
+        }),
+        "ContainsAllTokens" | "ContainsAnyToken" | "ContainsTokenSequence" => {
+            token_filter_matches(parts, left)
+        }
+        "Glob" | "NotGlob" | "IGlob" | "NotIGlob" => left.as_str().is_some_and(|text| {
+            let matches = GlobBuilder::new(right.as_str().unwrap())
+                .case_insensitive(matches!(parts[1].as_str(), Some("IGlob" | "NotIGlob")))
+                .build()
+                .unwrap()
+                .compile_matcher()
+                .is_match(text);
+            if matches!(parts[1].as_str(), Some("NotGlob" | "NotIGlob")) {
+                !matches
+            } else {
+                matches
+            }
+        }),
+        "Regex" => left
+            .as_str()
+            .is_some_and(|text| Regex::new(right.as_str().unwrap()).unwrap().is_match(text)),
+        _ => false,
+    }
+}
+
+fn token_filter_matches(parts: &[Value], left: &Value) -> bool {
+    let document = value_tokens(left);
+    let terms = match &parts[2] {
+        Value::String(query) => tokens(query),
+        Value::Array(terms) => terms
+            .iter()
+            .flat_map(|term| tokens(term.as_str().unwrap()))
+            .collect(),
+        _ => return false,
+    };
+    if document.is_empty() || terms.is_empty() {
+        return false;
+    }
+    let last_as_prefix = parts
+        .get(3)
+        .and_then(|options| options.get("last_as_prefix"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let matches_term = |index: usize, token: &str| {
+        document.iter().any(|candidate| {
+            if last_as_prefix && index + 1 == terms.len() {
+                candidate.starts_with(token)
+            } else {
+                candidate == token
+            }
+        })
+    };
+    match parts[1].as_str().unwrap() {
+        "ContainsAllTokens" => terms
+            .iter()
+            .enumerate()
+            .all(|(index, token)| matches_term(index, token)),
+        "ContainsAnyToken" => terms
+            .iter()
+            .enumerate()
+            .any(|(index, token)| matches_term(index, token)),
+        "ContainsTokenSequence" => document.windows(terms.len()).any(|window| window == terms),
         _ => false,
     }
 }
@@ -517,18 +868,47 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
         }
         return Err("multi-attribute rank requires attribute order clauses".into());
     }
-    if parts.len() == 2 && parts[0] == "Sum" {
-        let children = parts[1].as_array().ok_or("Sum requires an array")?;
+    if parts.len() == 2 && matches!(parts[0].as_str(), Some("Sum" | "Max")) {
+        let children = parts[1].as_array().ok_or("Sum/Max requires an array")?;
+        if children.is_empty() {
+            return Err("Sum/Max requires at least one expression".into());
+        }
         for child in children {
             validate_rank(child, schema)?;
         }
         return Ok(());
     }
     if parts.len() == 3 && parts[0] == "Product" {
-        if !parts[1].is_number() {
-            return Err("Product requires a numeric weight".into());
+        let (weight, expression) = if parts[1].is_number() {
+            (&parts[1], &parts[2])
+        } else {
+            (&parts[2], &parts[1])
+        };
+        if !weight
+            .as_f64()
+            .is_some_and(|value| value.is_finite() && value >= 0.0)
+        {
+            return Err("Product requires a nonnegative numeric weight".into());
         }
-        return validate_rank(&parts[2], schema);
+        return validate_rank(expression, schema);
+    }
+    if parts.len() == 2 && parts[0] == "Attribute" {
+        let field = parts[1].as_str().ok_or("Attribute requires a field name")?;
+        if !known_field(schema, field)
+            || !matches!(field_type(&schema[field]), "uint" | "int" | "float")
+        {
+            return Err(format!("attribute {field} is not numeric"));
+        }
+        return Ok(());
+    }
+    if parts.len() == 3
+        && parts[0].is_string()
+        && matches!(
+            parts[1].as_str(),
+            Some("Eq" | "NotEq" | "In" | "NotIn" | "Gt" | "Gte" | "Lt" | "Lte")
+        )
+    {
+        return validate_filter(rank, schema);
     }
     if parts.len() != 3 && parts.len() != 2 {
         return Err("unsupported rank_by expression".into());
@@ -539,7 +919,7 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
     }
     let operator = parts[1].as_str().ok_or("rank operator must be a string")?;
     match operator {
-        "ANN"
+        "ANN" | "kNN"
             if parts.len() == 3
                 && parts[2]
                     .as_array()
@@ -576,8 +956,10 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
         }
         "BM25" if parts.len() == 3 && parts[2].is_string() => {
             let definition = &schema[field];
-            if field_type(definition) != "string"
-                || definition.get("full_text_search") != Some(&Value::Bool(true))
+            if !matches!(field_type(definition), "string" | "[]string")
+                || !definition
+                    .get("full_text_search")
+                    .is_some_and(|value| value == true || value.is_object())
             {
                 return Err(format!("attribute {field} has no full-text index"));
             }
@@ -590,7 +972,13 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
 
 fn is_ann(rank: &Value) -> bool {
     rank.as_array()
-        .is_some_and(|a| a.len() == 3 && a[1] == "ANN")
+        .is_some_and(|a| a.len() == 3 && (a[1] == "ANN" || a[1] == "kNN"))
+}
+
+fn contains_knn(expression: &Value) -> bool {
+    expression.as_array().is_some_and(|parts| {
+        (parts.len() == 3 && parts[1] == "kNN") || parts.iter().any(contains_knn)
+    })
 }
 fn is_attribute_order(rank: &Value) -> bool {
     rank.as_array().is_some_and(|parts| {
@@ -660,20 +1048,35 @@ fn score_rank(
     if is_attribute_order(rank) {
         return 0.0;
     }
-    if parts[0] == "Sum" {
-        return parts[1]
+    if parts[0] == "Sum" || (parts[0] == "Max" && parts.len() == 2) {
+        let scores = parts[1]
             .as_array()
             .unwrap()
             .iter()
-            .map(|child| score_rank(child, row, corpus))
-            .sum();
+            .map(|child| score_rank(child, row, corpus));
+        return if parts[0] == "Sum" {
+            scores.sum()
+        } else {
+            scores.fold(f64::NEG_INFINITY, f64::max)
+        };
     }
     if parts[0] == "Product" {
-        return parts[1].as_f64().unwrap() * score_rank(&parts[2], row, corpus);
+        let (weight, expression) = if parts[1].is_number() {
+            (&parts[1], &parts[2])
+        } else {
+            (&parts[2], &parts[1])
+        };
+        return weight.as_f64().unwrap() * score_rank(expression, row, corpus);
+    }
+    if parts[0] == "Attribute" {
+        return row
+            .get(parts[1].as_str().unwrap())
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
     }
     let field = parts[0].as_str().unwrap();
     match parts[1].as_str().unwrap() {
-        "ANN" => {
+        "ANN" | "kNN" => {
             let query = parts[2].as_array().unwrap();
             let vector = row.get(field).and_then(Value::as_array);
             match vector {
@@ -703,6 +1106,9 @@ fn score_rank(
             }
         }
         "BM25" => bm25(field, parts[2].as_str().unwrap(), row, corpus),
+        "Eq" | "NotEq" | "In" | "NotIn" | "Gt" | "Gte" | "Lt" | "Lte" => {
+            f64::from(filter_matches(rank, row))
+        }
         "asc" | "desc" => row.get(field).and_then(Value::as_f64).unwrap_or(0.0),
         _ => 0.0,
     }
@@ -715,27 +1121,32 @@ fn tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn value_tokens(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(text) => tokens(text),
+        Value::Array(values) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .flat_map(tokens)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn bm25(
     field: &str,
     query: &str,
     row: &Map<String, Value>,
     corpus: &std::collections::BTreeMap<String, Map<String, Value>>,
 ) -> f64 {
-    let Some(text) = row.get(field).and_then(Value::as_str) else {
-        return 0.0;
-    };
-    let doc_tokens = tokens(text);
+    let doc_tokens = row.get(field).map(value_tokens).unwrap_or_default();
     let query_tokens = tokens(query);
     if query_tokens.is_empty() || doc_tokens.is_empty() {
         return 0.0;
     }
     let lengths = corpus
         .values()
-        .filter_map(|r| {
-            r.get(field)
-                .and_then(Value::as_str)
-                .map(|s| tokens(s).len())
-        })
+        .filter_map(|r| r.get(field).map(|value| value_tokens(value).len()))
         .collect::<Vec<_>>();
     let avg_len = (lengths.iter().sum::<usize>() as f64 / lengths.len().max(1) as f64).max(1.0);
     let mut terms = HashMap::new();
@@ -753,8 +1164,7 @@ fn bm25(
                 .values()
                 .filter(|r| {
                     r.get(field)
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| tokens(s).contains(&term))
+                        .is_some_and(|value| value_tokens(value).contains(&term))
                 })
                 .count() as f64;
             let n = corpus.len() as f64;

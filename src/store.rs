@@ -64,13 +64,33 @@ impl Namespace {
             }
             self.distance_metric = Some(metric.into());
         }
+        for (condition, operations) in [
+            ("upsert_condition", &["upsert_rows", "upsert_columns"][..]),
+            (
+                "patch_condition",
+                &["patch_rows", "patch_columns", "patch_by_filter"][..],
+            ),
+            ("delete_condition", &["deletes", "delete_by_filter"][..]),
+        ] {
+            if let Some(filter) = object.get(condition) {
+                if !operations
+                    .iter()
+                    .any(|operation| object.contains_key(*operation))
+                {
+                    return Err(format!("{condition} requires a matching write operation").into());
+                }
+                validate_filter(filter, &self.schema)?;
+            }
+        }
         let mut upserted_ids = Vec::new();
         let mut patched_ids = Vec::new();
         let mut deleted_ids = Vec::new();
         if let Some(filter) = object.get("delete_by_filter") {
             validate_filter(filter, &self.schema)?;
             self.rows.retain(|_, row| {
-                if filter_matches(filter, row) {
+                if filter_matches(filter, row)
+                    && condition_matches(object, "delete_condition", Some(row))
+                {
                     deleted_ids.push(row["id"].clone());
                     false
                 } else {
@@ -81,7 +101,10 @@ impl Namespace {
         if let Some(deletes) = object.get("deletes") {
             let deletes = deletes.as_array().ok_or("deletes must be an array")?;
             for id in deletes {
-                if self.rows.remove(&id_key(id)?).is_some() {
+                let key = id_key(id)?;
+                if condition_matches(object, "delete_condition", self.rows.get(&key))
+                    && self.rows.remove(&key).is_some()
+                {
                     deleted_ids.push(id.clone());
                 }
             }
@@ -103,7 +126,9 @@ impl Namespace {
             validate_filter(filter, &self.schema)?;
             self.validate_patch(values)?;
             for row in self.rows.values_mut() {
-                if filter_matches(filter, row) {
+                if filter_matches(filter, row)
+                    && condition_matches(object, "patch_condition", Some(row))
+                {
                     for (field, value) in values {
                         row.insert(field.clone(), value.clone());
                     }
@@ -119,7 +144,11 @@ impl Namespace {
                 let id = patch.get("id").ok_or("patch row requires id")?;
                 validate_id(id, self.schema.get("id"))?;
                 self.validate_patch(patch)?;
-                if let Some(row) = self.rows.get_mut(&id_key(id)?) {
+                let key = id_key(id)?;
+                if !condition_matches(object, "patch_condition", self.rows.get(&key)) {
+                    continue;
+                }
+                if let Some(row) = self.rows.get_mut(&key) {
                     for (field, value) in patch {
                         if field != "id" {
                             row.insert(field.clone(), value.clone());
@@ -137,6 +166,9 @@ impl Namespace {
                     .clone();
                 let id = row.get("id").ok_or("upsert row requires id")?.clone();
                 validate_id(&id, self.schema.get("id"))?;
+                if !condition_matches(object, "upsert_condition", self.rows.get(&id_key(&id)?)) {
+                    continue;
+                }
                 for (field, value) in &row {
                     if !self.schema.contains_key(field) {
                         self.schema.insert(field.clone(), infer_type(value)?);
@@ -208,6 +240,16 @@ impl Namespace {
     }
 }
 
+fn condition_matches(
+    object: &Map<String, Value>,
+    condition: &str,
+    current: Option<&Map<String, Value>>,
+) -> bool {
+    object
+        .get(condition)
+        .is_none_or(|filter| filter_matches(filter, current.unwrap_or(&Map::new())))
+}
+
 pub(crate) fn validate_write_keys(object: &Map<String, Value>) -> Result<(), String> {
     for key in object.keys() {
         if !matches!(
@@ -222,6 +264,9 @@ pub(crate) fn validate_write_keys(object: &Map<String, Value>) -> Result<(), Str
                 | "upsert_rows"
                 | "upsert_columns"
                 | "return_affected_ids"
+                | "upsert_condition"
+                | "patch_condition"
+                | "delete_condition"
                 | "branch_from_namespace"
                 | "copy_from_namespace"
         ) {

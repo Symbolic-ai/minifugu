@@ -81,6 +81,51 @@ async fn upserts_queries_deletes_and_namespaces_are_isolated() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["results"][0]["rows"][0]["id"], 1);
     assert_eq!(result["results"][1]["rows"][0]["document_id"], "one");
+    let fused = json!({
+        "queries":[
+            {"rank_by":["vector","ANN",[1.0,0.0]],"limit":2},
+            {"rank_by":["title","BM25","fugu"],"limit":2,"include_attributes":["document_id"]}
+        ],
+        "rerank_by":["RRF",{"rank_constant":10,"weights":[2,1]}],
+        "limit":{"total":1}
+    });
+    let (status, result) = post(&client, &format!("{a}/query"), fused.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["results"][0]["rows"][0]["id"], 1);
+    assert_eq!(result["results"][0]["rows"][0]["document_id"], "one");
+    assert!((result["results"][0]["rows"][0]["$dist"].as_f64().unwrap() - 3.0 / 11.0).abs() < 1e-9);
+    let mut invalid = fused;
+    invalid["rerank_by"][1]["weights"] = json!([1]);
+    let (status, error) = post(&client, &format!("{a}/query"), invalid).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error["error"].as_str().unwrap().contains("weights"));
+    let (status, computed) = post(
+        &client,
+        &format!("{a}/query"),
+        json!({"rank_by":["id","asc"],"limit":2,"compute_attributes":{"distance":["vector","VectorDist",[1,0]]}}),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(computed["rows"][0]["distance"], 0.0);
+    assert_eq!(computed["rows"][1]["distance"], 1.0);
+    let (status, tokens) = post(
+        &client,
+        &format!("{a}/query"),
+        json!({"rank_by":["id","asc"],"filters":["title","ContainsAnyToken",["whal","fug"],{"last_as_prefix":true}],"limit":2}),
+    ).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tokens["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(tokens["rows"][0]["id"], 1);
+    let (status, error) = post(
+        &client,
+        &format!("{a}/query"),
+        json!({"rank_by":["Sum",[["vector","kNN",[1,0]]]],"limit":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error["error"]
+        .as_str()
+        .unwrap()
+        .contains("kNN requires filters"));
     let (status, _) = post(
         &client,
         &format!("{b}/query"),
@@ -262,7 +307,7 @@ async fn unsupported_fields_fail_loudly() {
     let base = server().await;
     let client = Client::new();
     let ns = format!("{base}/unsupported");
-    let (status, body) = post(&client, &ns, json!({"upsert_condition":["id","Eq",1]})).await;
+    let (status, body) = post(&client, &ns, json!({"unknown_write_option":true})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["status"], "error");
     post(
@@ -336,6 +381,15 @@ async fn column_writes_array_filters_and_group_limits_work() {
     assert_eq!(result["rows"].as_array().unwrap().len(), 2);
     assert_eq!(result["rows"][0]["id"], 1);
     assert_eq!(result["rows"][1]["id"], 3);
+    let (status, any_gt) = post(
+        &client,
+        &format!("{ns}/query"),
+        json!({"rank_by":["id","asc"],"filters":["tags","AnyGt","v"],"limit":3}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(any_gt["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(any_gt["rows"][0]["id"], 2);
 
     let (status, error) = post(
         &client,
