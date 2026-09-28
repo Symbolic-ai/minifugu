@@ -7,7 +7,7 @@ MiniFugu implements **all 10 distinct HTTP method/path pairs** in Turbopuffer's 
 | `GET /v1/namespaces` | Sorted namespace list, prefix, cursor, page size | Local namespaces only |
 | `GET /v1/namespaces/{name}/schema` | Returns the local schema | Schema normalization differs from the service |
 | `POST /v1/namespaces/{name}/schema` | Updates an existing schema | Some advanced schema options are unavailable |
-| `GET /v1/namespaces/{name}/metadata` | Schema, row and byte estimates, durable timestamps, encryption and index fields | Byte counts are local estimates; index is always marked up to date |
+| `GET /v1/namespaces/{name}/metadata` | Schema, row and byte estimates, durable timestamps, encryption and index fields | Byte counts are local estimates; index is always marked up to date; `encryption.sse` is a compatibility value and local snapshots are not encrypted |
 | `GET /v1/namespaces/{name}/hint_cache_warm` | Returns HTTP 202 and the documented acceptance body | Local scans need no cache warming |
 | `POST /v1/namespaces/{name}/_debug/recall` | Runs exact vector searches with optional filters and ground truth | Recall is 1.0 for exact local search; sampling and index diagnostics differ |
 | `POST /v2/namespaces/{name}` | Row/column upsert and patch, ID/filter deletes, conditions, affected IDs, schema, local copy/branch; partial filter flags complete all matching small local rows; backpressure flag accepted for upserts and ID deletes | Cross-account copy, service-style partial chunking, sharding and encryption configuration unavailable |

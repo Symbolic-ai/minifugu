@@ -39,7 +39,7 @@ Set `MINIFUGU_DATA_DIR` to store all namespaces in a local JSON snapshot:
 MINIFUGU_DATA_DIR="$HOME/.local/share/minifugu" cargo run --release
 ```
 
-Writes use a temporary file, file sync, and rename before the HTTP request succeeds. On startup, a corrupt snapshot stops the server instead of clearing data. On Unix, MiniFugu sets the data directory to `0700` and the snapshot file to `0600`. This is intended for a single small local instance; it does not provide concurrent process access, sharding, or large-scale indexing. Leave the variable unset for an empty in-memory store on every start.
+Writes use a temporary file, file sync, and rename before the HTTP request succeeds. On startup, a corrupt snapshot stops the server instead of clearing data. On Unix, MiniFugu sets the data directory to `0700` and the snapshot file to `0600`. The snapshot is **not encrypted**; the `encryption.sse` metadata value is a compatibility field for the HTTP API. This is intended for a single small local instance; it does not provide concurrent process access, sharding, or large-scale indexing. Leave the variable unset for an empty in-memory store on every start.
 
 ## Embeddings
 
