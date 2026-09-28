@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -287,12 +288,17 @@ async fn patches_filters_and_namespace_inspection_work() {
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["namespaces"][0]["id"], "inspection");
 
-    let url = format!("{origin}/v2/namespaces/inspection/metadata");
+    let url = format!("{origin}/v1/namespaces/inspection/metadata");
     let response = client.get(url).bearer_auth("dummy").send().await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["approx_row_count"], 2);
     assert_eq!(body["schema"]["tag"], "string");
+    assert!(body["approx_logical_bytes"].as_u64().unwrap() > 0);
+    assert!(body["created_at"].as_str().unwrap().ends_with('Z'));
+    assert!(body["updated_at"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(body["encryption"], json!({"sse":true}));
+    assert_eq!(body["index"]["status"], "up-to-date");
 
     let url = format!("{origin}/v1/namespaces/inspection/schema");
     let response = client.get(&url).bearer_auth("dummy").send().await.unwrap();
@@ -307,6 +313,141 @@ async fn patches_filters_and_namespace_inspection_work() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["new"], "string");
+}
+
+#[tokio::test]
+async fn documented_cache_recall_and_explain_routes_work() {
+    let base = server().await;
+    let client = Client::new();
+    let origin = base.trim_end_matches("/v2/namespaces");
+    let ns = format!("{base}/operations");
+    let (status, _) = post(&client, &ns, json!({
+        "schema":{"id":"uint","vector":{"type":"[2]f32","ann":true},"tag":"string"},
+        "distance_metric":"cosine_distance",
+        "upsert_rows":[{"id":1,"vector":[1,0],"tag":"fish"},{"id":2,"vector":[0,1],"tag":"other"}]
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let warm = client
+        .get(format!("{origin}/v1/namespaces/operations/hint_cache_warm"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(warm.status(), StatusCode::ACCEPTED);
+    let warm_body: Value = warm.json().await.unwrap();
+    assert_eq!(warm_body["status"], "ACCEPTED");
+
+    let (status, recall) = post(
+        &client,
+        &format!("{origin}/v1/namespaces/operations/_debug/recall"),
+        json!({"num":2,"top_k":1,"include_ground_truth":true,"filters":["tag","Eq","fish"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recall["avg_recall"], 1.0);
+    assert_eq!(recall["avg_exhaustive_count"], 1.0);
+    assert_eq!(recall["ground_truth"].as_array().unwrap().len(), 2);
+    assert_eq!(recall["ground_truth"][0]["nearest_neighbors"][0]["id"], 1);
+
+    let (status, explanation) = post(
+        &client,
+        &format!("{ns}/explain_query"),
+        json!({"rank_by":["vector","ANN",[1,0]],"limit":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(explanation["plan_text"].as_str().unwrap().contains("exact"));
+
+    let (status, invalid) = post(
+        &client,
+        &format!("{ns}/explain_query"),
+        json!({"rank_by":["absent","ANN",[1,0]],"limit":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(invalid["error"].as_str().unwrap().contains("absent"));
+}
+
+#[tokio::test]
+async fn base64_vectors_round_trip_through_write_and_query() {
+    let base = server().await;
+    let client = Client::new();
+    let ns = format!("{base}/encoded");
+    let encoded = STANDARD.encode([1.0_f32.to_le_bytes(), 0.0_f32.to_le_bytes()].concat());
+    let (status, _) = post(
+        &client,
+        &ns,
+        json!({
+            "schema":{"id":"uint","vector":{"type":"[2]f32","ann":true}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"vector":encoded}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, response) = post(
+        &client,
+        &format!("{ns}/query"),
+        json!({
+            "rank_by":["vector","ANN",encoded],"limit":1,
+            "include_attributes":["vector"],"vector_encoding":"base64"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["rows"][0]["id"], 1);
+    assert_eq!(response["rows"][0]["vector"], encoded);
+    assert!(
+        response["billing"]["billable_logical_bytes_queried"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(response["performance"]["approx_namespace_size"], 1);
+
+    let (status, response) = post(
+        &client,
+        &format!("{ns}/query"),
+        json!({
+            "rank_by":["vector","ANN",[1,0]],"limit":1,
+            "include_attributes":["vector"],"vector_encoding":"float"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["rows"][0]["vector"], json!([1.0, 0.0]));
+}
+
+#[tokio::test]
+async fn euclidean_metric_and_i8_vectors_rank_exactly() {
+    let base = server().await;
+    let client = Client::new();
+    let ns = format!("{base}/metric");
+    let (status, _) = post(
+        &client,
+        &ns,
+        json!({
+            "schema":{"id":"uint","vector":{"type":"[2]i8","ann":true}},
+            "distance_metric":"euclidean_squared",
+            "upsert_rows":[{"id":1,"vector":[0,0]},{"id":2,"vector":[3,4]}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, response) = post(
+        &client,
+        &format!("{ns}/query"),
+        json!({
+            "rank_by":["vector","ANN",[1,1]],"limit":2
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["rows"][0]["id"], 1);
+    assert_eq!(response["rows"][0]["$dist"], 2.0);
+    assert_eq!(response["rows"][1]["$dist"], 13.0);
 }
 
 #[tokio::test]

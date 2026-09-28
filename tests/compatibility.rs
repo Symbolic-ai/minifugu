@@ -1,6 +1,7 @@
 //! Run with TURBOPUFFER_BASE_URL and TURBOPUFFER_API_KEY to compare the same
 //! disposable-namespace contract with the live service. No account is needed
 //! for the ordinary test run.
+use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -197,6 +198,40 @@ async fn extended_contract(base: &str, token: &str) {
         json!({"rank_by":["vector","kNN",[1,0]],"filters":["group","Eq","a"],"limit":2}),
     )
     .await;
+    let encoded = STANDARD.encode([1.0_f32.to_le_bytes(), 0.0_f32.to_le_bytes()].concat());
+    let encoded_query = response(
+        &client,
+        token,
+        &format!("{source}/query"),
+        json!({
+            "rank_by":["vector","ANN",encoded],"limit":1,
+            "include_attributes":["vector"],"vector_encoding":"base64"
+        }),
+    )
+    .await;
+    let metadata_response = client
+        .get(format!("{base}/v1/namespaces/{name}/metadata"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    let metadata_status = metadata_response.status();
+    let metadata: Value = metadata_response.json().await.unwrap();
+    let warm_response = client
+        .get(format!("{base}/v1/namespaces/{name}/hint_cache_warm"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    let warm_status = warm_response.status();
+    let warm: Value = warm_response.json().await.unwrap();
+    let recall = response(
+        &client,
+        token,
+        &format!("{base}/v1/namespaces/{name}/_debug/recall"),
+        json!({"num":1,"top_k":1}),
+    )
+    .await;
     let attribute_rank = response(
         &client,
         token,
@@ -300,6 +335,21 @@ async fn extended_contract(base: &str, token: &str) {
     assert_eq!(regex.0, StatusCode::OK, "regex response: {:?}", regex.1);
     assert_eq!(regex.1["rows"][0]["id"], 2);
     assert_eq!(knn.0, StatusCode::OK, "kNN response: {:?}", knn.1);
+    assert_eq!(
+        encoded_query.0,
+        StatusCode::OK,
+        "base64 query: {:?}",
+        encoded_query.1
+    );
+    assert_eq!(encoded_query.1["rows"][0]["id"], 1);
+    assert!(encoded_query.1["rows"][0]["vector"].is_string());
+    assert_eq!(metadata_status, StatusCode::OK);
+    assert!(metadata["created_at"].is_string());
+    assert_eq!(metadata["encryption"]["sse"], true);
+    assert_eq!(warm_status, StatusCode::ACCEPTED);
+    assert_eq!(warm["status"], "ACCEPTED");
+    assert_eq!(recall.0, StatusCode::OK, "recall response: {:?}", recall.1);
+    assert!(recall.1["avg_recall"].is_number());
     assert_eq!(knn.1["rows"][0]["id"], 1);
     assert_eq!(
         attribute_rank.0,

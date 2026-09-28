@@ -4,6 +4,7 @@ mod embedding;
 mod persistence;
 mod query;
 mod store;
+mod vector;
 
 use axum::{
     extract::{Path, Query, State},
@@ -99,12 +100,22 @@ fn router_with_state(
             "/v1/namespaces/{namespace}/schema",
             get(get_schema).post(update_schema),
         )
+        .route("/v1/namespaces/{namespace}/metadata", get(get_metadata))
         .route("/v2/namespaces/{namespace}/metadata", get(get_metadata))
+        .route(
+            "/v1/namespaces/{namespace}/hint_cache_warm",
+            get(hint_cache_warm),
+        )
+        .route("/v1/namespaces/{namespace}/_debug/recall", post(recall))
         .route(
             "/v2/namespaces/{namespace}",
             post(write).delete(delete_namespace),
         )
         .route("/v2/namespaces/{namespace}/query", post(query_namespace))
+        .route(
+            "/v2/namespaces/{namespace}/explain_query",
+            post(explain_query),
+        )
         .with_state(state)
 }
 
@@ -164,9 +175,81 @@ async fn get_metadata(
     let namespace = guard
         .get(&name)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "namespace does not exist".into()))?;
-    Ok(Json(
-        json!({"schema":namespace.schema,"approx_row_count":namespace.rows.len(),"index":{"status":"up-to-date"},"read_only":false}),
+    Ok(Json(namespace.metadata()))
+}
+
+async fn hint_cache_warm(
+    Path(name): Path<String>,
+    State(state): State<Shared>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    authorized(&headers)?;
+    namespace_name(&name)?;
+    if !state.namespaces.read().await.contains_key(&name) {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "namespace does not exist".into(),
+        ));
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status":"ACCEPTED", "message":"cache warm hint accepted"
+        })),
     ))
+}
+
+async fn recall(
+    Path(name): Path<String>,
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    authorized(&headers)?;
+    namespace_name(&name)?;
+    let guard = state.namespaces.read().await;
+    let namespace = guard
+        .get(&name)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "namespace does not exist".into()))?;
+    namespace.recall(&body).map(Json).map_err(bad)
+}
+
+async fn explain_query(
+    Path(name): Path<String>,
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    authorized(&headers)?;
+    namespace_name(&name)?;
+    let guard = state.namespaces.read().await;
+    let namespace = guard
+        .get(&name)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "namespace does not exist".into()))?;
+    namespace.query(&body).map_err(bad)?;
+    let plan = if let Some(queries) = body.get("queries").and_then(Value::as_array) {
+        format!(
+            "MiniFugu exact scan of {} rows for {} subqueries; local fusion",
+            namespace.rows.len(),
+            queries.len()
+        )
+    } else {
+        let rank = if body.get("rank_by").is_some() {
+            "ranked"
+        } else {
+            "unranked"
+        };
+        let filter = if body.get("filters").is_some() {
+            "filtered"
+        } else {
+            "unfiltered"
+        };
+        format!(
+            "MiniFugu exact {filter} {rank} scan of {} rows",
+            namespace.rows.len()
+        )
+    };
+    Ok(Json(json!({"plan_text":plan})))
 }
 
 async fn update_schema(
@@ -189,6 +272,7 @@ async fn update_schema(
             store::WriteError::Invalid(message) => bad(message),
             store::WriteError::EmbeddingUnavailable => bad("embedding provider unavailable"),
         })?;
+    namespace.touch();
     let response = json!(namespace.schema);
     persist_namespace(&state, &mut guard, name, namespace)?;
     Ok(Json(response))
@@ -255,12 +339,14 @@ async fn write(
                 "destination namespace already exists".into(),
             ));
         }
-        let namespace = guard.get(source).cloned().ok_or_else(|| {
+        let mut namespace = guard.get(source).cloned().ok_or_else(|| {
             ApiError(
                 StatusCode::NOT_FOUND,
                 "source namespace does not exist".into(),
             )
         })?;
+        namespace.created_at = None;
+        namespace.touch();
         let rows = namespace.rows.len();
         persist_namespace(&state, &mut guard, name, namespace)?;
         return Ok(Json(
@@ -290,6 +376,7 @@ async fn write(
                 "embedding provider unavailable".into(),
             ),
         })?;
+    namespace.touch();
     persist_namespace(&state, &mut guard, name, namespace)?;
     Ok(Json(result))
 }

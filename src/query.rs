@@ -1,4 +1,5 @@
 use crate::store::{field_type, known_field, Namespace};
+use crate::vector;
 use chrono::{DateTime, FixedOffset};
 use globset::GlobBuilder;
 use regex::Regex;
@@ -7,6 +8,34 @@ use std::collections::{BTreeMap, HashMap};
 
 impl Namespace {
     pub fn query(&self, body: &Value) -> Result<Value, String> {
+        let mut normalized = body.clone();
+        vector::normalize_query(&mut normalized, &self.schema)?;
+        let mut result = self.query_inner(&normalized)?;
+        if body.get("vector_encoding") == Some(&json!("base64")) {
+            vector::encode_response(&mut result, &self.schema)?;
+        }
+        let bytes_queried = self
+            .rows
+            .values()
+            .map(|row| serde_json::to_vec(row).map_or(0, |bytes| bytes.len()))
+            .sum::<usize>();
+        let bytes_returned = serde_json::to_vec(&result).map_or(0, |bytes| bytes.len());
+        result["billing"] = json!({
+            "billable_logical_bytes_queried": bytes_queried,
+            "billable_logical_bytes_returned": bytes_returned
+        });
+        result["performance"] = json!({
+            "cache_hit_ratio": 1.0,
+            "cache_temperature": "hot",
+            "server_total_ms": 0,
+            "query_execution_ms": 0,
+            "exhaustive_search_count": self.rows.len(),
+            "approx_namespace_size": self.rows.len()
+        });
+        Ok(result)
+    }
+
+    fn query_inner(&self, body: &Value) -> Result<Value, String> {
         let object = body.as_object().ok_or("query body must be an object")?;
         validate_query_options(object)?;
         if let Some(queries) = object.get("queries") {
@@ -54,7 +83,7 @@ impl Namespace {
             }
             if object
                 .keys()
-                .any(|key| !matches!(key.as_str(), "queries" | "consistency"))
+                .any(|key| !matches!(key.as_str(), "queries" | "consistency" | "vector_encoding"))
             {
                 return Err(
                     "queries cannot be combined with other query fields without rerank_by".into(),
@@ -89,6 +118,7 @@ impl Namespace {
                     | "compute_attributes"
                     | "consistency"
                     | "distance_metric"
+                    | "vector_encoding"
             ) {
                 return Err(format!("unsupported query field {key}"));
             }
@@ -221,6 +251,11 @@ impl Namespace {
         }
         let rank = object.get("rank_by");
         let filter = object.get("filters");
+        let metric = object
+            .get("distance_metric")
+            .and_then(Value::as_str)
+            .or(self.distance_metric.as_deref())
+            .unwrap_or("cosine_distance");
         let ascending = rank.is_none_or(|rank| is_ann(rank) || is_ascending(rank));
         let mut scored = self
             .rows
@@ -229,7 +264,7 @@ impl Namespace {
                 if filter.is_some_and(|f| !filter_matches(f, row)) {
                     return None;
                 }
-                let score = rank.map_or(0.0, |rank| score_rank(rank, row, &self.rows));
+                let score = rank.map_or(0.0, |rank| score_rank(rank, row, &self.rows, metric));
                 if !score.is_finite()
                     || rank.is_some_and(|rank| {
                         !is_ascending(rank)
@@ -322,7 +357,7 @@ impl Namespace {
                 if let Some(computed) = object.get("compute_attributes").and_then(Value::as_object)
                 {
                     for (name, expression) in computed {
-                        let value = computed_value(expression, row, &self.rows);
+                        let value = computed_value(expression, row, &self.rows, metric);
                         result.insert(name.clone(), value);
                     }
                 }
@@ -336,7 +371,12 @@ impl Namespace {
         for key in object.keys() {
             if !matches!(
                 key.as_str(),
-                "aggregate_by" | "group_by" | "filters" | "top_k"
+                "aggregate_by"
+                    | "group_by"
+                    | "filters"
+                    | "top_k"
+                    | "vector_encoding"
+                    | "consistency"
             ) {
                 return Err(format!("unsupported aggregation field {key}"));
             }
@@ -409,7 +449,7 @@ impl Namespace {
             .collect::<Vec<_>>();
         let aggregates = object["aggregate_by"].as_object().unwrap();
         let Some(groups) = object.get("group_by") else {
-            return json!({"aggregations": aggregate_values(aggregates, &rows), "billing":{}, "performance":{"server_total_ms":0}});
+            return json!({"aggregations": aggregate_values(aggregates, &rows)});
         };
         let fields = groups.as_array().unwrap();
         let mut grouped = std::collections::BTreeMap::<
@@ -466,11 +506,17 @@ impl Namespace {
                 Value::Object(attrs)
             })
             .collect::<Vec<_>>();
-        json!({"aggregation_groups":groups, "billing":{}, "performance":{"server_total_ms":0}})
+        json!({"aggregation_groups":groups})
     }
 }
 
 fn validate_query_options(object: &Map<String, Value>) -> Result<(), String> {
+    if object
+        .get("vector_encoding")
+        .is_some_and(|encoding| !matches!(encoding.as_str(), Some("float" | "base64")))
+    {
+        return Err("vector_encoding must be float or base64".into());
+    }
     if let Some(consistency) = object.get("consistency") {
         let consistency = consistency
             .as_object()
@@ -484,11 +530,13 @@ fn validate_query_options(object: &Map<String, Value>) -> Result<(), String> {
             return Err("consistency.level must be strong or eventual".into());
         }
     }
-    if object
-        .get("distance_metric")
-        .is_some_and(|value| value != "cosine_distance")
-    {
-        return Err("only cosine_distance is supported".into());
+    if object.get("distance_metric").is_some_and(|value| {
+        !matches!(
+            value.as_str(),
+            Some("cosine_distance" | "euclidean_squared")
+        )
+    }) {
+        return Err("distance_metric must be cosine_distance or euclidean_squared".into());
     }
     Ok(())
 }
@@ -515,12 +563,13 @@ fn computed_value(
     expression: &Value,
     row: &Map<String, Value>,
     corpus: &BTreeMap<String, Map<String, Value>>,
+    metric: &str,
 ) -> Value {
     let mut rank = expression.clone();
     if rank[1] == "VectorDist" {
         rank[1] = json!("ANN");
     }
-    let score = score_rank(&rank, row, corpus);
+    let score = score_rank(&rank, row, corpus, metric);
     if score.is_finite() {
         json!(score)
     } else {
@@ -982,10 +1031,7 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
                     .as_array()
                     .is_some_and(|a| a.iter().all(Value::is_number)) =>
         {
-            if !(field.starts_with("embed_")
-                || field_type(&schema[field]).ends_with("]f16")
-                || field_type(&schema[field]).ends_with("]f32"))
-            {
+            if !(field.starts_with("embed_") || vector::dimensions(&schema[field]).is_some()) {
                 return Err(format!("attribute {field} is not a vector"));
             }
             let dimensions = field.strip_prefix("embed_").map_or_else(
@@ -1104,6 +1150,7 @@ fn score_rank(
     rank: &Value,
     row: &Map<String, Value>,
     corpus: &std::collections::BTreeMap<String, Map<String, Value>>,
+    metric: &str,
 ) -> f64 {
     let parts = rank.as_array().unwrap();
     if is_attribute_order(rank) {
@@ -1114,7 +1161,7 @@ fn score_rank(
             .as_array()
             .unwrap()
             .iter()
-            .map(|child| score_rank(child, row, corpus));
+            .map(|child| score_rank(child, row, corpus, metric));
         return if parts[0] == "Sum" {
             scores.sum()
         } else {
@@ -1127,7 +1174,7 @@ fn score_rank(
         } else {
             (&parts[2], &parts[1])
         };
-        return weight.as_f64().unwrap() * score_rank(expression, row, corpus);
+        return weight.as_f64().unwrap() * score_rank(expression, row, corpus, metric);
     }
     if parts[0] == "Attribute" {
         return row
@@ -1142,6 +1189,13 @@ fn score_rank(
             let vector = row.get(field).and_then(Value::as_array);
             match vector {
                 Some(vector) if vector.len() == query.len() => {
+                    if metric == "euclidean_squared" {
+                        return vector
+                            .iter()
+                            .zip(query)
+                            .map(|(a, b)| (a.as_f64().unwrap() - b.as_f64().unwrap()).powi(2))
+                            .sum();
+                    }
                     let dot: f64 = vector
                         .iter()
                         .zip(query)

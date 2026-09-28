@@ -1,5 +1,7 @@
 use crate::embedding::EmbeddingMode;
 use crate::query::{filter_matches, validate_filter};
+use crate::vector;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -9,6 +11,111 @@ pub struct Namespace {
     pub(crate) schema: Map<String, Value>,
     pub(crate) rows: BTreeMap<String, Map<String, Value>>,
     pub(crate) distance_metric: Option<String>,
+    #[serde(default)]
+    pub(crate) created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) updated_at: Option<DateTime<Utc>>,
+}
+
+impl Namespace {
+    pub(crate) fn touch(&mut self) {
+        let now = Utc::now();
+        self.created_at.get_or_insert(now);
+        self.updated_at = Some(now);
+    }
+
+    pub(crate) fn metadata(&self) -> Value {
+        let created_at = self.created_at.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+        let updated_at = self.updated_at.unwrap_or(created_at);
+        let approx_logical_bytes = self
+            .rows
+            .values()
+            .map(|row| serde_json::to_vec(row).map_or(0, |bytes| bytes.len()))
+            .sum::<usize>();
+        json!({
+            "schema": self.schema,
+            "approx_row_count": self.rows.len(),
+            "approx_logical_bytes": approx_logical_bytes,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "encryption": {"sse": true},
+            "index": {"status": "up-to-date"}
+        })
+    }
+
+    pub(crate) fn recall(&self, body: &Value) -> Result<Value, String> {
+        let options = body.as_object().ok_or("recall body must be an object")?;
+        for key in options.keys() {
+            if !matches!(
+                key.as_str(),
+                "num" | "top_k" | "filters" | "include_ground_truth"
+            ) {
+                return Err(format!("unsupported recall field {key}"));
+            }
+        }
+        let num = options
+            .get("num")
+            .map_or(Some(25), Value::as_u64)
+            .filter(|n| (1..=1000).contains(n))
+            .ok_or("num must be between 1 and 1000")? as usize;
+        let top_k = options
+            .get("top_k")
+            .map_or(Some(10), Value::as_u64)
+            .filter(|n| (1..=1000).contains(n))
+            .ok_or("top_k must be between 1 and 1000")?;
+        if options
+            .get("include_ground_truth")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err("include_ground_truth must be a boolean".into());
+        }
+        if let Some(filter) = options.get("filters") {
+            validate_filter(filter, &self.schema)?;
+        }
+        let vector_field = self
+            .schema
+            .iter()
+            .find(|(_, definition)| {
+                let kind = field_type(definition);
+                kind.ends_with("]f16") || kind.ends_with("]f32") || kind.ends_with("]i8")
+            })
+            .map(|(field, _)| field.as_str())
+            .ok_or("recall requires a vector attribute")?;
+        let mut ground_truth = Vec::new();
+        let mut total = 0usize;
+        let mut searched = 0usize;
+        for vector in self
+            .rows
+            .values()
+            .filter_map(|row| row.get(vector_field).and_then(Value::as_array))
+            .take(num)
+        {
+            searched += 1;
+            let mut query = json!({"rank_by":[vector_field,"ANN",vector],"limit":top_k,"include_attributes":true});
+            if let Some(filter) = options.get("filters") {
+                query["filters"] = filter.clone();
+            }
+            let result = self.query(&query)?;
+            let neighbors = result["rows"]
+                .as_array()
+                .ok_or("invalid recall query result")?;
+            total += neighbors.len();
+            if options.get("include_ground_truth") == Some(&Value::Bool(true)) {
+                ground_truth.push(json!({"query_vector":vector,"nearest_neighbors":neighbors}));
+            }
+        }
+        let average = if searched == 0 {
+            0.0
+        } else {
+            total as f64 / searched as f64
+        };
+        let mut result =
+            json!({"avg_recall":1.0,"avg_exhaustive_count":average,"avg_ann_count":average});
+        if options.get("include_ground_truth") == Some(&Value::Bool(true)) {
+            result["ground_truth"] = json!(ground_truth);
+        }
+        Ok(result)
+    }
 }
 
 pub enum WriteError {
@@ -48,16 +155,23 @@ impl Namespace {
                 self.schema.insert(field.clone(), definition.clone());
             }
         }
+        let mut normalized = body.clone();
+        vector::normalize_write(&mut normalized, &self.schema)?;
+        let object = normalized
+            .as_object()
+            .ok_or("write body must be an object")?;
         if let Some(metric) = object.get("distance_metric") {
             let metric = metric.as_str().ok_or("distance_metric must be a string")?;
-            if metric != "cosine_distance" {
+            if !matches!(metric, "cosine_distance" | "euclidean_squared") {
                 return Err(WriteError::Invalid(
-                    "only cosine_distance is supported".into(),
+                    "distance_metric must be cosine_distance or euclidean_squared".into(),
                 ));
             }
-            if !self.schema.values().any(|v| {
-                field_type(v).ends_with("]f16") || field_type(v).ends_with("]f32") || has_embed(v)
-            }) {
+            if !self
+                .schema
+                .values()
+                .any(|v| vector::dimensions(v).is_some() || has_embed(v))
+            {
                 return Err(WriteError::Invalid(
                     "distance_metric requires a vector attribute".into(),
                 ));
@@ -386,7 +500,9 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
         | "[]uint" | "[]int" | "[]float" | "[]string" | "[]bool" | "[]datetime" => Ok(()),
         value
             if value.starts_with('[')
-                && (value.ends_with("]f16") || value.ends_with("]f32"))
+                && (value.ends_with("]f16")
+                    || value.ends_with("]f32")
+                    || value.ends_with("]i8"))
                 && value
                     .trim_start_matches('[')
                     .split(']')
@@ -457,14 +573,22 @@ fn validate_value(field: &str, value: &Value, definition: &Value) -> Result<(), 
         "[]bool" => value
             .as_array()
             .is_some_and(|a| a.iter().all(Value::is_boolean)),
-        vector if vector.ends_with("]f16") || vector.ends_with("]f32") => {
+        vector if vector::dimensions(definition).is_some() => {
             let expected = vector
                 .trim_start_matches('[')
                 .split(']')
                 .next()
                 .and_then(|n| n.parse::<usize>().ok());
             value.as_array().is_some_and(|array| {
-                Some(array.len()) == expected && array.iter().all(Value::is_number)
+                Some(array.len()) == expected
+                    && array.iter().all(|item| {
+                        if vector.ends_with("]i8") {
+                            item.as_f64()
+                                .is_some_and(|number| (-128.0..=127.0).contains(&number))
+                        } else {
+                            item.is_number()
+                        }
+                    })
             })
         }
         _ => false,
