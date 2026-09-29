@@ -68,6 +68,53 @@ async fn equal_bm25_scores_order_numeric_ids_numerically() {
 }
 
 #[tokio::test]
+async fn attribute_and_rrf_ties_order_numeric_ids_numerically() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/ranking-ties");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","group":"string"},
+            "upsert_rows":[{"id":11,"group":"same"},{"id":2,"group":"same"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, ordered) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["group","asc"],"limit":2
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&ordered), [2, 11]);
+    let (status, fused) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "queries":[
+                {"rank_by":["id","asc"],"limit":2},
+                {"rank_by":["id","desc"],"limit":2}
+            ],
+            "rerank_by":["RRF"],"limit":2,"vector_encoding":"base64"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fused}");
+    let ids = fused["results"][0]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, [2, 11]);
+}
+
+#[tokio::test]
 async fn exact_cosine_ranks_explicit_vectors_and_rejects_wrong_dimensions() {
     let base = serve(minifugu::router()).await;
     let client = Client::new();
@@ -1480,6 +1527,116 @@ async fn highlights_match_the_live_service() {
         for (row, expected) in rows.iter().zip(expected) {
             assert_eq!(row["id"], expected["id"], "{label}");
             assert_eq!(row["h"], expected["h"], "{label} row {}", row["id"]);
+            if let Some(score) = expected["$dist"].as_f64() {
+                assert_close(row["$dist"].as_f64().unwrap(), score);
+            }
         }
+    }
+}
+
+#[tokio::test]
+async fn explicit_fragment_rank_does_not_change_sibling_bm25_score() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/fragment-stats");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","body":{"type":"string","full_text_search":true}},
+            "upsert_rows":[
+                {"id":1,"body":"red fish. Fish swim."},
+                {"id":2,"body":"blue whale. Fish swim."}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query_url = format!("{url}/query");
+    let score = json!(["body", "BM25", "fish"]);
+    let (status, baseline) = post(
+        &client,
+        &query_url,
+        json!({
+            "rank_by":["id","asc"],"limit":2,
+            "compute_attributes":{"score":score}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, highlighted) = post(
+        &client,
+        &query_url,
+        json!({
+            "rank_by":["id","asc"],"limit":2,
+            "compute_attributes":{
+                "highlight":["Highlight","body",{"rank_fragments_by":score}],
+                "score":score
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{highlighted}");
+    for (baseline, highlighted) in baseline["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(highlighted["rows"].as_array().unwrap())
+    {
+        assert_eq!(highlighted["score"], baseline["score"]);
+    }
+}
+
+#[tokio::test]
+async fn pre_tokenized_array_queries_and_validation_match_live() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/pre-tokenized");
+    let (status, body) = post(&client, &url, json!({
+        "schema":{"id":"uint","text":{"type":"[]string","full_text_search":{"tokenizer":"pre_tokenized_array"}}},
+        "upsert_rows":[{"id":1,"text":["FoO","bar"]}]
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let query_url = format!("{url}/query");
+    let (status, result) = post(
+        &client,
+        &query_url,
+        json!({
+            "rank_by":["text","BM25",["FoO"]],"limit":2
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&result), [1]);
+    let (status, _) = post(
+        &client,
+        &query_url,
+        json!({
+            "rank_by":["text","BM25","FoO"],"limit":2
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = post(&client, &query_url, json!({
+        "rank_by":["id","asc"],"limit":2,
+        "compute_attributes":{"h":["Highlight","text",{"rank_fragments_by":["text","BM25",["FoO"]]}]}
+    })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for config in [
+        json!({"tokenizer":"pre_tokenized_array","stemming":true}),
+        json!({"tokenizer":"pre_tokenized_array","remove_stopwords":true}),
+        json!({"tokenizer":"pre_tokenized_array","case_sensitive":false}),
+        json!({"tokenizer":"pre_tokenized_array","language":"english"}),
+    ] {
+        let (status, _) = post(
+            &client,
+            &format!("{url}-invalid"),
+            json!({
+                "schema":{"id":"uint","text":{"type":"[]string","full_text_search":config}},
+                "upsert_rows":[{"id":1,"text":["FoO"]}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{config}");
     }
 }

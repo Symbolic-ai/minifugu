@@ -1,7 +1,7 @@
 //! The `Highlight` computed attribute: splits a full-text attribute into fragments, scores
 //! them with BM25 using the row's own fragments as the corpus, and returns the best ones.
 
-use crate::query::{forget_field_stats, score_rank, validate_rank};
+use crate::query::{score_rank, validate_rank, with_isolated_field_stats};
 use crate::text::{self, TextAnalysis};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashSet};
@@ -208,7 +208,12 @@ pub(crate) fn compute(
         .iter()
         .enumerate()
         .map(|(index, fragment)| {
-            let mut fragment_row = row.clone();
+            // Auto-derived ranks read only $fragment. Explicit ranks may read other row fields.
+            let mut fragment_row = if options.contains_key("rank_fragments_by") {
+                row.clone()
+            } else {
+                Map::new()
+            };
             fragment_row.insert(
                 FRAGMENT.into(),
                 json!(&inputs[fragment.input_index][fragment.range.clone()]),
@@ -216,11 +221,11 @@ pub(crate) fn compute(
             (format!("{index:08}"), fragment_row)
         })
         .collect();
-    forget_field_stats(FRAGMENT);
-    for (fragment, fragment_row) in fragments.iter_mut().zip(corpus.values()) {
-        fragment.score = score_rank(&ranking, fragment_row, &corpus, &fragment_schema, metric);
-    }
-    forget_field_stats(FRAGMENT);
+    with_isolated_field_stats(|| {
+        for (fragment, fragment_row) in fragments.iter_mut().zip(corpus.values()) {
+            fragment.score = score_rank(&ranking, fragment_row, &corpus, &fragment_schema, metric);
+        }
+    });
 
     fragments.retain(|fragment| fragment.score.is_finite() && fragment.score > 0.0);
     fragments.sort_by(|a, b| {
@@ -236,12 +241,15 @@ pub(crate) fn compute(
     fragments.truncate(limit);
 
     let offsets = options.get("include_offsets").and_then(Value::as_str);
-    let mut terms = HashSet::new();
-    query_terms(&ranking, &analysis, &mut terms);
-    let tokens: Vec<_> = inputs
-        .iter()
-        .map(|input| analysis.analyze(&json!(input)))
-        .collect();
+    let offset_data = offsets.map(|_| {
+        let mut terms = HashSet::new();
+        query_terms(&ranking, &analysis, &mut terms);
+        let tokens = inputs
+            .iter()
+            .map(|input| analysis.analyze(&json!(input)))
+            .collect::<Vec<_>>();
+        (terms, tokens)
+    });
     let is_array = matches!(row.get(field), Some(Value::Array(_)));
     let highlights = fragments
         .iter()
@@ -255,6 +263,7 @@ pub(crate) fn compute(
                     "fragment_range".into(),
                     json!([position(fragment.range.start), position(fragment.range.end)]),
                 );
+                let (terms, tokens) = offset_data.as_ref().unwrap();
                 let matches: Vec<Value> = tokens[fragment.input_index]
                     .iter()
                     .filter(|token| {

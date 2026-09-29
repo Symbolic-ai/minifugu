@@ -13,11 +13,17 @@ pub(crate) fn open(directory: &Path) -> io::Result<(PathBuf, HashMap<String, Nam
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
     }
     let path = directory.join("namespaces.json");
-    let namespaces = match fs::read(&path) {
+    let mut namespaces: HashMap<String, Namespace> = match fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => HashMap::new(),
         Err(error) => return Err(error),
     };
+    // Older snapshots lack the cached byte estimate; compute it once on startup.
+    for namespace in namespaces.values_mut() {
+        if namespace.approx_logical_bytes.is_none() {
+            namespace.approx_logical_bytes = Some(namespace.logical_bytes());
+        }
+    }
     Ok((path, namespaces))
 }
 

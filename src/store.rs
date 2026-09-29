@@ -60,8 +60,7 @@ impl Namespace {
                 .get("full_text_search")
                 .filter(|config| config.is_object() || **config == json!(true))
                 .map(text::normalized_config);
-            let fixed_vector = vector::dimensions(definition).is_some()
-                && vector::multi_dimensions(definition).is_none();
+            let fixed_vector = is_fixed_vector(definition);
             match view {
                 SchemaView::Schema => {
                     attribute.insert("filterable".into(), json!(filterable));
@@ -90,6 +89,26 @@ impl Namespace {
                 if definition.get(option) == Some(&Value::Bool(true)) {
                     attribute.insert(option.into(), json!(true));
                 }
+            }
+            if let Some(embed) = definition.get("embed") {
+                let generated = format!("embed_{field}");
+                if matches!(view, SchemaView::Metadata) {
+                    attribute.insert(
+                        "embed".into(),
+                        json!({"attribute":generated,"model":embed["model"]}),
+                    );
+                }
+                let kind = format!("[{}]f16", embed["dims"].as_u64().unwrap());
+                let generated_attribute = match view {
+                    SchemaView::Schema => json!({
+                        "type":kind,"filterable":false,"full_text_search":null,"ann":true
+                    }),
+                    SchemaView::Metadata => json!({
+                        "type":kind,"filterable":false,
+                        "ann":{"distance_metric":self.distance_metric.as_deref().unwrap_or("cosine_distance")}
+                    }),
+                };
+                attributes.insert(generated, generated_attribute);
             }
             attributes.insert(field.clone(), Value::Object(attribute));
         }
@@ -568,14 +587,16 @@ fn default_filterable(definition: &Value) -> bool {
             .get(option)
             .is_some_and(|value| value == &json!(true) || value.is_object())
     };
-    let fixed_vector =
-        vector::dimensions(definition).is_some() && vector::multi_dimensions(definition).is_none();
     !(enabled("full_text_search")
         || enabled("regex")
         || enabled("glob")
         || enabled("fuzzy")
-        || fixed_vector
+        || is_fixed_vector(definition)
         || matches!(field_type(definition), "{}f16" | "bytes"))
+}
+
+fn is_fixed_vector(definition: &Value) -> bool {
+    vector::dimensions(definition).is_some() && vector::multi_dimensions(definition).is_none()
 }
 
 pub(crate) fn field_type(definition: &Value) -> &str {

@@ -38,7 +38,9 @@ impl Namespace {
         let object = body.as_object().ok_or("query body must be an object")?;
         validate_query_options(object)?;
         if let Some(queries) = object.get("queries") {
-            let queries = queries.as_array().ok_or("queries must be an array")?;
+            let queries = queries
+                .as_array()
+                .ok_or_else(|| crate::shape_error("queries must be an array"))?;
             for query in queries {
                 self.validate_query(query)?;
             }
@@ -135,7 +137,7 @@ impl Namespace {
         if let Some(computed) = object.get("compute_attributes") {
             let computed = computed
                 .as_object()
-                .ok_or("compute_attributes must be an object")?;
+                .ok_or_else(|| crate::shape_error("compute_attributes must be an object"))?;
             if computed.len() > 256 {
                 return Err("compute_attributes exceeds 256 fields".into());
             }
@@ -155,9 +157,9 @@ impl Namespace {
         validate_query_options(object)?;
         if let Some(include) = object.get("include_attributes") {
             if !include.is_boolean() {
-                let fields = include
-                    .as_array()
-                    .ok_or("include_attributes must be an array or boolean")?;
+                let fields = include.as_array().ok_or_else(|| {
+                    crate::shape_error("include_attributes must be an array or boolean")
+                })?;
                 for field in fields {
                     let name = field
                         .as_str()
@@ -171,7 +173,7 @@ impl Namespace {
         if let Some(exclude) = object.get("exclude_attributes") {
             let fields = exclude
                 .as_array()
-                .ok_or("exclude_attributes must be an array")?;
+                .ok_or_else(|| crate::shape_error("exclude_attributes must be an array"))?;
             if fields.iter().any(|field| !field.is_string()) {
                 return Err("exclude_attributes entries must be strings".into());
             }
@@ -430,7 +432,9 @@ impl Namespace {
             validate_filter(filter, &self.schema)?;
         }
         if let Some(groups) = object.get("group_by") {
-            let groups = groups.as_array().ok_or("group_by must be an array")?;
+            let groups = groups
+                .as_array()
+                .ok_or_else(|| crate::shape_error("group_by must be an array"))?;
             let mut seen = std::collections::HashSet::new();
             for field in groups {
                 let field = field
@@ -571,12 +575,14 @@ fn validate_query_options(object: &Map<String, Value>) -> Result<(), String> {
 fn validate_computed(expression: &Value, schema: &Map<String, Value>) -> Result<(), String> {
     let parts = expression
         .as_array()
-        .ok_or("computed attribute expression must be an array")?;
+        .ok_or_else(|| crate::shape_error("computed attribute expression must be an array"))?;
     if parts.get(1) == Some(&json!("BM25")) {
         return validate_rank(expression, schema);
     }
     if parts.len() != 3 {
-        return Err("computed attribute requires a three-part expression".into());
+        return Err(crate::shape_error(
+            "computed attribute requires a three-part expression",
+        ));
     }
     if parts[1] == "VectorDist" {
         let mut rank = parts.clone();
@@ -615,14 +621,14 @@ fn validate_rrf(
     if object.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "queries" | "rerank_by" | "limit" | "offset" | "consistency"
+            "queries" | "rerank_by" | "limit" | "offset" | "consistency" | "vector_encoding"
         )
     }) {
         return Err("unsupported multi-query field".into());
     }
     let parts = object["rerank_by"]
         .as_array()
-        .ok_or("rerank_by must be an array")?;
+        .ok_or_else(|| crate::shape_error("rerank_by must be an array"))?;
     if parts.is_empty() || parts.len() > 2 || parts[0] != "RRF" {
         return Err("only RRF reranking is supported".into());
     }
@@ -690,18 +696,30 @@ fn aggregate_values(
                 json!(rows.len())
             } else {
                 let field = parts[1].as_str().unwrap();
-                let total: f64 = rows
-                    .iter()
-                    .filter_map(|row| row.get(field).and_then(Value::as_f64))
-                    .sum();
-                if field_type(&schema[field]) != "float"
-                    && total.fract() == 0.0
-                    && total >= i64::MIN as f64
-                    && total <= i64::MAX as f64
-                {
-                    json!(total as i64)
-                } else {
+                if field_type(&schema[field]) == "float" {
+                    let total: f64 = rows
+                        .iter()
+                        .filter_map(|row| row.get(field).and_then(Value::as_f64))
+                        .sum();
                     json!(total)
+                } else {
+                    let total: i128 = rows
+                        .iter()
+                        .filter_map(|row| row.get(field))
+                        .filter_map(|value| {
+                            value
+                                .as_i64()
+                                .map(i128::from)
+                                .or_else(|| value.as_u64().map(i128::from))
+                        })
+                        .sum();
+                    if let Ok(signed) = i64::try_from(total) {
+                        json!(signed)
+                    } else if let Ok(unsigned) = u64::try_from(total) {
+                        json!(unsigned)
+                    } else {
+                        json!(total as f64)
+                    }
                 }
             };
             (name.clone(), value)
@@ -1162,7 +1180,9 @@ fn compare_values(left: &Value, right: &Value) -> Option<i8> {
 }
 
 pub(crate) fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String> {
-    let parts = rank.as_array().ok_or("rank_by must be an array")?;
+    let parts = rank
+        .as_array()
+        .ok_or_else(|| crate::shape_error("rank_by must be an array"))?;
     if !parts.is_empty() && parts.iter().all(Value::is_array) {
         for part in parts {
             validate_rank(part, schema)?;
@@ -1179,6 +1199,9 @@ pub(crate) fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result
         }
         for child in children {
             // Max accepts scalar floors such as ["Max", [0, expression]]; Sum does not.
+            if parts[0] == "Sum" && child.is_number() {
+                return Err("Sum aggregations can only contain other text queries".into());
+            }
             if parts[0] == "Max" && child.is_number() {
                 if child
                     .as_f64()
@@ -1847,9 +1870,13 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
-/// Drops the cached statistics of one attribute, for corpora that change within a request.
-pub(crate) fn forget_field_stats(field: &str) {
-    FIELD_STATS.with(|stats| stats.borrow_mut().remove(field));
+/// Fragment ranking uses a different corpus from the outer query. Keep its BM25 statistics
+/// separate so explicit `rank_fragments_by` expressions cannot affect sibling scores.
+pub(crate) fn with_isolated_field_stats<T>(work: impl FnOnce() -> T) -> T {
+    let saved = FIELD_STATS.with(|stats| std::mem::take(&mut *stats.borrow_mut()));
+    let result = work();
+    FIELD_STATS.with(|stats| *stats.borrow_mut() = saved);
+    result
 }
 
 /// Drops per-request text caches. Every request that reads rows calls this first.

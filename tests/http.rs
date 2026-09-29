@@ -108,6 +108,13 @@ async fn query_shape_errors_use_live_status_codes() {
         json!({"rank_by":["id","asc"],"filters":["id","Equals",1],"limit":1}),
         json!({"aggregate_by":{"count":["Avg","id"]}}),
         json!({"aggregate_by":{"count":["Count"]},"group_by":["id"],"limit":1}),
+        json!({"rank_by":"id","limit":1}),
+        json!({"queries":{}}),
+        json!({"rank_by":["id","asc"],"limit":1,"include_attributes":"id"}),
+        json!({"rank_by":["id","asc"],"limit":1,"exclude_attributes":"id"}),
+        json!({"rank_by":["id","asc"],"limit":1,"compute_attributes":[]}),
+        json!({"rank_by":["id","asc"],"limit":1,"compute_attributes":{"x":["id","VectorDist"]}}),
+        json!({"aggregate_by":{"count":["Count"]},"group_by":"id"}),
     ] {
         let (status, body) = post(&client, &query_url, query.clone()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{query}: {body}");
@@ -1151,4 +1158,153 @@ async fn schema_views_match_the_live_service() {
             "metadata view of {field}"
         );
     }
+}
+
+#[tokio::test]
+async fn embedded_attribute_schema_views_match_live_shapes() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/embedded-schema");
+    let origin = base.trim_end_matches("/v2/namespaces");
+    let (status, body) = post(&client, &url, json!({
+        "schema":{"id":"uint","body":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":1536}}},
+        "distance_metric":"cosine_distance",
+        "upsert_rows":[{"id":1,"body":"red fish"}]
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let schema: Value = client
+        .get(format!("{origin}/v1/namespaces/embedded-schema/schema"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        schema["body"],
+        json!({
+            "type":"string","filterable":true,"full_text_search":null
+        })
+    );
+    assert_eq!(
+        schema["embed_body"],
+        json!({
+            "type":"[1536]f16","filterable":false,"full_text_search":null,"ann":true
+        })
+    );
+    let metadata: Value = client
+        .get(format!("{origin}/v1/namespaces/embedded-schema/metadata"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata["schema"]["body"],
+        json!({
+            "type":"string","filterable":true,
+            "embed":{"attribute":"embed_body","model":"openai/text-embedding-3-small"}
+        })
+    );
+    assert_eq!(
+        metadata["schema"]["embed_body"],
+        json!({
+            "type":"[1536]f16","filterable":false,
+            "ann":{"distance_metric":"cosine_distance"}
+        })
+    );
+}
+
+#[tokio::test]
+async fn integer_sum_keeps_values_beyond_float_precision() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/exact-sum");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","big":"uint"},
+            "upsert_rows":[{"id":1,"big":9007199254740992_u64},{"id":2,"big":1}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "aggregate_by":{"sum":["Sum","big"]}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["aggregations"]["sum"], json!(9007199254740993_u64));
+}
+
+#[tokio::test]
+async fn inferred_numeric_and_array_types_follow_live_rules() {
+    let base = server().await;
+    let client = Client::new();
+    let origin = base.trim_end_matches("/v2/namespaces");
+    let url = format!("{base}/inferred-types");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({
+            "upsert_rows":[{"id":1,"count":3,"empty":[]}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let schema: Value = client
+        .get(format!("{origin}/v1/namespaces/inferred-types/schema"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(schema["count"]["type"], "int");
+    assert_eq!(schema["empty"]["type"], "[]unknown");
+
+    let (status, body) = post(
+        &client,
+        &format!("{base}/inferred-decimal"),
+        json!({
+            "upsert_rows":[{"id":1,"fraction":1.5}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("signed 64-bit integer"));
+
+    let (status, body) = post(
+        &client,
+        &format!("{base}/inferred-multivector"),
+        json!({
+            "upsert_rows":[{"id":1,"tokens":[[1.0,0.0],[0.0,1.0]]}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let schema: Value = client
+        .get(format!(
+            "{origin}/v1/namespaces/inferred-multivector/schema"
+        ))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(schema["tokens"]["type"], "[][2]f32");
 }
