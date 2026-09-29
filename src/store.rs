@@ -6,7 +6,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Namespace {
@@ -261,6 +261,9 @@ impl Namespace {
         crate::query::reset_text_caches();
         let object = body.as_object().ok_or("write body must be an object")?;
         validate_write_keys(object)?;
+        let existing_namespace =
+            self.created_at.is_some() || !self.schema.is_empty() || !self.rows.is_empty();
+        let previous_vectors = vector_attributes(&self.schema);
         if let Some(schema) = object.get("schema") {
             let schema = schema.as_object().ok_or("schema must be an object")?;
             for (field, definition) in schema {
@@ -407,6 +410,18 @@ impl Namespace {
                     }
                 }
             }
+        }
+        let current_vectors = vector_attributes(&self.schema);
+        if existing_namespace {
+            if let Some(field) = current_vectors.difference(&previous_vectors).next() {
+                return Err(format!(
+                    "cannot add new vector attribute '{field}' to an existing namespace"
+                )
+                .into());
+            }
+        }
+        if current_vectors.len() > 8 {
+            return Err("a namespace supports at most 8 vector attributes".into());
         }
         if self.distance_metric.is_none()
             && self.schema.values().any(|definition| {
@@ -644,6 +659,22 @@ impl Namespace {
         }
         Ok(())
     }
+}
+
+fn vector_attributes(schema: &Map<String, Value>) -> BTreeSet<String> {
+    let mut fields = BTreeSet::new();
+    for (field, definition) in schema {
+        if is_fixed_vector(definition)
+            || vector::multi_dimensions(definition).is_some()
+            || (field == "vector" && definition == "[]unknown")
+        {
+            fields.insert(field.clone());
+        }
+        if has_embed(definition) {
+            fields.insert(format!("embed_{field}"));
+        }
+    }
+    fields
 }
 
 fn validate_distinct_document_ids(object: &Map<String, Value>) -> Result<(), WriteError> {

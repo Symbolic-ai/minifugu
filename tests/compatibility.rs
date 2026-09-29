@@ -764,6 +764,7 @@ async fn local_contract() {
     regex_array_contract(&format!("http://{address}"), "dummy").await;
     inferred_vector_contract(&format!("http://{address}"), "dummy").await;
     embedded_write_contract(&format!("http://{address}"), "dummy").await;
+    vector_lifecycle_contract(&format!("http://{address}"), "dummy").await;
     embed_schema_contract(&format!("http://{address}"), "dummy").await;
     sort_validation_contract(&format!("http://{address}"), "dummy").await;
     query_embed_contract(&format!("http://{address}"), "dummy").await;
@@ -788,6 +789,7 @@ async fn optional_real_turbopuffer_contract() {
     regex_array_contract(base.trim_end_matches('/'), &token).await;
     inferred_vector_contract(base.trim_end_matches('/'), &token).await;
     embedded_write_contract(base.trim_end_matches('/'), &token).await;
+    vector_lifecycle_contract(base.trim_end_matches('/'), &token).await;
     embed_schema_contract(base.trim_end_matches('/'), &token).await;
     sort_validation_contract(base.trim_end_matches('/'), &token).await;
     query_embed_contract(base.trim_end_matches('/'), &token).await;
@@ -1518,6 +1520,71 @@ async fn ann_contract(base: &str, token: &str) {
         StatusCode::BAD_REQUEST,
         "namespace metric change: {}",
         changed_metric.1
+    );
+}
+
+async fn vector_lifecycle_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-vector-lifecycle-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let create = response(
+        &client,
+        token,
+        &url,
+        json!({"schema":{"v1":{"type":"[2]f32","ann":true}},"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"v1":[1,0]}]}),
+    )
+    .await;
+    let add = response(
+        &client,
+        token,
+        &url,
+        json!({"schema":{"v2":{"type":"[2]f32","ann":true}},"upsert_rows":[{"id":1,"v1":[1,0],"v2":[0,1]}]}),
+    )
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(
+        create.0,
+        StatusCode::OK,
+        "vector lifecycle create: {}",
+        create.1
+    );
+    assert_eq!(
+        add.0,
+        StatusCode::BAD_REQUEST,
+        "vector lifecycle add: {}",
+        add.1
+    );
+    assert_eq!(cleanup.status(), StatusCode::OK);
+
+    let name = format!("minifugu-vector-limit-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let schema = (0..9)
+        .map(|index| {
+            let field = if index == 0 {
+                "vector".to_owned()
+            } else {
+                format!("v{index}")
+            };
+            (field, json!({"type":"[2]f32","ann":true}))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let mut row = serde_json::Map::from_iter([("id".into(), json!(1))]);
+    for field in schema.keys() {
+        row.insert(field.clone(), json!([1, 0]));
+    }
+    let ninth = response(
+        &client,
+        token,
+        &url,
+        json!({"schema":schema,"distance_metric":"cosine_distance","upsert_rows":[row]}),
+    )
+    .await;
+    let _ = client.delete(&url).bearer_auth(token).send().await;
+    assert_eq!(
+        ninth.0,
+        StatusCode::BAD_REQUEST,
+        "nine vectors: {}",
+        ninth.1
     );
 }
 

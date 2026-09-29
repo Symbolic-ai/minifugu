@@ -2514,3 +2514,78 @@ async fn undeclared_vector_attribute_is_inferred_like_live() {
         assert_eq!(status, StatusCode::OK, "{name}: {body}");
     }
 }
+
+#[tokio::test]
+async fn vector_columns_are_fixed_at_namespace_creation_and_capped_at_eight() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/vector-lifecycle");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"schema":{"v1":{"type":"[2]f32","ann":true}},"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"v1":[1,0]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"schema":{"v2":{"type":"[2]f32","ann":true}},"upsert_rows":[{"id":1,"v1":[1,0],"v2":[0,1]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("cannot add new vector attribute"));
+
+    let url = format!("{base}/scalar-to-vector");
+    let (status, body) = post(&client, &url, json!({"upsert_rows":[{"id":1,"title":"a"}]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"schema":{"v1":{"type":"[2]f32","ann":true}},"upsert_rows":[{"id":1,"v1":[1,0]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("cannot add new vector attribute"));
+
+    for count in [8, 9] {
+        let names = (0..count)
+            .map(|index| {
+                if index == 0 {
+                    "vector".to_owned()
+                } else {
+                    format!("v{index}")
+                }
+            })
+            .collect::<Vec<_>>();
+        let schema = names
+            .iter()
+            .map(|name| (name.clone(), json!({"type":"[2]f32","ann":true})))
+            .collect::<serde_json::Map<_, _>>();
+        let mut row = serde_json::Map::from_iter([("id".into(), json!(1))]);
+        for name in names {
+            row.insert(name, json!([1, 0]));
+        }
+        let (status, body) = post(
+            &client,
+            &format!("{base}/{count}-vectors"),
+            json!({"schema":schema,"distance_metric":"cosine_distance","upsert_rows":[row]}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            if count == 8 {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            "{count}: {body}"
+        );
+    }
+}
