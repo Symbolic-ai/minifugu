@@ -1652,8 +1652,14 @@ async fn unsupported_fields_fail_loudly() {
         .as_str()
         .unwrap()
         .contains("unsupported schema option geo"));
+    let (status, _) = post(
+        &client,
+        &format!("{base}/invalid-sparse-metric"),
+        json!({"schema":{"terms":{"type":"{}f16","sparse_knn":{"distance_metric":"cosine_distance"}}},"upsert_rows":[{"id":1}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     for (index, schema) in [
-        json!({"terms":{"type":"{}f16","sparse_knn":{"distance_metric":"cosine_distance"}}}),
         json!({"terms":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"},"filterable":true}}),
         json!({"blob":{"type":"bytes","filterable":true}}),
         json!({"vector":{"type":"[2]f32","ann":{"late_interaction":true}}}),

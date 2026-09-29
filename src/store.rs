@@ -387,8 +387,9 @@ impl Namespace {
         }
         if self.distance_metric.is_none()
             && self.schema.values().any(|definition| {
-                vector::dimensions(definition).is_some()
-                    && vector::multi_dimensions(definition).is_none()
+                (vector::dimensions(definition).is_some()
+                    && vector::multi_dimensions(definition).is_none())
+                    || has_embed(definition)
             })
         {
             return Err(
@@ -859,15 +860,18 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
                     }
                 }
                 "sparse_knn" => {
-                    if field_type(definition) != "{}f16"
-                        || value.as_object().is_none_or(|config| {
-                            config.len() != 1
-                                || config.get("distance_metric") != Some(&json!("dot_product"))
-                        })
-                    {
+                    if field_type(definition) != "{}f16" {
                         return Err(format!(
-                            "invalid sparse_knn configuration for attribute {field}"
+                            "sparse_knn is only supported on sparse vector attributes: {field}"
                         ));
+                    }
+                    if value.as_object().is_none_or(|config| {
+                        config.len() != 1
+                            || config.get("distance_metric") != Some(&json!("dot_product"))
+                    }) {
+                        return Err(crate::shape_error(format!(
+                            "schema.{field}.sparse_knn.distance_metric is invalid"
+                        )));
                     }
                 }
                 "embed" if !value.is_object() => {
