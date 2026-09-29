@@ -54,6 +54,8 @@ For `openai/text-embedding-3-small`, `embed` may also be the model string, or an
 The default provider hashes tokens deterministically. This keeps CI reproducible and keyless; these vectors are **not semantic embeddings**. Query with `"rank_by":["content","ANN",["Embed","red fugu"]]`, or pass a vector from `minifugu::deterministic_embedding(query, dims)`.
 
 
+Each upsert must provide nonempty text for an embedded field, or supply its generated `embed_<field>` vector explicitly. Both provider-generated and explicit vectors are stored at f16 precision. An explicit generated vector skips the embedding call, including when the row also has source text. The source field must be declared as `string`.
+
 For semantic embeddings, opt in to OpenAI:
 
 ```sh

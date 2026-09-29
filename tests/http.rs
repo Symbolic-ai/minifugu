@@ -2130,6 +2130,127 @@ async fn embedded_attribute_schema_views_match_live_shapes() {
 }
 
 #[tokio::test]
+async fn embedded_upserts_require_text_or_accept_an_explicit_generated_vector() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/embedded-upserts");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":4}}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"content":"pufferfish"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["id","asc"],"limit":10,"include_attributes":["embed_content"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for value in body["rows"][0]["embed_content"].as_array().unwrap() {
+        let stored = value.as_f64().unwrap() as f32;
+        assert_eq!(stored, half::f16::from_f32(stored).to_f32());
+    }
+    for row in [
+        json!({"id":2}),
+        json!({"id":3,"content":null}),
+        json!({"id":4,"content":""}),
+        json!({"id":5,"embed_content":null}),
+    ] {
+        let (status, body) = post(&client, &url, json!({"upsert_rows":[row]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("non-empty string"));
+    }
+    for row in [
+        json!({"id":6,"embed_content":[1.0,0.0,0.0,0.0]}),
+        json!({"id":7,"content":"pufferfish","embed_content":[1.0,0.0,0.0,0.0]}),
+    ] {
+        let (status, body) = post(&client, &url, json!({"upsert_rows":[row]})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"upsert_rows":[{"id":8,"embed_content":[1.0,0.0]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["id","asc"],
+            "filters":["id","In",[6,7]],
+            "limit":10,
+            "include_attributes":true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["id"], 6);
+    assert!(body["rows"][0].get("content").is_none());
+    assert_eq!(
+        body["rows"][0]["embed_content"],
+        json!([1.0, 0.0, 0.0, 0.0])
+    );
+    assert_eq!(body["rows"][1]["id"], 7);
+    assert_eq!(body["rows"][1]["content"], "pufferfish");
+    assert_eq!(
+        body["rows"][1]["embed_content"],
+        json!([1.0, 0.0, 0.0, 0.0])
+    );
+    let explicit = [0.1234567_f32, 0.0, 0.0, 0.0];
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"upsert_columns":{"id":[9],"embed_content":[STANDARD.encode(explicit.iter().flat_map(|number| number.to_le_bytes()).collect::<Vec<_>>())]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["id","asc"],"filters":["id","Eq",9],"limit":1,"include_attributes":["embed_content"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rows"][0]["embed_content"][0].as_f64().unwrap() as f32,
+        half::f16::from_f32(explicit[0]).to_f32()
+    );
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"upsert_rows":[{"id":10,"embed_content":[1e6,0.0,0.0,0.0]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"schema":{"wrong":{"type":"int","embed":{"model":"openai/text-embedding-3-small","dims":4}}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"patch_rows":[{"id":1,"embed_content":"not base64"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("does not exist in schema"));
+}
+
+#[tokio::test]
 async fn embedding_schema_shorthand_infers_supported_model_dimensions() {
     let base = server().await;
     let client = Client::new();

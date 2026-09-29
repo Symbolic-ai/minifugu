@@ -321,8 +321,17 @@ impl Namespace {
                 self.schema.insert("vector".into(), definition);
             }
         }
+        let generated_vectors = self
+            .schema
+            .iter()
+            .filter_map(|(field, definition)| {
+                let embed = definition.get("embed")?;
+                let dims = embed.get("dims").and_then(Value::as_u64).unwrap_or(1536);
+                Some((format!("embed_{field}"), json!(format!("[{dims}]f16"))))
+            })
+            .collect::<Map<_, _>>();
         let mut normalized = body.clone();
-        vector::normalize_write(&mut normalized, &self.schema)?;
+        vector::normalize_write(&mut normalized, &self.schema, &generated_vectors)?;
         let object = normalized
             .as_object()
             .ok_or("write body must be an object")?;
@@ -537,6 +546,10 @@ impl Namespace {
                 }
                 for (field, value) in &row {
                     validate_attribute_name(field)?;
+                    if let Some(definition) = generated_vectors.get(field) {
+                        validate_value(field, value, definition)?;
+                        continue;
+                    }
                     // `[]unknown` comes from an empty array; the first non-empty array
                     // settles the element type.
                     let unknown = self.schema.get(field) == Some(&json!("[]unknown"))
@@ -553,25 +566,35 @@ impl Namespace {
                 }
                 for (field, definition) in &self.schema {
                     if has_embed(definition) {
-                        if let Some(Value::String(text)) = row.get(field) {
-                            let dims = definition
-                                .get("embed")
-                                .and_then(|e| e.get("dims"))
-                                .and_then(Value::as_u64)
-                                .unwrap_or(1536) as usize;
-                            let model = definition
-                                .get("embed")
-                                .and_then(|e| e.get("model"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("openai/text-embedding-3-small");
-                            let vector = embedder
-                                .embed(text, model, dims)
-                                .await
-                                .map_err(|_| WriteError::EmbeddingUnavailable)?;
-                            row.insert(format!("embed_{field}"), json!(vector));
+                        let vector_field = format!("embed_{field}");
+                        if row.get(&vector_field).is_some_and(|value| !value.is_null()) {
+                            continue;
                         }
+                        let text = row
+                            .get(field)
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.is_empty())
+                            .ok_or_else(|| {
+                                format!("embedded attribute `{field}` must be a non-empty string")
+                            })?;
+                        let dims = definition
+                            .get("embed")
+                            .and_then(|e| e.get("dims"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(1536) as usize;
+                        let model = definition
+                            .get("embed")
+                            .and_then(|e| e.get("model"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("openai/text-embedding-3-small");
+                        let vector = embedder
+                            .embed(text, model, dims)
+                            .await
+                            .map_err(|_| WriteError::EmbeddingUnavailable)?;
+                        row.insert(vector_field, json!(vector));
                     }
                 }
+                vector::normalize_row(&mut row, &generated_vectors)?;
                 row.retain(|field, value| field == "id" || !value.is_null());
                 self.rows.insert(id_key(&id)?, row);
                 upserted_ids.push(id);
@@ -1007,7 +1030,8 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
         }
     }
     if let Some(embed) = definition.get("embed") {
-        if !embed.get("model").is_some_and(Value::is_string)
+        if field_type(definition) != "string"
+            || !embed.get("model").is_some_and(Value::is_string)
             || !embed
                 .get("dims")
                 .and_then(Value::as_u64)

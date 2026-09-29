@@ -97,20 +97,32 @@ pub(crate) fn normalize_row(
     Ok(())
 }
 
-pub(crate) fn normalize_write(body: &mut Value, schema: &Map<String, Value>) -> Result<(), String> {
+pub(crate) fn normalize_write(
+    body: &mut Value,
+    schema: &Map<String, Value>,
+    generated_vectors: &Map<String, Value>,
+) -> Result<(), String> {
     let object = body.as_object_mut().ok_or("write body must be an object")?;
     for key in ["upsert_rows", "patch_rows"] {
         if let Some(rows) = object.get_mut(key).and_then(Value::as_array_mut) {
             for row in rows {
                 if let Some(row) = row.as_object_mut() {
                     normalize_row(row, schema)?;
+                    if key == "upsert_rows" {
+                        normalize_row(row, generated_vectors)?;
+                    }
                 }
             }
         }
     }
     for key in ["upsert_columns", "patch_columns"] {
         if let Some(columns) = object.get_mut(key).and_then(Value::as_object_mut) {
-            for (field, definition) in schema {
+            for (field, definition) in schema.iter().chain(
+                (key == "upsert_columns")
+                    .then_some(generated_vectors.iter())
+                    .into_iter()
+                    .flatten(),
+            ) {
                 if let Some(values) = columns.get_mut(field).and_then(Value::as_array_mut) {
                     for value in values {
                         if let (Some(dimensions), Some(encoded)) =

@@ -763,6 +763,7 @@ async fn local_contract() {
     null_sort_contract(&format!("http://{address}"), "dummy").await;
     regex_array_contract(&format!("http://{address}"), "dummy").await;
     inferred_vector_contract(&format!("http://{address}"), "dummy").await;
+    embedded_write_contract(&format!("http://{address}"), "dummy").await;
     embed_schema_contract(&format!("http://{address}"), "dummy").await;
     sort_validation_contract(&format!("http://{address}"), "dummy").await;
     query_embed_contract(&format!("http://{address}"), "dummy").await;
@@ -786,6 +787,7 @@ async fn optional_real_turbopuffer_contract() {
     null_sort_contract(base.trim_end_matches('/'), &token).await;
     regex_array_contract(base.trim_end_matches('/'), &token).await;
     inferred_vector_contract(base.trim_end_matches('/'), &token).await;
+    embedded_write_contract(base.trim_end_matches('/'), &token).await;
     embed_schema_contract(base.trim_end_matches('/'), &token).await;
     sort_validation_contract(base.trim_end_matches('/'), &token).await;
     query_embed_contract(base.trim_end_matches('/'), &token).await;
@@ -1003,6 +1005,117 @@ async fn embed_schema_contract(base: &str, token: &str) {
         assert_eq!(update.0, StatusCode::OK, "embed update: {}", update.1);
         assert_eq!(schema["embed_narrow"]["type"], "[256]f16");
     }
+}
+
+async fn embedded_write_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-embedded-write-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let setup = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":256}}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"content":"pufferfish"}]
+        }),
+    )
+    .await;
+    let mut vector = vec![0.0; 256];
+    vector[0] = 1.0;
+    vector[1] = 0.1234567;
+    let mut out_of_range = vector.clone();
+    out_of_range[0] = 1e6;
+    let cases = [
+        ("missing", json!({"id":2}), StatusCode::BAD_REQUEST),
+        (
+            "null",
+            json!({"id":3,"content":null}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "empty",
+            json!({"id":4,"content":""}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "vector",
+            json!({"id":5,"embed_content":vector}),
+            StatusCode::OK,
+        ),
+        (
+            "both",
+            json!({"id":6,"content":"fish","embed_content":vector}),
+            StatusCode::OK,
+        ),
+        (
+            "wrong_dims",
+            json!({"id":7,"embed_content":[1.0,0.0]}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "out_of_range",
+            json!({"id":8,"embed_content":out_of_range}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    let checks: Result<_, reqwest::Error> = async {
+        let mut results = Vec::new();
+        for (label, row, expected) in cases {
+            let response = client
+                .post(&url)
+                .bearer_auth(token)
+                .json(&json!({"upsert_rows":[row]}))
+                .send()
+                .await?;
+            let status = response.status();
+            let body = response.json::<Value>().await?;
+            results.push((label, expected, status, body));
+        }
+        let response = client
+            .post(format!("{url}/query"))
+            .bearer_auth(token)
+            .json(&json!({"rank_by":["id","asc"],"limit":10,"include_attributes":["id","content","embed_content"]}))
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.json::<Value>().await?;
+        Ok::<_, reqwest::Error>((results, status, body))
+    }
+    .await;
+    let invalid_source = response(
+        &client,
+        token,
+        &url,
+        json!({"schema":{"wrong":{"type":"int","embed":{"model":"openai/text-embedding-3-small","dims":256}}}}),
+    )
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(setup.0, StatusCode::OK, "embedded write setup: {}", setup.1);
+    assert_eq!(
+        invalid_source.0,
+        StatusCode::BAD_REQUEST,
+        "{invalid_source:?}"
+    );
+    assert_eq!(cleanup.status(), StatusCode::OK);
+    let (results, status, body) = checks.expect("embedded write request failed");
+    for (label, expected, actual, reply) in results {
+        assert_eq!(actual, expected, "{label}: {reply}");
+    }
+    assert_eq!(status, StatusCode::OK, "embedded query: {body}");
+    assert_eq!(ids(&body), vec![1, 5, 6]);
+    assert!(body["rows"][1].get("content").is_none());
+    let mut stored_vector = vector;
+    stored_vector[1] = half::f16::from_f32(stored_vector[1] as f32).to_f32() as f64;
+    for row in &body["rows"].as_array().unwrap()[1..] {
+        let values = row["embed_content"].as_array().unwrap();
+        assert_eq!(values.len(), stored_vector.len());
+        for (actual, expected) in values.iter().zip(&stored_vector) {
+            assert_eq!(actual.as_f64().unwrap() as f32, *expected as f32);
+        }
+    }
+    assert_eq!(body["rows"][2]["content"], "fish");
 }
 
 async fn inferred_vector_contract(base: &str, token: &str) {
