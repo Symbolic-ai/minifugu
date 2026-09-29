@@ -52,7 +52,7 @@ jobs:
         run: |
           if [ -n "$INPUT_TAG" ]; then
             [[ "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-            gh release view "$INPUT_TAG" --json tagName --jq .tagName >/dev/null
+            gh release view "$INPUT_TAG" --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName >/dev/null
             tag="$INPUT_TAG"
           elif [ "$CREATED" = true ]; then
             tag="$RELEASE_TAG"
@@ -170,4 +170,4 @@ jobs:
           else
             shasum -a 256 "$asset" > "$asset.sha256"
           fi
-          gh release upload "$RELEASE_TAG" "$asset" "$asset.sha256" --clobber
+          gh release upload "$RELEASE_TAG" "$asset" "$asset.sha256" --repo "$GITHUB_REPOSITORY" --clobber
