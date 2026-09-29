@@ -224,7 +224,11 @@ fn normalize_array_value(value: &Value, definition: &Value) -> Result<Option<Val
 /// JSON numbers are stored as f64. Parse the shortest f32 round-trip decimal so
 /// float vector responses have the same precision as the live f32/f16 output.
 fn float_value(number: f32) -> Value {
-    json!(number.to_string().parse::<f64>().unwrap())
+    json!(serialized_f32(number))
+}
+
+pub(crate) fn serialized_f32(number: f32) -> f64 {
+    number.to_string().parse().unwrap()
 }
 
 pub(crate) fn normalize_query(
@@ -237,6 +241,13 @@ pub(crate) fn normalize_query(
                 if let (Some(field), Some(encoded)) = (parts[0].as_str(), parts[2].as_str()) {
                     if let Some(dimensions) = schema.get(field).and_then(dimensions) {
                         parts[2] = decode(encoded, dimensions)?;
+                    }
+                }
+            }
+            if parts.len() == 3 && parts[1] == "SparseKNN" {
+                if let Some(definition) = parts[0].as_str().and_then(|field| schema.get(field)) {
+                    if let Some(normalized) = normalize_array_value(&parts[2], definition)? {
+                        parts[2] = normalized;
                     }
                 }
             }

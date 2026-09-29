@@ -194,7 +194,17 @@ fn scenario(seed: u64, metric: &str) -> (Value, Vec<Value>) {
         json!({"rank_by":["id","asc"],"limit":12,"compute_attributes":{"fugu_score":["title","BM25","fugu"]}}),
         json!({"aggregate_by":{"count":["Count"]},"group_by":[{"tag":["ForEachUnique","tags"]},"group"]}),
         json!({"rank_by":["vector","kNN",[0.2,0.7]],"filters":["id","Gte",1],"limit":5,"include_attributes":["vector"]}),
-        json!({"rank_by":["sparse","SparseKNN",{"fugu":1.0}],"limit":8,"include_attributes":["sparse"]}),
+        json!({"rank_by":["sparse","SparseKNN",{"fugu":0.2,"sea":0.7}],"limit":8,"include_attributes":["sparse"]}),
+        json!({"rank_by":["id","asc"],"filters":["And",[["score","Gte",threshold],["group","NotEq",null]]],"limit":12}),
+        json!({"rank_by":["id","asc"],"filters":["Or",[["title","ContainsAnyToken","fugu"],["score","Lt",threshold]]],"limit":12}),
+        json!({"rank_by":["id","asc"],"filters":["Not",["group","Eq",group]],"limit":12}),
+        json!({"rank_by":["id","asc"],"filters":["title","ContainsTokenSequence","fugu whale"],"limit":12}),
+        json!({"rank_by":["title","BM25","fu",{"last_as_prefix":true}],"limit":12}),
+        json!({"rank_by":["Saturate",["Attribute","weight"],{"midpoint":3.0}],"limit":12}),
+        json!({"rank_by":["Decay",["Dist",["Attribute","score"],7],{"midpoint":2}],"limit":12}),
+        json!({"rank_by":["Max",[0,["Attribute","score"]]],"limit":12}),
+        json!({"aggregate_by":{"count":["Count"],"sum":["Sum","score"]},"filters":["score","Gte",threshold],"group_by":["group"]}),
+        json!({"rank_by":["id","asc"],"filters":["tags","ContainsAny",["whale","sea"]],"limit":12}),
     ];
     (write, queries)
 }

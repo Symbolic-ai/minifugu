@@ -68,6 +68,120 @@ async fn equal_bm25_scores_order_numeric_ids_numerically() {
 }
 
 #[tokio::test]
+async fn score_precision_matches_captured_live_float32_values() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/score-precision");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","x":"float","text":{"type":"string","full_text_search":true},"vector":{"type":"[2]f32","ann":true},"s":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[
+                {"id":1,"x":0.1234567891234,"text":"fugu fugu whale","vector":[0.1,0.6],"s":{"fugu":0.123456789,"whale":0.3333333}},
+                {"id":2,"x":1.234567891234,"text":"fugu whale","vector":[0.3,0.3],"s":{"fugu":0.654321,"whale":0.5}},
+                {"id":3,"text":"whale","vector":[0.7,0.7],"s":{"whale":0.25}}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query_url = format!("{url}/query");
+    let (_, bm25) = post(
+        &client,
+        &query_url,
+        json!({"rank_by":["text","BM25","fugu"],"limit":3}),
+    )
+    .await;
+    assert_eq!(bm25["rows"][0]["$dist"], json!(0.56657976));
+    let (_, computed) = post(
+        &client,
+        &query_url,
+        json!({"rank_by":["id","asc"],"limit":3,"compute_attributes":{"score":["text","BM25","fugu"]}}),
+    )
+    .await;
+    assert_eq!(computed["rows"][0]["score"], json!(0.60996956));
+    let (_, vector) = post(
+        &client,
+        &query_url,
+        json!({"rank_by":["vector","ANN",[0.2,0.7]],"limit":3}),
+    )
+    .await;
+    assert_eq!(vector["rows"][0]["$dist"], json!(0.0063946843));
+    let (_, sparse) = post(
+        &client,
+        &query_url,
+        json!({"rank_by":["s","SparseKNN",{"fugu":0.2,"whale":0.7}],"limit":3}),
+    )
+    .await;
+    assert_eq!(sparse["rows"][0]["$dist"], json!(0.48092508));
+    assert_eq!(sparse["rows"][1]["$dist"], json!(0.25803024));
+    let (_, rrf) = post(
+        &client,
+        &query_url,
+        json!({
+            "queries":[
+                {"rank_by":["text","BM25","fugu"],"limit":3},
+                {"rank_by":["vector","ANN",[0.2,0.7]],"limit":3}
+            ],
+            "rerank_by":["RRF"],"limit":3
+        }),
+    )
+    .await;
+    assert_eq!(rrf["results"][0]["rows"][0]["$dist"], json!(0.032786883));
+    let (_, numeric) = post(
+        &client,
+        &query_url,
+        json!({"rank_by":["Saturate",["Attribute","x"],{"midpoint":0.5}],"limit":3}),
+    )
+    .await;
+    assert_eq!(numeric["rows"][0]["$dist"], json!(0.7117438));
+    assert_eq!(numeric["rows"][1]["$dist"], json!(0.1980198));
+    let (_, compound) = post(
+        &client,
+        &query_url,
+        json!({"rank_by":["Sum",[["Max",[0,["Attribute","x"]]],["Product",0.3,["Max",[0,["Attribute","x"]]]]]],"limit":3}),
+    )
+    .await;
+    assert_eq!(compound["rows"][1]["$dist"], json!(0.16049382));
+}
+
+#[tokio::test]
+async fn float32_numeric_score_ties_use_id_order() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/numeric-float32-ties");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","x":"float"},
+            "upsert_rows":[
+                {"id":1,"x":0.1234567891234},
+                {"id":2,"x":0.1234567891235}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for rank in [
+        json!(["Saturate",["Attribute","x"],{"midpoint":0.5}]),
+        json!(["Decay",["Dist",["Attribute","x"],0.5],{"midpoint":0.5}]),
+    ] {
+        let (status, result) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({"rank_by":rank,"limit":2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ids(&result), [1, 2]);
+        assert_eq!(result["rows"][0]["$dist"], result["rows"][1]["$dist"]);
+    }
+}
+
+#[tokio::test]
 async fn attribute_and_rrf_ties_order_numeric_ids_numerically() {
     let base = serve(minifugu::router()).await;
     let client = Client::new();
@@ -322,6 +436,8 @@ async fn late_interaction_vectors_sum_best_document_token_distances() {
     assert_eq!(result["rows"][0]["id"], 1);
     assert_eq!(result["rows"][0]["$dist"], 0.0);
     assert_eq!(result["rows"][1]["id"], 2);
+    // Late-interaction scores are rounded once after all token distances are summed.
+    assert_eq!(result["rows"][1]["$dist"], json!(1.6399999));
     let (status, _) = post(
         &client,
         &format!("{url}/query"),
