@@ -762,6 +762,8 @@ async fn local_contract() {
     ann_contract(&format!("http://{address}"), "dummy").await;
     null_sort_contract(&format!("http://{address}"), "dummy").await;
     regex_array_contract(&format!("http://{address}"), "dummy").await;
+    sort_validation_contract(&format!("http://{address}"), "dummy").await;
+    query_embed_contract(&format!("http://{address}"), "dummy").await;
 }
 
 #[tokio::test]
@@ -781,6 +783,120 @@ async fn optional_real_turbopuffer_contract() {
     ann_contract(base.trim_end_matches('/'), &token).await;
     null_sort_contract(base.trim_end_matches('/'), &token).await;
     regex_array_contract(base.trim_end_matches('/'), &token).await;
+    sort_validation_contract(base.trim_end_matches('/'), &token).await;
+    query_embed_contract(base.trim_end_matches('/'), &token).await;
+}
+
+async fn sort_validation_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-sort-validation-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let write = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","tags":"[]string","a0":"int","a1":"int","a2":"int","a3":"int","a4":"int","a5":"int","a6":"int","a7":"int","a8":"int"},
+            "upsert_rows":[{"id":1,"tags":["fish"],"a0":0,"a1":1,"a2":2,"a3":3,"a4":4,"a5":5,"a6":6,"a7":7,"a8":8}]
+        }),
+    )
+    .await;
+    let order = |count| {
+        (0..count)
+            .map(|index| json!([format!("a{index}"), "asc"]))
+            .collect::<Vec<_>>()
+    };
+    let cases = [
+        (json!(["tags", "asc"]), StatusCode::BAD_REQUEST),
+        (json!(["a0", "asc"]), StatusCode::OK),
+        (json!(order(8)), StatusCode::OK),
+        (json!(order(9)), StatusCode::BAD_REQUEST),
+        (json!([]), StatusCode::BAD_REQUEST),
+    ];
+    let results: Result<Vec<_>, reqwest::Error> = async {
+        let mut results = Vec::new();
+        for (rank, expected) in cases {
+            let reply = client
+                .post(format!("{url}/query"))
+                .bearer_auth(token)
+                .json(&json!({"rank_by":rank,"limit":10}))
+                .send()
+                .await?;
+            let status = reply.status();
+            let body = reply.json::<Value>().await?;
+            results.push((rank, expected, status, body));
+        }
+        Ok(results)
+    }
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(write.0, StatusCode::OK, "sort write: {}", write.1);
+    assert_eq!(cleanup.status(), StatusCode::OK);
+    for (rank, expected, status, body) in results.expect("sort validation query failed") {
+        assert_eq!(status, expected, "rank {rank}: {body}");
+    }
+}
+
+async fn query_embed_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-query-embed-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let mut vector = vec![0.0; 256];
+    vector[0] = 1.0;
+    let write = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","vector":{"type":"[256]f32","ann":true},"content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":256}}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"vector":vector,"content":"pufferfish swim"}]
+        }),
+    )
+    .await;
+    let cases = [
+        (
+            json!(["content", "ANN", ["Embed", "pufferfish"]]),
+            StatusCode::OK,
+        ),
+        (
+            json!(["vector", "ANN", ["Embed", "pufferfish", {"model":"openai/text-embedding-3-small"}]]),
+            StatusCode::OK,
+        ),
+        (
+            json!(["content", "kNN", ["Embed", "pufferfish"]]),
+            StatusCode::OK,
+        ),
+        (
+            json!(["vector", "ANN", ["Embed", "pufferfish"]]),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    let results: Result<Vec<_>, reqwest::Error> = async {
+        let mut results = Vec::new();
+        for (rank, expected) in cases {
+            let reply = client
+                .post(format!("{url}/query"))
+                .bearer_auth(token)
+                .json(&json!({"rank_by":rank,"filters":["id","Eq",1],"limit":1}))
+                .send()
+                .await?;
+            let status = reply.status();
+            let body = reply.json::<Value>().await?;
+            results.push((rank, expected, status, body));
+        }
+        Ok(results)
+    }
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(write.0, StatusCode::OK, "embed write: {}", write.1);
+    assert_eq!(cleanup.status(), StatusCode::OK);
+    for (rank, expected, status, body) in results.expect("query embedding failed") {
+        assert_eq!(status, expected, "rank {rank}: {body}");
+        if status == StatusCode::OK {
+            assert_eq!(ids(&body), vec![1], "rank {rank}");
+        }
+    }
 }
 
 async fn null_sort_contract(base: &str, token: &str) {

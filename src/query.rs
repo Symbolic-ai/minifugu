@@ -1521,7 +1521,13 @@ pub(crate) fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result
     let parts = rank
         .as_array()
         .ok_or_else(|| crate::shape_error("rank_by must be an array"))?;
-    if !parts.is_empty() && parts.iter().all(Value::is_array) {
+    if parts.is_empty() {
+        return Err("rank_by cannot be empty".into());
+    }
+    if parts.iter().all(Value::is_array) {
+        if parts.len() > 8 && parts.iter().all(is_attribute_order) {
+            return Err("cannot order by more than 8 attributes".into());
+        }
         for part in parts {
             validate_rank(part, schema)?;
         }
@@ -1780,8 +1786,8 @@ pub(crate) fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result
         "asc" | "desc"
             if parts.len() == 2
                 && schema.get(field).is_some_and(|definition| {
-                    !matches!(field_type(definition), "bytes" | "{}f16")
-                        && vector::multi_dimensions(definition).is_none()
+                    let kind = field_type(definition);
+                    !kind.starts_with('[') && !matches!(kind, "bytes" | "{}f16")
                 }) =>
         {
             Ok(())

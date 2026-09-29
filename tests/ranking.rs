@@ -723,6 +723,39 @@ async fn deterministic_native_vectors_can_be_queried_with_the_same_embedder() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["rows"][0]["id"], 1);
     assert!(result["rows"][0]["$dist"].as_f64().unwrap().abs() < 0.00001);
+    for rank in [
+        json!(["content", "ANN", ["Embed", "red fugu"]]),
+        json!(["embed_content", "ANN", ["Embed", "red fugu", {"model":"openai/text-embedding-3-small"}]]),
+        json!(["content", "kNN", ["Embed", "red fugu"]]),
+    ] {
+        let (status, result) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({"rank_by":rank,"filters":["id","Eq",1],"limit":2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "rank {rank}: {result}");
+        assert_eq!(result["rows"][0]["id"], 1);
+    }
+    let (status, _) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["embed_content","ANN",["Embed","red fugu"]],"limit":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"queries":[
+            {"rank_by":["content","ANN",["Embed","red fugu"]],"limit":1},
+            {"rank_by":["content","ANN",["Embed","blue whale"]],"limit":1}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["results"][0]["rows"][0]["id"], 1);
+    assert_eq!(result["results"][1]["rows"][0]["id"], 2);
     let (status, _) = post(
         &client,
         &format!("{url}/query"),
@@ -775,6 +808,14 @@ async fn openai_mode_embeds_native_text_and_queries_it() {
         json!({
             "rank_by":["embed_content","ANN",[1.0,0.0,0.0,0.0]],"limit":2
         }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"][0]["id"], 1);
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["content","ANN",["Embed","fugu"]],"limit":2}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

@@ -502,10 +502,32 @@ async fn query_namespace(
     Path(name): Path<String>,
     State(state): State<Shared>,
     headers: HeaderMap,
-    JsonBody(body): JsonBody,
+    JsonBody(mut body): JsonBody,
 ) -> Result<Json<Value>, ApiError> {
     authorized(&headers)?;
     namespace_name(&name)?;
+    let schema = {
+        let guard = state.namespaces.read().await;
+        guard
+            .get(&name)
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::NOT_FOUND,
+                    format!("namespace {name} does not exist"),
+                )
+            })?
+            .schema
+            .clone()
+    };
+    embedding::materialize_query(&mut body, &schema, &state.embedding)
+        .await
+        .map_err(|error| match error {
+            embedding::QueryEmbeddingError::Invalid(message) => bad(message),
+            embedding::QueryEmbeddingError::Unavailable => ApiError(
+                StatusCode::BAD_GATEWAY,
+                "embedding provider unavailable".into(),
+            ),
+        })?;
     let guard = state.namespaces.read().await;
     let namespace = guard.get(&name).ok_or_else(|| {
         ApiError(

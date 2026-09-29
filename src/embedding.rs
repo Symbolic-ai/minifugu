@@ -1,4 +1,5 @@
-use serde_json::{json, Value};
+use crate::vector;
+use serde_json::{json, Map, Value};
 
 #[derive(Clone)]
 pub enum EmbeddingMode {
@@ -39,6 +40,129 @@ impl EmbeddingMode {
             }
         }
     }
+}
+
+pub(crate) enum QueryEmbeddingError {
+    Invalid(String),
+    Unavailable,
+}
+
+struct QueryEmbedding {
+    pointer: String,
+    target: String,
+    text: String,
+    model: String,
+    dims: usize,
+}
+
+/// Turn native Embed query operands into vectors before synchronous query validation.
+/// Collect every request first so a malformed later clause never starts an embedding call.
+pub(crate) async fn materialize_query(
+    body: &mut Value,
+    schema: &Map<String, Value>,
+    mode: &EmbeddingMode,
+) -> Result<(), QueryEmbeddingError> {
+    let mut requests = Vec::new();
+    collect_query_embeddings(body, "", schema, &mut requests)
+        .map_err(QueryEmbeddingError::Invalid)?;
+    for request in requests {
+        let vector = mode
+            .embed(&request.text, &request.model, request.dims)
+            .await
+            .map_err(|()| QueryEmbeddingError::Unavailable)?;
+        let parts = body
+            .pointer_mut(&request.pointer)
+            .and_then(Value::as_array_mut)
+            .expect("collected query expression remains present");
+        parts[0] = json!(request.target);
+        parts[2] = json!(vector);
+    }
+    Ok(())
+}
+
+fn collect_query_embeddings(
+    value: &Value,
+    pointer: &str,
+    schema: &Map<String, Value>,
+    requests: &mut Vec<QueryEmbedding>,
+) -> Result<(), String> {
+    if let Some(parts) = value.as_array() {
+        if parts.len() == 3
+            && matches!(parts[1].as_str(), Some("ANN" | "kNN"))
+            && parts[2]
+                .as_array()
+                .is_some_and(|operand| operand.first() == Some(&json!("Embed")))
+        {
+            let field = parts[0]
+                .as_str()
+                .ok_or("Embed target must be an attribute")?;
+            let operand = parts[2].as_array().unwrap();
+            if !(2..=3).contains(&operand.len()) {
+                return Err("Embed requires text and optional model parameters".into());
+            }
+            let text = operand[1].as_str().ok_or("Embed text must be a string")?;
+            let explicit_model = if operand.len() == 3 {
+                let options = operand[2]
+                    .as_object()
+                    .ok_or("Embed parameters must be an object")?;
+                if options.keys().any(|key| key != "model") {
+                    return Err("unsupported Embed parameter".into());
+                }
+                options
+                    .get("model")
+                    .map(|model| model.as_str().ok_or("Embed model must be a string"))
+                    .transpose()?
+            } else {
+                None
+            };
+            let source = schema
+                .get(field)
+                .and_then(|definition| definition.get("embed"));
+            let (target, dims) = if let Some(config) = source {
+                (
+                    format!("embed_{field}"),
+                    config.get("dims").and_then(Value::as_u64).unwrap_or(1536) as usize,
+                )
+            } else if let Some(base) = field.strip_prefix("embed_") {
+                let config = schema
+                    .get(base)
+                    .and_then(|definition| definition.get("embed"))
+                    .ok_or_else(|| format!("attribute {field} is not a vector"))?;
+                (
+                    field.to_owned(),
+                    config.get("dims").and_then(Value::as_u64).unwrap_or(1536) as usize,
+                )
+            } else {
+                let dims = schema
+                    .get(field)
+                    .and_then(vector::dimensions)
+                    .ok_or_else(|| format!("attribute {field} is not a vector"))?;
+                (field.to_owned(), dims)
+            };
+            let model = explicit_model
+                .or_else(|| source.and_then(|config| config.get("model").and_then(Value::as_str)))
+                .ok_or(
+                    "a model name must be provided when ranking a vector by an embedding query",
+                )?;
+            requests.push(QueryEmbedding {
+                pointer: pointer.to_owned(),
+                target,
+                text: text.to_owned(),
+                model: model.to_owned(),
+                dims,
+            });
+            return Ok(());
+        }
+        for (index, child) in parts.iter().enumerate() {
+            collect_query_embeddings(child, &format!("{pointer}/{index}"), schema, requests)?;
+        }
+    } else if let Some(object) = value.as_object() {
+        for (key, child) in object {
+            let key = key.replace('~', "~0").replace('/', "~1");
+            collect_query_embeddings(child, &format!("{pointer}/{key}"), schema, requests)?;
+        }
+    }
+    Ok(())
 }
 
 // FNV-1a token hashing keeps offline vectors stable without network calls.
