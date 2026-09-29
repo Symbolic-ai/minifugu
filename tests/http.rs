@@ -784,7 +784,8 @@ async fn query_shape_errors_use_live_status_codes() {
         &client,
         &url,
         json!({
-            "schema":{"id":"uint"},"upsert_rows":[{"id":1}]
+            "schema":{"id":"uint","group":"string","tags":"[]string"},
+            "upsert_rows":[{"id":1,"group":"a","tags":["fish"]}]
         }),
     )
     .await;
@@ -808,12 +809,51 @@ async fn query_shape_errors_use_live_status_codes() {
         json!({"rank_by":["id","asc"],"limit":1,"vector_encoding":"invalid"}),
         json!({"rank_by":["id","asc"],"limit":1,"distance_metric":"invalid"}),
         json!({"rank_by":["id","asc"],"limit":1,"distance_metric":1}),
+        json!({"rank_by":["id","asc"],"limit":1,"offset":-1}),
+        json!({"rank_by":["id","asc"],"limit":1,"offset":"1"}),
+        json!({"rank_by":["id","asc"],"limit":1,"offset":1.0}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["id","In",[1,"2"]]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["group","In",["a",1]]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","ContainsAny",[null]]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","In",[["fish"]]]}),
     ] {
         let (status, body) = post(&client, &query_url, query.clone()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{query}: {body}");
         assert_eq!(body["status"], "error");
     }
     let subquery = json!({"rank_by":["id","asc"],"limit":1});
+    for query in [
+        json!({"rank_by":["id","asc"],"limit":0}),
+        json!({"rank_by":["id","asc"],"top_k":0}),
+        json!({"rank_by":["id","asc"],"limit":{"total":0}}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["id","Gt","1"]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["id","In",["1"]]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Contains",null]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","AnyGt",null]}),
+    ] {
+        assert_eq!(
+            post(&client, &query_url, query).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    for extra in [json!({"limit":0}), json!({"top_k":1})] {
+        let mut query = json!({"queries":[subquery.clone()]});
+        query
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (status, body) = post(&client, &query_url, query).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["results"][0]["rows"][0]["id"], 1);
+    }
+    for query in [
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","In",["fish"]]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","NotIn",["other"]]}),
+    ] {
+        let (status, body) = post(&client, &query_url, query).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rows"][0]["id"], 1);
+    }
     for count in [0, 17] {
         let (status, _) = post(
             &client,

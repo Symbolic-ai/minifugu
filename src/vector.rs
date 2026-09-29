@@ -224,7 +224,11 @@ fn normalize_array_value(value: &Value, definition: &Value) -> Result<Option<Val
 /// JSON numbers are stored as f64. Parse the shortest f32 round-trip decimal so
 /// float vector responses have the same precision as the live f32/f16 output.
 fn float_value(number: f32) -> Value {
-    json!(number.to_string().parse::<f64>().unwrap())
+    json!(serialized_f32(number))
+}
+
+pub(crate) fn serialized_f32(number: f32) -> f64 {
+    number.to_string().parse().unwrap()
 }
 
 pub(crate) fn normalize_query(

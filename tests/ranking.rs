@@ -138,6 +138,13 @@ async fn score_precision_matches_captured_live_float32_values() {
     .await;
     assert_eq!(numeric["rows"][0]["$dist"], json!(0.7117438));
     assert_eq!(numeric["rows"][1]["$dist"], json!(0.1980198));
+    let (_, compound) = post(
+        &client,
+        &query_url,
+        json!({"rank_by":["Sum",[["Max",[0,["Attribute","x"]]],["Product",0.3,["Max",[0,["Attribute","x"]]]]]],"limit":3}),
+    )
+    .await;
+    assert_eq!(compound["rows"][1]["$dist"], json!(0.16049382));
 }
 
 #[tokio::test]
@@ -429,6 +436,8 @@ async fn late_interaction_vectors_sum_best_document_token_distances() {
     assert_eq!(result["rows"][0]["id"], 1);
     assert_eq!(result["rows"][0]["$dist"], 0.0);
     assert_eq!(result["rows"][1]["id"], 2);
+    // Late-interaction scores are rounded once after all token distances are summed.
+    assert_eq!(result["rows"][1]["$dist"], json!(1.6399999));
     let (status, _) = post(
         &client,
         &format!("{url}/query"),

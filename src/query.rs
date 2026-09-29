@@ -80,7 +80,7 @@ impl Namespace {
                     .skip(offset)
                     .take(limit)
                     .map(|(score, mut row)| {
-                        row["$dist"] = json!(serialized_f32(score as f32));
+                        row["$dist"] = json!(vector::serialized_f32(score as f32));
                         row
                     })
                     .collect::<Vec<_>>();
@@ -88,10 +88,12 @@ impl Namespace {
                     json!({"results":[{"rows":rows}],"billing":{},"performance":{"server_total_ms":0}}),
                 );
             }
-            if object
-                .keys()
-                .any(|key| !matches!(key.as_str(), "queries" | "consistency" | "vector_encoding"))
-            {
+            if object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "queries" | "limit" | "top_k" | "consistency" | "vector_encoding"
+                )
+            }) {
                 return Err(
                     "queries cannot be combined with other query fields without rerank_by".into(),
                 );
@@ -195,11 +197,11 @@ impl Namespace {
         }
         let limit = object.get("limit").or_else(|| object.get("top_k"));
         match limit {
-            Some(Value::Number(n)) if n.as_u64().is_some_and(|v| v <= 10_000) => (),
+            Some(Value::Number(n)) if n.as_u64().is_some_and(|v| v > 0 && v <= 10_000) => (),
             Some(Value::Object(v))
                 if v.get("total")
                     .and_then(Value::as_u64)
-                    .is_some_and(|n| n <= 10_000) =>
+                    .is_some_and(|n| n > 0 && n <= 10_000) =>
             {
                 if v.keys().any(|key| !matches!(key.as_str(), "total" | "per")) {
                     return Err(crate::shape_error("unsupported limit field"));
@@ -252,10 +254,16 @@ impl Namespace {
             Some(Value::Number(_)) => {
                 return Err("limit or top_k must be an integer at most 10000".into());
             }
+            Some(Value::Object(v)) if v.get("total").and_then(Value::as_u64) == Some(0) => {
+                return Err("limit.total must be positive".into());
+            }
             _ => return Err(crate::shape_error("limit must be an integer or object")),
         }
-        if object.get("offset").is_some_and(|v| v.as_u64().is_none()) {
-            return Err("offset must be a nonnegative integer".into());
+        if object
+            .get("offset")
+            .is_some_and(|v| !v.is_null() && v.as_u64().is_none())
+        {
+            return Err(crate::shape_error("offset must be a nonnegative integer"));
         }
         let total = limit
             .and_then(|value| value.as_u64().or_else(|| value["total"].as_u64()))
@@ -291,7 +299,7 @@ impl Namespace {
                     score_rank(rank, row, &self.rows, &self.schema, metric)
                 });
                 let score = if score.is_finite() {
-                    serialized_score(score)
+                    (score as f32) as f64
                 } else {
                     score
                 };
@@ -726,7 +734,7 @@ fn computed_value(
             .and_then(|options| options.get("last_as_prefix"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        return json!(bm25(
+        return json!(serialized_score(bm25(
             field,
             &parts[2],
             last_as_prefix,
@@ -734,7 +742,7 @@ fn computed_value(
             corpus,
             schema,
             true,
-        ));
+        )));
     }
     let mut rank = expression.clone();
     if rank[1] == "VectorDist" {
@@ -815,7 +823,12 @@ fn validate_rrf(
         return Err("RRF limit must be at most 10000".into());
     }
     let offset = object.get("offset").map_or(Ok(0), |v| {
-        v.as_u64().ok_or("offset must be a nonnegative integer")
+        if v.is_null() {
+            Ok(0)
+        } else {
+            v.as_u64()
+                .ok_or_else(|| crate::shape_error("offset must be a nonnegative integer"))
+        }
     })?;
     if offset.saturating_add(limit) > 10_000 {
         return Err("offset plus limit must be at most 10000".into());
@@ -1062,7 +1075,7 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
     if parts.len() == 4 {
         return Err(format!("{op} does not take options"));
     }
-    match op {
+    let operator = match op {
         "Eq" | "NotEq" | "Gt" | "Gte" | "Lt" | "Lte" | "Contains" | "NotContains" => Ok(()),
         "In" | "NotIn"
             if parts[2]
@@ -1088,6 +1101,81 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
         _ => Err(crate::shape_error(format!(
             "unsupported filter operator {op}"
         ))),
+    };
+    operator?;
+    let kind = field_type(definition);
+    let operand_kind = if matches!(
+        op,
+        "Contains"
+            | "NotContains"
+            | "ContainsAny"
+            | "NotContainsAny"
+            | "AnyGt"
+            | "AnyGte"
+            | "AnyLt"
+            | "AnyLte"
+            | "In"
+            | "NotIn"
+    ) {
+        kind.strip_prefix("[]").unwrap_or(kind)
+    } else {
+        kind
+    };
+    let list = matches!(op, "In" | "NotIn" | "ContainsAny" | "NotContainsAny");
+    if list {
+        let values = parts[2].as_array().unwrap();
+        let first_type = values.first().map(json_type);
+        if values.iter().any(|value| {
+            value.is_null()
+                || value.is_array()
+                || value.is_object()
+                || Some(json_type(value)) != first_type
+        }) {
+            return Err(crate::shape_error(format!("invalid {op} values")));
+        }
+    } else if parts[2].is_null()
+        && matches!(
+            op,
+            "Contains" | "NotContains" | "AnyGt" | "AnyGte" | "AnyLt" | "AnyLte"
+        )
+    {
+        return Err(format!("{op} requires a non-null value"));
+    }
+    let valid = if list {
+        parts[2].as_array().is_some_and(|values| {
+            values
+                .iter()
+                .all(|value| filter_value_type(value, operand_kind))
+        })
+    } else {
+        filter_value_type(&parts[2], operand_kind)
+    };
+    if !valid {
+        return Err(format!(
+            "filter value for {field} must match {operand_kind}"
+        ));
+    }
+    Ok(())
+}
+
+fn filter_value_type(value: &Value, kind: &str) -> bool {
+    if value.is_null() {
+        return true;
+    }
+    if let Some(element_type) = kind.strip_prefix("[]") {
+        return value.as_array().is_some_and(|values| {
+            values
+                .iter()
+                .all(|value| filter_value_type(value, element_type))
+        });
+    }
+    match kind {
+        "uint" => value.as_u64().is_some(),
+        "int" => value.as_i64().is_some(),
+        "float" => value.is_number(),
+        "string" | "uuid" | "datetime" => value.is_string(),
+        "bool" => value.is_boolean(),
+        _ => true,
     }
 }
 
@@ -1125,8 +1213,20 @@ pub(crate) fn filter_matches(
     match parts[1].as_str().unwrap() {
         "Eq" => left == right,
         "NotEq" => left != right,
-        "In" => right.as_array().unwrap().contains(left),
-        "NotIn" => !right.as_array().unwrap().contains(left),
+        "In" => {
+            let values = right.as_array().unwrap();
+            left.as_array().map_or_else(
+                || values.contains(left),
+                |array| array.iter().any(|value| values.contains(value)),
+            )
+        }
+        "NotIn" => {
+            let values = right.as_array().unwrap();
+            left.as_array().map_or_else(
+                || !values.contains(left),
+                |array| array.iter().all(|value| !values.contains(value)),
+            )
+        }
         "Contains" => left.as_array().is_some_and(|a| a.contains(right)),
         "NotContains" => left.as_array().is_none_or(|a| !a.contains(right)),
         "ContainsAny" => left
@@ -1947,7 +2047,7 @@ pub(crate) fn score_rank(
                         * document.get(key).and_then(Value::as_f64).unwrap_or(0.0) as f32
                 })
                 .sum();
-            serialized_f32(score)
+            f64::from(score)
         }
         "BM25" => bm25(
             field,
@@ -2020,7 +2120,7 @@ fn dense_distance(query: &[Value], vector: &[Value], metric: &str) -> f64 {
             .zip(query)
             .map(|(a, b)| (a.as_f64().unwrap() as f32 - b.as_f64().unwrap() as f32).powi(2))
             .sum();
-        return serialized_f32(distance);
+        return f64::from(distance);
     }
     let dot: f32 = vector
         .iter()
@@ -2040,20 +2140,14 @@ fn dense_distance(query: &[Value], vector: &[Value], metric: &str) -> f64 {
     if norm_a == 0.0 || norm_b == 0.0 {
         f64::INFINITY
     } else {
-        serialized_f32(1.0 - dot / (norm_a * norm_b))
+        f64::from(1.0 - dot / (norm_a * norm_b))
     }
-}
-
-/// JSON numbers are f64; use the shortest decimal that round-trips to the
-/// float32 score returned by the live service.
-fn serialized_f32(value: f32) -> f64 {
-    value.to_string().parse().unwrap()
 }
 
 fn serialized_score(score: f64) -> f64 {
     let narrow = score as f32;
     if narrow.is_finite() {
-        serialized_f32(narrow)
+        vector::serialized_f32(narrow)
     } else {
         score
     }
@@ -2189,7 +2283,7 @@ fn bm25(
                 .iter()
                 .any(|token| token.text.starts_with(&prefix))
         }));
-    serialized_f32(score)
+    f64::from(score)
 }
 
 /// The live service's name for a JSON value's type in error messages.
