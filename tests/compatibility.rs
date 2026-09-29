@@ -795,32 +795,39 @@ async fn null_sort_contract(base: &str, token: &str) {
                 {"id":1,"x":3,"y":"b"},
                 {"id":2,"y":"d"},
                 {"id":3,"x":1,"y":"c"},
-                {"id":4,"x":null,"y":"a"}
+                {"id":4,"x":null,"y":"a"},
+                {"id":5,"x":null,"y":null},
+                {"id":6,"x":3,"y":null}
             ]
         }),
     )
     .await;
     let cases = [
-        (json!(["x", "asc"]), vec![2, 4, 3, 1]),
-        (json!(["x", "desc"]), vec![1, 3, 2, 4]),
-        (json!([["x", "asc"], ["y", "asc"]]), vec![4, 2, 3, 1]),
-        (json!([["x", "desc"], ["y", "asc"]]), vec![1, 3, 4, 2]),
+        (json!(["x", "asc"]), vec![2, 4, 5, 3, 1, 6]),
+        (json!(["x", "desc"]), vec![1, 6, 3, 2, 4, 5]),
+        (json!([["x", "asc"], ["y", "asc"]]), vec![5, 4, 2, 3, 6, 1]),
+        (json!([["x", "desc"], ["y", "asc"]]), vec![6, 1, 3, 5, 4, 2]),
     ];
-    let mut results = Vec::new();
-    for (rank, expected) in cases {
-        let (status, reply) = response(
-            &client,
-            token,
-            &format!("{url}/query"),
-            json!({"rank_by":rank,"limit":10}),
-        )
-        .await;
-        results.push((rank, expected, status, reply));
+    let results: Result<Vec<_>, reqwest::Error> = async {
+        let mut results = Vec::new();
+        for (rank, expected) in cases {
+            let response = client
+                .post(format!("{url}/query"))
+                .bearer_auth(token)
+                .json(&json!({"rank_by":rank,"limit":10}))
+                .send()
+                .await?;
+            let status = response.status();
+            let reply = response.json::<Value>().await?;
+            results.push((rank, expected, status, reply));
+        }
+        Ok(results)
     }
+    .await;
     let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
     assert_eq!(write.0, StatusCode::OK, "null-sort write: {}", write.1);
     assert_eq!(cleanup.status(), StatusCode::OK);
-    for (rank, expected, status, reply) in results {
+    for (rank, expected, status, reply) in results.expect("null-sort query failed") {
         assert_eq!(status, StatusCode::OK, "rank {rank}: {reply}");
         assert_eq!(ids(&reply), expected, "rank {rank}");
     }

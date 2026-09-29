@@ -22,6 +22,7 @@ jobs:
       - run: cargo doc --no-deps --locked
   live-parity:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: rust
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
