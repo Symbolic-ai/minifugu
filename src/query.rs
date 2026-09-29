@@ -531,14 +531,20 @@ impl Namespace {
                 }
             }
         }
-        if object.contains_key("top_k") && !object.contains_key("group_by") {
-            return Err("top_k requires group_by for aggregation".into());
-        }
-        if object
-            .get("top_k")
-            .is_some_and(|value| !value.as_u64().is_some_and(|n| n <= 10_000))
-        {
-            return Err("top_k must be an integer at most 10000".into());
+        if let Some(top_k) = object.get("top_k").filter(|value| !value.is_null()) {
+            let top_k = top_k
+                .as_u64()
+                .ok_or_else(|| crate::shape_error("top_k must be a nonnegative integer"))?;
+            if object
+                .get("group_by")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            {
+                return Err("top_k requires a nonempty group_by for aggregation".into());
+            }
+            if top_k > 10_000 {
+                return Err("top_k must be at most 10000".into());
+            }
         }
         Ok(())
     }
@@ -1110,6 +1116,9 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
     };
     operator?;
     let kind = field_type(definition);
+    if kind.starts_with("[]") && matches!(op, "Gt" | "Gte" | "Lt" | "Lte") {
+        return Err(format!("{op} cannot compare array attribute {field}"));
+    }
     let operand_kind = if matches!(
         op,
         "Contains"

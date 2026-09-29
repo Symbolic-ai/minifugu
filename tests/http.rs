@@ -88,6 +88,7 @@ async fn metadata_read_only_blocks_writes_and_is_inherited_by_branches() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
     assert_eq!(
         error["error"],
         "💔 Writes not permitted. This namespace is read-only."
@@ -742,6 +743,32 @@ async fn aggregates_match_live_grouping_edges() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["aggregations"], json!({"count":4,"sum":0.0}));
+
+    for top_k in [json!(-1), json!("1"), json!(1.0), json!(true)] {
+        let (status, _) = post(
+            &client,
+            &query_url,
+            json!({"aggregate_by":{"count":["Count"]},"group_by":["g"],"top_k":top_k}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    for group_by in [None, Some(json!([]))] {
+        let mut query = json!({"aggregate_by":{"count":["Count"]},"top_k":0});
+        if let Some(group_by) = group_by {
+            query["group_by"] = group_by;
+        }
+        let (status, _) = post(&client, &query_url, query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let (status, result) = post(
+        &client,
+        &query_url,
+        json!({"aggregate_by":{"count":["Count"]},"top_k":null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["aggregations"]["count"], 4);
     let (status, result) = post(
         &client,
         &query_url,
@@ -845,6 +872,10 @@ async fn query_shape_errors_use_live_status_codes() {
         json!({"rank_by":["id","asc"],"limit":1,"filters":["id","In",["1"]]}),
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Contains",null]}),
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","AnyGt",null]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Gt",["a"]]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Gte",["fish"]]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Lt",["z"]]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Lte",["fish"]]}),
     ] {
         assert_eq!(
             post(&client, &query_url, query).await.0,
@@ -1675,7 +1706,7 @@ async fn unsupported_fields_fail_loudly() {
         ),
         (
             json!({"aggregate_by":{"count":["Count"]},"top_k":1}),
-            "top_k requires group_by",
+            "top_k requires a nonempty group_by",
             StatusCode::BAD_REQUEST,
         ),
         (
