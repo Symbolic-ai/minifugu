@@ -139,7 +139,10 @@ fn router_with_state(
             "/v1/namespaces/{namespace}/schema",
             get(get_schema).post(update_schema),
         )
-        .route("/v1/namespaces/{namespace}/metadata", get(get_metadata))
+        .route(
+            "/v1/namespaces/{namespace}/metadata",
+            get(get_metadata).patch(update_metadata),
+        )
         .route("/v2/namespaces/{namespace}/metadata", get(get_metadata))
         .route(
             "/v1/namespaces/{namespace}/hint_cache_warm",
@@ -216,6 +219,43 @@ async fn get_metadata(
         .get(&name)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "namespace does not exist".into()))?;
     Ok(Json(namespace.metadata()))
+}
+
+async fn update_metadata(
+    Path(name): Path<String>,
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    JsonBody(body): JsonBody,
+) -> Result<Json<Value>, ApiError> {
+    authorized(&headers)?;
+    namespace_name(&name)?;
+    let options = body
+        .as_object()
+        .ok_or_else(|| bad(shape_error("metadata body must be an object")))?;
+    if options.get("pinning").is_some_and(|value| !value.is_null()) {
+        return Err(bad("namespace pinning is unavailable locally"));
+    }
+    // Turbopuffer ignores unknown metadata keys. Keep that behavior so a client
+    // can send harmless newer settings alongside read_only.
+    let read_only = options
+        .get("read_only")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| bad(shape_error("read_only must be a boolean")))
+        })
+        .transpose()?;
+    let mut guard = state.namespaces.write().await;
+    let mut namespace = guard
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "namespace does not exist".into()))?;
+    if let Some(read_only) = read_only {
+        namespace.read_only = read_only;
+    }
+    let response = namespace.metadata();
+    persist_namespace(&state, &mut guard, name, namespace)?;
+    Ok(Json(response))
 }
 
 async fn hint_cache_warm(
@@ -305,6 +345,9 @@ async fn update_schema(
         .get(&name)
         .cloned()
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "namespace does not exist".into()))?;
+    if namespace.read_only {
+        return Err(bad("💔 Writes not permitted. This namespace is read-only."));
+    }
     namespace
         .write(&json!({"schema":schema}), &state.embedding)
         .await
@@ -312,7 +355,7 @@ async fn update_schema(
             store::WriteError::Invalid(message) => bad(message),
             store::WriteError::EmbeddingUnavailable => bad("embedding provider unavailable"),
         })?;
-    namespace.touch();
+    namespace.touch_schema();
     let response = namespace.schema_view(store::SchemaView::Schema);
     persist_namespace(&state, &mut guard, name, namespace)?;
     Ok(Json(response))
@@ -385,8 +428,7 @@ async fn write(
                 "source namespace does not exist".into(),
             )
         })?;
-        namespace.created_at = None;
-        namespace.touch();
+        namespace.touch_clone();
         let rows = namespace.rows.len();
         persist_namespace(&state, &mut guard, name, namespace)?;
         return Ok(Json(
@@ -406,6 +448,9 @@ async fn write(
         ));
     }
     let mut namespace = guard.get(&name).cloned().unwrap_or_default();
+    if namespace.read_only {
+        return Err(bad("💔 Writes not permitted. This namespace is read-only."));
+    }
     let result = namespace
         .write(&body, &state.embedding)
         .await
@@ -416,7 +461,7 @@ async fn write(
                 "embedding provider unavailable".into(),
             ),
         })?;
-    namespace.touch();
+    namespace.touch_write();
     persist_namespace(&state, &mut guard, name, namespace)?;
     Ok(Json(result))
 }

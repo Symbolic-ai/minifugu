@@ -66,18 +66,19 @@ MiniFugu calls OpenAI's embeddings endpoint for native `embed` fields, using the
 | Route | Behavior |
 | --- | --- |
 | `POST /v2/namespaces/{name}` | Schema and vector metric, row/column upserts and patches, conditional writes, ID deletes, patch/delete by filter, affected IDs, local copy/branch |
-| `POST /v2/namespaces/{name}/query` | Single and multiqueries, exact dense and sparse ANN/kNN, late-interaction ranking, BM25, RRF fusion, text and fuzzy filters, numeric ranking expressions, ordering, `limit`/`top_k`, offset, attribute selection, computed BM25/vector scores, text highlighting, Count/Sum aggregations with multiple group fields |
+| `POST /v2/namespaces/{name}/query` | Single and multiqueries, exact dense and sparse ANN/kNN, late-interaction ranking, BM25, RRF fusion, text and fuzzy filters, numeric ranking expressions, ordering, `limit`/`top_k`, offset, attribute selection, computed BM25/vector scores, text highlighting, Count/Sum aggregations with multiple group fields and `ForEachUnique` |
 | `DELETE /v2/namespaces/{name}` | Delete a namespace |
 | `GET /v1/namespaces` | List namespace IDs with prefix, cursor, and page size |
 | `GET/POST /v1/namespaces/{name}/schema` | Read and extend a schema |
 | `GET /v1/namespaces/{name}/metadata` | Read schema, local estimates, timestamps and index status |
+| `PATCH /v1/namespaces/{name}/metadata` | Set or clear persistent `read_only` state; non-null cloud pinning is unavailable locally |
 | `GET /v1/namespaces/{name}/hint_cache_warm` | Acknowledge a cache warm hint |
 | `POST /v1/namespaces/{name}/_debug/recall` | Measure exact local vector recall |
 | `POST /v2/namespaces/{name}/explain_query` | Explain the local exact scan plan |
 
 Supported filters include `And`, `Or`, `Not`, equality, `In`/`NotIn`, numeric/date ranges, array containment, full-text token matching, and fuzzy substring matching. Dense vectors can be sent as float arrays or little-endian float32 base64; base64 query responses use the schema's f32, f16, or i8 element width. Sparse vectors use `{}f16` maps and multi-vectors use `[][N]f32` arrays. Queries validate referenced attributes even when no rows match. Unsupported request fields fail, so a test cannot silently pass when MiniFugu cannot emulate the operation. See [API coverage](docs/api-coverage.md) for exact details and remaining gaps.
 
-Behavior checked against live Turbopuffer includes full-text analysis options, highlighting, normalized schema responses, aggregation edge cases, and generated query results. The [parity checks](docs/api-coverage.md#behavioral-parity-checks) show the evidence and scope for each area. MiniFugu still uses exact local scans and local estimates, so approximate ANN recall, cloud billing, and distributed consistency differ.
+Behavior checked against live Turbopuffer includes full-text analysis options, highlighting, normalized schema responses, aggregation edge cases, metadata changes, and generated query and write sequences. The [parity checks](docs/api-coverage.md#behavioral-parity-checks) show the evidence and scope for each area. MiniFugu still uses exact local scans and local estimates, so approximate ANN recall, cloud billing, and distributed consistency differ.
 
 ## Development and compatibility checks
 

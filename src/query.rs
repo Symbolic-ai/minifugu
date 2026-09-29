@@ -436,22 +436,65 @@ impl Namespace {
                 .as_array()
                 .ok_or_else(|| crate::shape_error("group_by must be an array"))?;
             let mut seen = std::collections::HashSet::new();
-            for field in groups {
-                let field = field
-                    .as_str()
-                    .ok_or("group_by entries must be attribute names")?;
-                if field == "id" {
+            let mut has_for_each_unique = false;
+            for entry in groups {
+                let (name, source, explode) = if let Some(field) = entry.as_str() {
+                    (field, field, false)
+                } else {
+                    let expression = entry.as_object().ok_or_else(|| {
+                        crate::shape_error("group_by entry must be an attribute or expression")
+                    })?;
+                    if expression.len() != 1 {
+                        return Err(crate::shape_error("group_by expression needs one name"));
+                    }
+                    let (alias, expression) = expression.iter().next().unwrap();
+                    let parts = expression.as_array().ok_or_else(|| {
+                        crate::shape_error("group_by expression must be an array")
+                    })?;
+                    if parts.len() != 2 || parts[0] != "ForEachUnique" {
+                        return Err(crate::shape_error("unsupported group_by expression"));
+                    }
+                    let source = parts[1].as_str().ok_or_else(|| {
+                        crate::shape_error("ForEachUnique attribute must be a string")
+                    })?;
+                    (alias.as_str(), source, true)
+                };
+                if name == "id" {
                     return Err("cannot group by id".into());
                 }
-                if !seen.insert(field) {
-                    return Err(format!("cannot use {field} in group_by more than once"));
+                if !seen.insert(name) {
+                    return Err(format!("cannot use {name} in group_by more than once"));
                 }
-                if !known_field(&self.schema, field) {
-                    return Err(format!("attribute {field} does not exist in schema"));
+                if !known_field(&self.schema, source) {
+                    return Err(format!("attribute {source} does not exist in schema"));
                 }
-                if aggregates.contains_key(field) {
+                if explode
+                    && !self.schema.get(source).is_some_and(|definition| {
+                        matches!(
+                            field_type(definition),
+                            "[]string"
+                                | "[]int"
+                                | "[]uint"
+                                | "[]float"
+                                | "[]bool"
+                                | "[]datetime"
+                                | "[]uuid"
+                        )
+                    })
+                {
                     return Err(format!(
-                        "aggregate name {field} conflicts with a group field"
+                        "ForEachUnique requires an array attribute {source}"
+                    ));
+                }
+                if explode {
+                    if has_for_each_unique {
+                        return Err("cannot use ForEachUnique more than once in group_by".into());
+                    }
+                    has_for_each_unique = true;
+                }
+                if aggregates.contains_key(name) {
+                    return Err(format!(
+                        "aggregate name {name} conflicts with a group field"
                     ));
                 }
             }
@@ -483,29 +526,53 @@ impl Namespace {
         let Some(fields) = fields.filter(|fields| !fields.is_empty()) else {
             return json!({"aggregations": aggregate_values(aggregates, &rows, &self.schema)});
         };
+        let fields = group_fields(fields);
         let mut grouped = std::collections::BTreeMap::<
             String,
             (Map<String, Value>, Vec<&Map<String, Value>>),
         >::new();
         for row in rows {
-            let values = fields
-                .iter()
-                .map(|field| {
-                    row.get(field.as_str().unwrap())
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                })
-                .collect::<Vec<_>>();
-            let key = serde_json::to_string(&values).unwrap();
-            let entry = grouped.entry(key).or_insert_with(|| {
-                let attrs = fields
-                    .iter()
-                    .zip(&values)
-                    .map(|(field, value)| (field.as_str().unwrap().to_owned(), value.clone()))
+            let mut combinations = vec![Vec::new()];
+            for field in &fields {
+                let values = if field.explode {
+                    match row.get(field.source) {
+                        Some(Value::Array(values)) => {
+                            let mut distinct = Vec::new();
+                            for value in values {
+                                if !distinct.contains(value) {
+                                    distinct.push(value.clone());
+                                }
+                            }
+                            distinct
+                        }
+                        _ => vec![Value::Null],
+                    }
+                } else {
+                    vec![row.get(field.source).cloned().unwrap_or(Value::Null)]
+                };
+                combinations = combinations
+                    .into_iter()
+                    .flat_map(|prefix| {
+                        values.iter().map(move |value| {
+                            let mut group = prefix.clone();
+                            group.push(value.clone());
+                            group
+                        })
+                    })
                     .collect();
-                (attrs, Vec::new())
-            });
-            entry.1.push(row);
+            }
+            for values in combinations {
+                let key = serde_json::to_string(&values).unwrap();
+                let entry = grouped.entry(key).or_insert_with(|| {
+                    let attrs = fields
+                        .iter()
+                        .zip(&values)
+                        .map(|(field, value)| (field.name.to_owned(), value.clone()))
+                        .collect();
+                    (attrs, Vec::new())
+                });
+                entry.1.push(row);
+            }
         }
         let limit = object
             .get("top_k")
@@ -513,10 +580,9 @@ impl Namespace {
             .unwrap_or(10_000) as usize;
         let mut groups = grouped.into_values().collect::<Vec<_>>();
         groups.sort_by(|(left, _), (right, _)| {
-            for field in fields {
-                let field = field.as_str().unwrap();
-                let left = left.get(field).unwrap_or(&Value::Null);
-                let right = right.get(field).unwrap_or(&Value::Null);
+            for field in &fields {
+                let left = left.get(field.name).unwrap_or(&Value::Null);
+                let right = right.get(field.name).unwrap_or(&Value::Null);
                 let order = match (left.is_null(), right.is_null()) {
                     (true, true) => std::cmp::Ordering::Equal,
                     (true, false) => std::cmp::Ordering::Less,
@@ -539,6 +605,34 @@ impl Namespace {
             .collect::<Vec<_>>();
         json!({"aggregation_groups":groups})
     }
+}
+
+struct GroupField<'a> {
+    name: &'a str,
+    source: &'a str,
+    explode: bool,
+}
+
+fn group_fields(fields: &[Value]) -> Vec<GroupField<'_>> {
+    fields
+        .iter()
+        .map(|field| {
+            if let Some(name) = field.as_str() {
+                GroupField {
+                    name,
+                    source: name,
+                    explode: false,
+                }
+            } else {
+                let (name, expression) = field.as_object().unwrap().iter().next().unwrap();
+                GroupField {
+                    name,
+                    source: expression[1].as_str().unwrap(),
+                    explode: true,
+                }
+            }
+        })
+        .collect()
 }
 
 fn validate_query_options(object: &Map<String, Value>) -> Result<(), String> {
@@ -599,6 +693,24 @@ fn computed_value(
     schema: &Map<String, Value>,
     metric: &str,
 ) -> Value {
+    if expression[1] == "BM25" {
+        let parts = expression.as_array().unwrap();
+        let field = parts[0].as_str().unwrap();
+        let last_as_prefix = parts
+            .get(3)
+            .and_then(|options| options.get("last_as_prefix"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        return json!(bm25(
+            field,
+            &parts[2],
+            last_as_prefix,
+            row,
+            corpus,
+            schema,
+            true,
+        ));
+    }
     let mut rank = expression.clone();
     if rank[1] == "VectorDist" {
         rank[1] = json!("ANN");
@@ -839,9 +951,18 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
         return Ok(());
     }
     if matches!(op, "Glob" | "NotGlob" | "IGlob" | "NotIGlob" | "Regex") {
-        if parts.len() != 3 || field_type(&schema[field]) != "string" {
+        let kind = field_type(&schema[field]);
+        if parts.len() != 3
+            || (op == "Regex" && kind != "string")
+            || (op != "Regex" && !matches!(kind, "string" | "[]string"))
+        {
             return Err(format!(
-                "{op} requires a string attribute and a three-part filter"
+                "{op} requires a string{} attribute and a three-part filter",
+                if op == "Regex" {
+                    ""
+                } else {
+                    " or string-array"
+                }
             ));
         }
         let capability = if op == "Regex" { "regex" } else { "glob" };
@@ -915,6 +1036,15 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
     }
     match op {
         "Eq" | "NotEq" | "Gt" | "Gte" | "Lt" | "Lte" | "Contains" | "NotContains" => Ok(()),
+        "In" | "NotIn"
+            if parts[2]
+                .as_array()
+                .is_some_and(|values| values.iter().any(Value::is_null)) =>
+        {
+            Err(crate::shape_error(format!(
+                "{op} values cannot include null"
+            )))
+        }
         "In" | "NotIn" | "ContainsAny" | "NotContainsAny" if parts[2].is_array() => Ok(()),
         "In" | "NotIn" | "ContainsAny" | "NotContainsAny" => Err(format!("{op} requires an array")),
         "AnyGt" | "AnyGte" | "AnyLt" | "AnyLte"
@@ -977,10 +1107,28 @@ pub(crate) fn filter_matches(
         "NotContainsAny" => left
             .as_array()
             .is_none_or(|a| a.iter().all(|v| !right.as_array().unwrap().contains(v))),
-        "Gt" => !left.is_null() && compare_values(left, right).is_some_and(|o| o > 0),
-        "Gte" => !left.is_null() && compare_values(left, right).is_some_and(|o| o >= 0),
-        "Lt" => left.is_null() || compare_values(left, right).is_some_and(|o| o < 0),
-        "Lte" => left.is_null() || compare_values(left, right).is_some_and(|o| o <= 0),
+        "Gt" => {
+            if right.is_null() {
+                !left.is_null()
+            } else {
+                !left.is_null() && compare_values(left, right).is_some_and(|o| o > 0)
+            }
+        }
+        "Gte" => {
+            right.is_null()
+                || (!left.is_null() && compare_values(left, right).is_some_and(|o| o >= 0))
+        }
+        "Lt" => {
+            !right.is_null()
+                && (left.is_null() || compare_values(left, right).is_some_and(|o| o < 0))
+        }
+        "Lte" => {
+            if right.is_null() {
+                left.is_null()
+            } else {
+                left.is_null() || compare_values(left, right).is_some_and(|o| o <= 0)
+            }
+        }
         "AnyGt" | "AnyGte" | "AnyLt" | "AnyLte" => left.as_array().is_some_and(|values| {
             values.iter().any(|value| match parts[1].as_str().unwrap() {
                 "AnyGt" => compare_values(value, right).is_some_and(|order| order > 0),
@@ -992,19 +1140,25 @@ pub(crate) fn filter_matches(
         "ContainsAllTokens" | "ContainsAnyToken" | "ContainsTokenSequence" => {
             token_filter_matches(parts, left, schema.get(field).unwrap_or(&Value::Null))
         }
-        "Glob" | "NotGlob" | "IGlob" | "NotIGlob" => left.as_str().is_some_and(|text| {
-            let matches = GlobBuilder::new(right.as_str().unwrap())
+        "Glob" | "NotGlob" | "IGlob" | "NotIGlob" => {
+            let matcher = GlobBuilder::new(right.as_str().unwrap())
                 .case_insensitive(matches!(parts[1].as_str(), Some("IGlob" | "NotIGlob")))
                 .build()
                 .unwrap()
-                .compile_matcher()
-                .is_match(text);
+                .compile_matcher();
+            let matches = match left {
+                Value::String(text) => matcher.is_match(text),
+                Value::Array(values) => values
+                    .iter()
+                    .any(|value| value.as_str().is_some_and(|text| matcher.is_match(text))),
+                _ => false,
+            };
             if matches!(parts[1].as_str(), Some("NotGlob" | "NotIGlob")) {
                 !matches
             } else {
                 matches
             }
-        }),
+        }
         "Regex" => left
             .as_str()
             .is_some_and(|text| Regex::new(right.as_str().unwrap()).unwrap().is_match(text)),
@@ -1777,6 +1931,7 @@ pub(crate) fn score_rank(
             row,
             corpus,
             schema,
+            false,
         ),
         operator if is_filter_operator(operator) => f64::from(filter_matches(rank, row, schema)),
         _ => 0.0,
@@ -1924,6 +2079,7 @@ fn bm25(
     row: &Map<String, Value>,
     corpus: &std::collections::BTreeMap<String, Map<String, Value>>,
     schema: &Map<String, Value>,
+    computed: bool,
 ) -> f64 {
     let config = schema[field].get("full_text_search");
     let k1 = config
@@ -1954,8 +2110,10 @@ fn bm25(
     } else {
         None
     };
-    let stats = field_stats(field, &analysis, corpus);
-    let avg_len = stats.average_length;
+    // Live computed BM25 attributes use a fixed one-token average length and
+    // ln(2) IDF. Rank clauses use the namespace's actual corpus statistics.
+    let stats = (!computed).then(|| field_stats(field, &analysis, corpus));
+    let avg_len = stats.as_ref().map_or(1.0, |stats| stats.average_length);
     let mut terms = HashMap::new();
     for token in query_tokens {
         *terms.entry(token).or_insert(0_usize) += 1;
@@ -1967,9 +2125,13 @@ fn bm25(
             if freq == 0.0 {
                 return 0.0;
             }
-            let df = stats.document_frequency.get(&term).copied().unwrap_or(0) as f64;
-            let n = corpus.len() as f64;
-            let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+            let idf = if let Some(stats) = &stats {
+                let df = stats.document_frequency.get(&term).copied().unwrap_or(0) as f64;
+                let n = corpus.len() as f64;
+                (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+            } else {
+                std::f64::consts::LN_2
+            };
             let norm = k1 * (1.0 - b + b * doc_tokens.len() as f64 / avg_len);
             let query_weight = query_freq as f64 * (k3 + 1.0) / (query_freq as f64 + k3);
             query_weight * idf * freq * (k1 + 1.0) / (freq + norm)

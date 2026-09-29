@@ -18,13 +18,32 @@ pub struct Namespace {
     #[serde(default)]
     pub(crate) updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
+    pub(crate) last_write_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub(crate) approx_logical_bytes: Option<usize>,
+    #[serde(default)]
+    pub(crate) read_only: bool,
 }
 
 impl Namespace {
-    pub(crate) fn touch(&mut self) {
+    pub(crate) fn touch_write(&mut self) {
         let now = Utc::now();
         self.created_at.get_or_insert(now);
+        self.updated_at = Some(now);
+        self.last_write_at = Some(now);
+        self.approx_logical_bytes = Some(self.compute_logical_bytes());
+    }
+
+    pub(crate) fn touch_schema(&mut self) {
+        let now = Utc::now();
+        self.created_at.get_or_insert(now);
+        self.updated_at = Some(now);
+    }
+
+    pub(crate) fn touch_clone(&mut self) {
+        self.last_write_at = self.last_write_at.or(self.updated_at);
+        let now = Utc::now();
+        self.created_at = Some(now);
         self.updated_at = Some(now);
         self.approx_logical_bytes = Some(self.compute_logical_bytes());
     }
@@ -118,16 +137,20 @@ impl Namespace {
     pub(crate) fn metadata(&self) -> Value {
         let created_at = self.created_at.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
         let updated_at = self.updated_at.unwrap_or(created_at);
-        json!({
+        let mut metadata = json!({
             "schema": self.schema_view(SchemaView::Metadata),
             "approx_row_count": self.rows.len(),
             "approx_logical_bytes": self.logical_bytes(),
             "created_at": created_at,
             "updated_at": updated_at,
-            "last_write_at": updated_at.format("%Y-%m-%dT%H:%M:%S.000000000Z").to_string(),
+            "last_write_at": self.last_write_at.unwrap_or(updated_at).format("%Y-%m-%dT%H:%M:%S.000000000Z").to_string(),
             "encryption": {"sse": true},
             "index": {"status": "up-to-date"}
-        })
+        });
+        if self.read_only {
+            metadata["read_only"] = json!(true);
+        }
+        metadata
     }
 
     pub(crate) fn recall(&self, body: &Value) -> Result<Value, String> {
@@ -302,11 +325,8 @@ impl Namespace {
         }
         for (condition, operations) in [
             ("upsert_condition", &["upsert_rows", "upsert_columns"][..]),
-            (
-                "patch_condition",
-                &["patch_rows", "patch_columns", "patch_by_filter"][..],
-            ),
-            ("delete_condition", &["deletes", "delete_by_filter"][..]),
+            ("patch_condition", &["patch_rows", "patch_columns"][..]),
+            ("delete_condition", &["deletes"][..]),
         ] {
             if let Some(filter) = object.get(condition) {
                 if !operations
@@ -324,29 +344,30 @@ impl Namespace {
         if let Some(filter) = object.get("delete_by_filter") {
             validate_filter(filter, &self.schema)?;
             self.rows.retain(|_, row| {
-                if filter_matches(filter, row, &self.schema)
-                    && condition_matches(object, "delete_condition", Some(row), &self.schema)
-                {
+                if filter_matches(filter, row, &self.schema) {
                     deleted_ids.push(row["id"].clone());
                     false
                 } else {
                     true
                 }
             });
+            sort_ids(&mut deleted_ids);
         }
         if let Some(deletes) = object.get("deletes") {
             let deletes = deletes.as_array().ok_or("deletes must be an array")?;
             for id in deletes {
                 let key = id_key(id)?;
-                if condition_matches(
-                    object,
-                    "delete_condition",
-                    self.rows.get(&key),
-                    &self.schema,
-                ) && self.rows.remove(&key).is_some()
+                let current = self.rows.get(&key);
+                // Plain delete-by-ID is an acknowledged write even when the row was
+                // already absent. A conditional delete skips absent rows instead.
+                if object.contains_key("delete_condition")
+                    && (current.is_none()
+                        || !condition_matches(object, "delete_condition", current, &self.schema))
                 {
-                    deleted_ids.push(id.clone());
+                    continue;
                 }
+                self.rows.remove(&key);
+                deleted_ids.push(id.clone());
             }
         }
         if let Some(patch) = object.get("patch_by_filter") {
@@ -366,15 +387,18 @@ impl Namespace {
             validate_filter(filter, &self.schema)?;
             self.validate_patch(values)?;
             for row in self.rows.values_mut() {
-                if filter_matches(filter, row, &self.schema)
-                    && condition_matches(object, "patch_condition", Some(row), &self.schema)
-                {
+                if filter_matches(filter, row, &self.schema) {
                     for (field, value) in values {
-                        row.insert(field.clone(), value.clone());
+                        if value.is_null() {
+                            row.remove(field);
+                        } else {
+                            row.insert(field.clone(), value.clone());
+                        }
                     }
                     patched_ids.push(row["id"].clone());
                 }
             }
+            sort_ids(&mut patched_ids);
         }
         if let Some(rows) = write_rows(object, "patch_rows", "patch_columns")? {
             for patch in &rows {
@@ -392,7 +416,11 @@ impl Namespace {
                 if let Some(row) = self.rows.get_mut(&key) {
                     for (field, value) in patch {
                         if field != "id" {
-                            row.insert(field.clone(), value.clone());
+                            if value.is_null() {
+                                row.remove(field);
+                            } else {
+                                row.insert(field.clone(), value.clone());
+                            }
                         }
                     }
                     patched_ids.push(id.clone());
@@ -416,6 +444,7 @@ impl Namespace {
                     continue;
                 }
                 for (field, value) in &row {
+                    validate_attribute_name(field)?;
                     // `[]unknown` comes from an empty array; the first non-empty array
                     // settles the element type.
                     let unknown = self.schema.get(field) == Some(&json!("[]unknown"))
@@ -451,6 +480,7 @@ impl Namespace {
                         }
                     }
                 }
+                row.retain(|field, value| field == "id" || !value.is_null());
                 self.rows.insert(id_key(&id)?, row);
                 upserted_ids.push(id);
             }
@@ -479,6 +509,7 @@ impl Namespace {
 
     fn validate_patch(&self, values: &Map<String, Value>) -> Result<(), WriteError> {
         for (field, value) in values {
+            validate_attribute_name(field)?;
             if field == "id" {
                 continue;
             }
@@ -617,7 +648,21 @@ pub(crate) fn known_field(schema: &Map<String, Value>, field: &str) -> bool {
             .is_some_and(|base| schema.get(base).is_some_and(has_embed))
 }
 
+fn validate_attribute_name(field: &str) -> Result<(), String> {
+    if field.is_empty() {
+        return Err("attribute name cannot be empty".into());
+    }
+    if field.len() > 128 {
+        return Err(format!("attribute name is too long: {field}"));
+    }
+    if field.starts_with('$') {
+        return Err(format!("cannot use reserved attribute name {field}"));
+    }
+    Ok(())
+}
+
 fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
+    validate_attribute_name(field)?;
     if let Some(config) = definition.as_object() {
         for (option, value) in config {
             match option.as_str() {
@@ -750,6 +795,13 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
     }
 }
 
+fn sort_ids(ids: &mut [Value]) {
+    ids.sort_by(|left, right| match (left.as_u64(), right.as_u64()) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => left.as_str().cmp(&right.as_str()),
+    });
+}
+
 fn validate_id(value: &Value, definition: Option<&Value>) -> Result<(), String> {
     id_key(value)?;
     if let Some(definition) = definition {
@@ -760,7 +812,11 @@ fn validate_id(value: &Value, definition: Option<&Value>) -> Result<(), String> 
 
 fn id_key(value: &Value) -> Result<String, String> {
     match value {
-        Value::String(s) if !s.is_empty() => Ok(format!("s:{s}")),
+        Value::String(s) if s.len() <= 64 => Ok(format!("s:{s}")),
+        Value::String(s) => Err(format!(
+            "id string must be at most 64 bytes, got {}",
+            s.len()
+        )),
         Value::Number(n) if n.as_u64().is_some() => Ok(format!("n:{n}")),
         _ => Err("id must be a string or unsigned integer".into()),
     }
