@@ -762,6 +762,7 @@ async fn local_contract() {
     ann_contract(&format!("http://{address}"), "dummy").await;
     null_sort_contract(&format!("http://{address}"), "dummy").await;
     regex_array_contract(&format!("http://{address}"), "dummy").await;
+    write_response_contract(&format!("http://{address}"), "dummy").await;
     inferred_vector_contract(&format!("http://{address}"), "dummy").await;
     embedded_write_contract(&format!("http://{address}"), "dummy").await;
     vector_lifecycle_contract(&format!("http://{address}"), "dummy").await;
@@ -790,6 +791,7 @@ async fn optional_real_turbopuffer_contract() {
     ann_contract(base.trim_end_matches('/'), &token).await;
     null_sort_contract(base.trim_end_matches('/'), &token).await;
     regex_array_contract(base.trim_end_matches('/'), &token).await;
+    write_response_contract(base.trim_end_matches('/'), &token).await;
     inferred_vector_contract(base.trim_end_matches('/'), &token).await;
     embedded_write_contract(base.trim_end_matches('/'), &token).await;
     vector_lifecycle_contract(base.trim_end_matches('/'), &token).await;
@@ -1538,6 +1540,113 @@ async fn null_sort_contract(base: &str, token: &str) {
         assert_eq!(status, StatusCode::OK, "rank {rank}: {reply}");
         assert_eq!(ids(&reply), expected, "rank {rank}");
     }
+}
+
+async fn write_response_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-write-response-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    // A body without a write never creates the namespace, even with a schema.
+    let new_empty = response(
+        &client,
+        token,
+        &url,
+        json!({"schema":{"t":"string"},"upsert_rows":[]}),
+    )
+    .await;
+    let setup = response(
+        &client,
+        token,
+        &url,
+        json!({"upsert_rows":[{"id":1,"t":"x"},{"id":3,"t":"w"}]}),
+    )
+    .await;
+    let mut results = Vec::new();
+    for body in [
+        json!({}),
+        json!({"upsert_rows":[],"deletes":[]}),
+        json!({"upsert_columns":{"id":[]}}),
+        json!({"upsert_rows":null,"disable_backpressure":true}),
+        json!({"patch_condition":["id","Eq",2]}),
+        json!({"upsert_rows":"x"}),
+        json!({"upsert_columns":{}}),
+        json!({"upsert_rows":[{"id":2,"t":"y"}],"return_affected_ids":false}),
+        json!({"patch_rows":[{"id":1,"t":"z"}],"deletes":[3]}),
+        json!({"patch_rows":[{"id":42,"t":"z"}]}),
+        json!({"delete_by_filter":["t","Eq","nothing"],"schema":{"u":"string"}}),
+        json!({"schema":{"v":"string"}}),
+    ] {
+        let mut result = response(&client, token, &url, body).await;
+        if let Some(object) = result.1.as_object_mut() {
+            object.remove("billing");
+            object.remove("performance");
+            // Deserializer detail text differs; the status and message prefix do not.
+            if let Some(error) = object.get("error").and_then(Value::as_str) {
+                let error = error.trim_start_matches("💔 ");
+                let error = error.split(':').next().unwrap_or(error).to_owned();
+                object.insert("error".into(), json!(error));
+            }
+        }
+        results.push(result);
+    }
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(new_empty.0, StatusCode::BAD_REQUEST, "{new_empty:?}");
+    assert_eq!(new_empty.1["error"], "💔 no writes provided");
+    assert_eq!(setup.0, StatusCode::OK, "{setup:?}");
+    let no_writes = json!({"status":"error","error":"no writes provided"});
+    for result in &results[..4] {
+        assert_eq!(result, &(StatusCode::BAD_REQUEST, no_writes.clone()));
+    }
+    assert_eq!(
+        results[4],
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"status":"error","error":"cannot set patch_condition without corresponding patch writes"})
+        )
+    );
+    let shape = json!({"status":"error","error":"Failed to deserialize the JSON body into the target type"});
+    assert_eq!(
+        results[5],
+        (StatusCode::UNPROCESSABLE_ENTITY, shape.clone())
+    );
+    assert_eq!(results[6], (StatusCode::UNPROCESSABLE_ENTITY, shape));
+    let committed = "documents committed successfully";
+    assert_eq!(
+        results[7],
+        (
+            StatusCode::OK,
+            json!({"status":"OK","message":committed,"rows_affected":1,"rows_upserted":1})
+        )
+    );
+    assert_eq!(
+        results[8],
+        (
+            StatusCode::OK,
+            json!({"status":"OK","message":committed,"rows_affected":2,"rows_patched":1,"rows_deleted":1})
+        )
+    );
+    assert_eq!(
+        results[9],
+        (
+            StatusCode::OK,
+            json!({"status":"OK","message":committed,"rows_affected":0})
+        )
+    );
+    assert_eq!(
+        results[10],
+        (
+            StatusCode::OK,
+            json!({"status":"OK","message":"filter matched 0 documents, schema updated successfully","rows_affected":0})
+        )
+    );
+    assert_eq!(
+        results[11],
+        (
+            StatusCode::OK,
+            json!({"status":"OK","message":"schema updated successfully","rows_affected":0})
+        )
+    );
+    assert_eq!(cleanup.status(), StatusCode::OK);
 }
 
 async fn regex_array_contract(base: &str, token: &str) {
