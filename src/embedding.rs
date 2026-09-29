@@ -2,6 +2,61 @@ use crate::store::embedding_target;
 use crate::vector;
 use serde_json::{json, Map, Value};
 
+/// Hosted embedding models the live service accepts, each with its default output dimension
+/// and every dimension it supports. Captured from live `GET /schema` and error responses.
+pub(crate) const MODELS: &[(&str, usize, &[usize])] = &[
+    ("baai/bge-m3", 1024, &[1024]),
+    ("cohere/embed-v4.0", 1536, &[256, 512, 1024, 1536]),
+    ("google/gemini-embedding-2", 1536, &[768, 1536, 3072]),
+    ("nvidia/nemotron-3-embed-1b", 2048, &[512, 1024, 2048]),
+    ("nvidia/nemotron-3-embed-8b", 4096, &[512, 1024, 2048, 4096]),
+    (
+        "openai/text-embedding-3-large",
+        3072,
+        &[256, 512, 1024, 1536, 3072],
+    ),
+    (
+        "openai/text-embedding-3-small",
+        1536,
+        &[256, 512, 768, 1024, 1536],
+    ),
+    ("openai/text-embedding-ada-002", 1536, &[1536]),
+    (
+        "qwen/qwen3-embedding-0p6b",
+        1024,
+        &[256, 384, 512, 768, 1024],
+    ),
+    (
+        "qwen/qwen3-embedding-4b",
+        1024,
+        &[512, 1024, 1536, 2048, 2560],
+    ),
+    (
+        "qwen/qwen3-embedding-8b",
+        1024,
+        &[512, 1024, 1536, 2048, 3072, 4096],
+    ),
+    ("voyage/voyage-4", 1024, &[256, 512, 1024, 2048]),
+    ("voyage/voyage-4-large", 1024, &[256, 512, 1024, 2048]),
+    ("voyage/voyage-4-lite", 1024, &[256, 512, 1024, 2048]),
+    ("voyage/voyage-4-nano", 1024, &[256, 512, 1024, 2048]),
+    ("voyage/voyage-code-3", 1024, &[256, 512, 1024, 2048]),
+    ("voyage/voyage-code-4", 1024, &[256, 512, 1024, 2048]),
+    (
+        "zeroentropy/zembed-1",
+        1280,
+        &[40, 80, 160, 320, 640, 1280, 2560],
+    ),
+];
+
+/// The default output dimension and supported dimensions of a hosted model.
+pub(crate) fn model_dimensions(model: &str) -> Option<(usize, &'static [usize])> {
+    MODELS
+        .iter()
+        .find(|(name, _, _)| *name == model)
+        .map(|(_, default, allowed)| (*default, *allowed))
+}
+
 #[derive(Clone)]
 pub enum EmbeddingMode {
     /// Stable token-hash vectors for offline tests. They are not semantic embeddings.
@@ -25,9 +80,11 @@ impl EmbeddingMode {
         match self {
             Self::Deterministic => Ok(deterministic_embedding(text, dims)),
             Self::OpenAI { api_key, base_url } => {
+                // Other hosted models are valid schema models that this provider cannot
+                // serve, so the request fails as an unavailable provider (HTTP 502).
                 let model = model
                     .strip_prefix("openai/")
-                    .ok_or(EmbeddingError::InvalidModel)?;
+                    .ok_or(EmbeddingError::Unavailable)?;
                 let response = reqwest::Client::new()
                     .post(format!("{}/v1/embeddings", base_url.trim_end_matches('/')))
                     .bearer_auth(api_key)
@@ -251,6 +308,11 @@ fn collect_query_embeddings(
                 .ok_or(
                     "a model name must be provided when ranking a vector by an embedding query",
                 )?;
+            if model_dimensions(model).is_none() {
+                return Err(format!(
+                    "💔 `{model}` is not supported in this region, please reach out to us"
+                ));
+            }
             requests.push(QueryEmbedding {
                 pointer: pointer.to_owned(),
                 target,
