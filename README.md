@@ -3,7 +3,7 @@
 <p align="center">A small, persistent, keyless Turbopuffer API emulator in Rust.</p>
 <p align="center"><a href="https://github.com/Symbolic-ai/minifugu/actions/workflows/ci.yml"><img src="https://github.com/Symbolic-ai/minifugu/actions/workflows/ci.yml/badge.svg" alt="CI"></a> <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a> <img src="https://img.shields.io/badge/Rust-1.98%2B-orange.svg" alt="Rust 1.98 or newer"></p>
 
-MiniFugu lets local apps and CI exercise real HTTP writes, schema validation, filters, vector search, and text search without a Turbopuffer account. It ranks small collections with **exact cosine or squared Euclidean distance** and **BM25**. It accepts any nonempty bearer token; no network service or API key is needed in its default mode.
+MiniFugu lets local apps and CI exercise real HTTP writes, schema validation, filters, vector search, and text search without a Turbopuffer account. It ranks small collections with **exact dense and sparse vector search**, **late-interaction multi-vector search**, and **BM25**. It accepts any nonempty bearer token; no network service or API key is needed in its default mode.
 
 MiniFugu is an independent open source project and is not affiliated with Turbopuffer. See [API coverage](docs/api-coverage.md) for precise compatibility and known differences.
 
@@ -66,7 +66,7 @@ MiniFugu calls OpenAI's embeddings endpoint for native `embed` fields, using the
 | Route | Behavior |
 | --- | --- |
 | `POST /v2/namespaces/{name}` | Schema and vector metric, row/column upserts and patches, conditional writes, ID deletes, patch/delete by filter, affected IDs, local copy/branch |
-| `POST /v2/namespaces/{name}/query` | Single and multiqueries, exact ANN and filtered kNN, BM25, RRF fusion, text filters, ranking expressions, ordering, `limit`/`top_k`, offset, attribute selection, computed BM25/vector scores, Count/Sum aggregations |
+| `POST /v2/namespaces/{name}/query` | Single and multiqueries, exact dense and sparse ANN/kNN, late-interaction ranking, BM25, RRF fusion, text and fuzzy filters, numeric ranking expressions, ordering, `limit`/`top_k`, offset, attribute selection, computed BM25/vector scores, Count/Sum aggregations |
 | `DELETE /v2/namespaces/{name}` | Delete a namespace |
 | `GET /v1/namespaces` | List namespace IDs with prefix, cursor, and page size |
 | `GET/POST /v1/namespaces/{name}/schema` | Read and extend a schema |
@@ -75,7 +75,7 @@ MiniFugu calls OpenAI's embeddings endpoint for native `embed` fields, using the
 | `POST /v1/namespaces/{name}/_debug/recall` | Measure exact local vector recall |
 | `POST /v2/namespaces/{name}/explain_query` | Explain the local exact scan plan |
 
-Supported filters include `And`, `Or`, `Not`, equality, `In`/`NotIn`, numeric/date ranges, array containment, and full-text token matching. Dense vectors can be sent as float arrays or little-endian float32 base64; base64 query responses use the schema's f32, f16, or i8 element width. Queries validate referenced attributes even when no rows match. Unsupported request fields return HTTP 400. This prevents a test from silently passing when MiniFugu cannot emulate the operation. See [API coverage](docs/api-coverage.md) for exact details and remaining gaps.
+Supported filters include `And`, `Or`, `Not`, equality, `In`/`NotIn`, numeric/date ranges, array containment, full-text token matching, and fuzzy substring matching. Dense vectors can be sent as float arrays or little-endian float32 base64; base64 query responses use the schema's f32, f16, or i8 element width. Sparse vectors use `{}f16` maps and multi-vectors use `[][N]f32` arrays. Queries validate referenced attributes even when no rows match. Unsupported request fields return HTTP 400. This prevents a test from silently passing when MiniFugu cannot emulate the operation. See [API coverage](docs/api-coverage.md) for exact details and remaining gaps.
 
 ## Development and compatibility checks
 

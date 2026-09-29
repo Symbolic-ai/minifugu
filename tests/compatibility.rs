@@ -632,6 +632,64 @@ async fn conditional_contract(base: &str, token: &str) {
     assert_eq!(cleanup.status(), StatusCode::OK);
 }
 
+async fn gap_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-gaps-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let write = response(&client, token, &url, json!({
+        "schema":{
+            "id":"uint",
+            "sparse":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}},
+            "name":{"type":"string","fuzzy":true},
+            "blob":"bytes",
+            "clicks":"uint",
+            "title":{"type":"string","full_text_search":{"k1":2.0,"b":0.0,"k3":8.0}}
+        },
+        "upsert_rows":[
+            {"id":1,"sparse":{"fish":1.0},"name":"Small Pufferfish","blob":"AP8=","clicks":100,"title":"orange orange fugu"},
+            {"id":2,"sparse":{"fish":0.5},"name":"Blue whale","blob":"AAE=","clicks":10,"title":"blue whale"}
+        ]
+    })).await;
+    let sparse = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["sparse","SparseKNN",{"fish":1.0}],"limit":2
+        }),
+    )
+    .await;
+    let fuzzy = response(&client, token, &format!("{url}/query"), json!({
+        "rank_by":["id","asc"],
+        "filters":["name","Fuzzy","pufferfsh",{"max_edit_distance":[{"min_query_chars":6,"distance":1}],"case_sensitive":false}],
+        "limit":2,"include_attributes":["blob"]
+    })).await;
+    let numeric = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["Saturate",["Attribute","clicks"],{"midpoint":100}],"limit":2
+        }),
+    )
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(write.0, StatusCode::OK, "gap write: {:?}", write.1);
+    assert_eq!(sparse.0, StatusCode::OK, "sparse response: {:?}", sparse.1);
+    assert_eq!(sparse.1["rows"][0]["id"], 1);
+    assert_eq!(fuzzy.0, StatusCode::OK, "fuzzy response: {:?}", fuzzy.1);
+    assert_eq!(fuzzy.1["rows"][0]["id"], 1);
+    assert_eq!(fuzzy.1["rows"][0]["blob"], "AP8=");
+    assert_eq!(
+        numeric.0,
+        StatusCode::OK,
+        "numeric response: {:?}",
+        numeric.1
+    );
+    assert_eq!(numeric.1["rows"][0]["id"], 1);
+    assert_eq!(cleanup.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn local_contract() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -642,6 +700,7 @@ async fn local_contract() {
     grouping_contract(&format!("http://{address}"), "dummy").await;
     null_filter_contract(&format!("http://{address}"), "dummy").await;
     conditional_contract(&format!("http://{address}"), "dummy").await;
+    gap_contract(&format!("http://{address}"), "dummy").await;
 }
 
 #[tokio::test]
@@ -657,4 +716,5 @@ async fn optional_real_turbopuffer_contract() {
     grouping_contract(base.trim_end_matches('/'), &token).await;
     null_filter_contract(base.trim_end_matches('/'), &token).await;
     conditional_contract(base.trim_end_matches('/'), &token).await;
+    gap_contract(base.trim_end_matches('/'), &token).await;
 }

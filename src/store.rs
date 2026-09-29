@@ -1,6 +1,7 @@
 use crate::embedding::EmbeddingMode;
 use crate::query::{filter_matches, validate_filter};
 use crate::vector;
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -211,11 +212,11 @@ impl Namespace {
                     "distance_metric must be cosine_distance or euclidean_squared".into(),
                 ));
             }
-            if !self
-                .schema
-                .values()
-                .any(|v| vector::dimensions(v).is_some() || has_embed(v))
-            {
+            if !self.schema.values().any(|v| {
+                vector::dimensions(v).is_some()
+                    || vector::multi_dimensions(v).is_some()
+                    || has_embed(v)
+            }) {
                 return Err(WriteError::Invalid(
                     "distance_metric requires a vector attribute".into(),
                 ));
@@ -502,12 +503,58 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
                         "schema option type must be a string for attribute {field}"
                     ));
                 }
-                "filterable" | "ann" | "regex" | "glob" | "full_text_search"
-                    if !value.is_boolean() =>
+                "filterable" | "regex" | "glob" | "full_text_search" | "fuzzy"
+                    if !value.is_boolean()
+                        && !(option == "full_text_search" && value.is_object()) =>
                 {
                     return Err(format!(
                         "schema option {option} must be a boolean for attribute {field}"
                     ));
+                }
+                "ann" if !value.is_boolean() && !value.is_object() => {
+                    return Err(format!("invalid ann configuration for attribute {field}"));
+                }
+                "full_text_search" if value.is_object() => {
+                    let config = value.as_object().unwrap();
+                    if !matches!(field_type(definition), "string" | "[]string")
+                        || config.iter().any(|(key, value)| {
+                            let number = value.as_f64();
+                            match key.as_str() {
+                                "k1" | "k3" => number.is_none_or(|n| !n.is_finite() || n <= 0.0),
+                                "b" => number
+                                    .is_none_or(|n| !n.is_finite() || !(0.0..=1.0).contains(&n)),
+                                _ => true,
+                            }
+                        })
+                    {
+                        return Err(format!(
+                            "unsupported full_text_search configuration for attribute {field}"
+                        ));
+                    }
+                }
+                "ann" if value.is_object() => {
+                    if vector::multi_dimensions(definition).is_none()
+                        || value.as_object().is_none_or(|ann| {
+                            ann.len() != 1
+                                || ann.get("late_interaction") != Some(&Value::Bool(true))
+                        })
+                    {
+                        return Err(format!(
+                            "invalid late-interaction configuration for attribute {field}"
+                        ));
+                    }
+                }
+                "sparse_knn" => {
+                    if field_type(definition) != "{}f16"
+                        || value.as_object().is_none_or(|config| {
+                            config.len() != 1
+                                || config.get("distance_metric") != Some(&json!("dot_product"))
+                        })
+                    {
+                        return Err(format!(
+                            "invalid sparse_knn configuration for attribute {field}"
+                        ));
+                    }
                 }
                 "embed" if !value.is_object() => {
                     return Err(format!(
@@ -523,7 +570,8 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
                         return Err(format!("unsupported embed option for attribute {field}"));
                     }
                 }
-                "type" | "filterable" | "ann" | "regex" | "glob" | "full_text_search" => {}
+                "type" | "filterable" | "ann" | "regex" | "glob" | "full_text_search" | "fuzzy" => {
+                }
                 _ => {
                     return Err(format!(
                         "unsupported schema option {option} for attribute {field}"
@@ -542,9 +590,16 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
             return Err(format!("invalid embed configuration for attribute {field}"));
         }
     }
+    if field_type(definition) == "bytes" && definition.get("filterable") == Some(&Value::Bool(true))
+    {
+        return Err(format!("bytes attribute {field} cannot be filterable"));
+    }
     match field_type(definition) {
-        "uuid" | "uint" | "int" | "float" | "string" | "bool" | "datetime" | "[]uuid"
-        | "[]uint" | "[]int" | "[]float" | "[]string" | "[]bool" | "[]datetime" => Ok(()),
+        "uuid" | "uint" | "int" | "float" | "string" | "bool" | "datetime" | "bytes" | "{}f16"
+        | "[]uuid" | "[]uint" | "[]int" | "[]float" | "[]string" | "[]bool" | "[]datetime" => {
+            Ok(())
+        }
+        _ if vector::multi_dimensions(definition).is_some_and(|n| n > 0 && n <= 3072) => Ok(()),
         value
             if value.starts_with('[')
                 && (value.ends_with("]f16")
@@ -602,6 +657,11 @@ fn validate_value(field: &str, value: &Value, definition: &Value) -> Result<(), 
         "float" => value.is_number(),
         "string" | "datetime" => value.is_string(),
         "bool" => value.is_boolean(),
+        "bytes" => value.as_str().is_some_and(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .is_ok_and(|bytes| bytes.len() <= 8 * 1024 * 1024)
+        }),
         "[]uuid" => value
             .as_array()
             .is_some_and(|a| a.iter().all(|v| v.as_str().is_some_and(uuid_like))),
@@ -620,6 +680,21 @@ fn validate_value(field: &str, value: &Value, definition: &Value) -> Result<(), 
         "[]bool" => value
             .as_array()
             .is_some_and(|a| a.iter().all(Value::is_boolean)),
+        "{}f16" => value.as_object().is_some_and(|sparse| {
+            sparse.len() <= 1024
+                && sparse.keys().all(|key| !key.is_empty())
+                && sparse.values().all(Value::is_number)
+        }),
+        _ if vector::multi_dimensions(definition).is_some() => vector::multi_dimensions(definition)
+            .is_some_and(|dimensions| {
+                value.as_array().is_some_and(|vectors| {
+                    vectors.iter().all(|vector| {
+                        vector.as_array().is_some_and(|elements| {
+                            elements.len() == dimensions && elements.iter().all(Value::is_number)
+                        })
+                    })
+                })
+            }),
         vector if vector::dimensions(definition).is_some() => {
             let expected = vector
                 .trim_start_matches('[')

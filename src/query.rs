@@ -1,6 +1,6 @@
 use crate::store::{field_type, known_field, Namespace};
 use crate::vector;
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use globset::GlobBuilder;
 use regex::Regex;
 use serde_json::{json, Map, Value};
@@ -260,7 +260,9 @@ impl Namespace {
                 if filter.is_some_and(|f| !filter_matches(f, row)) {
                     return None;
                 }
-                let score = rank.map_or(0.0, |rank| score_rank(rank, row, &self.rows, metric));
+                let score = rank.map_or(0.0, |rank| {
+                    score_rank(rank, row, &self.rows, &self.schema, metric)
+                });
                 if !score.is_finite()
                     || rank.is_some_and(|rank| {
                         !is_ascending(rank)
@@ -353,7 +355,8 @@ impl Namespace {
                 if let Some(computed) = object.get("compute_attributes").and_then(Value::as_object)
                 {
                     for (name, expression) in computed {
-                        let value = computed_value(expression, row, &self.rows, metric);
+                        let value =
+                            computed_value(expression, row, &self.rows, &self.schema, metric);
                         result.insert(name.clone(), value);
                     }
                 }
@@ -559,13 +562,14 @@ fn computed_value(
     expression: &Value,
     row: &Map<String, Value>,
     corpus: &BTreeMap<String, Map<String, Value>>,
+    schema: &Map<String, Value>,
     metric: &str,
 ) -> Value {
     let mut rank = expression.clone();
     if rank[1] == "VectorDist" {
         rank[1] = json!("ANN");
     }
-    let score = score_rank(&rank, row, corpus, metric);
+    let score = score_rank(&rank, row, corpus, schema, metric);
     if score.is_finite() {
         json!(score)
     } else {
@@ -696,12 +700,22 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
     let op = parts[1]
         .as_str()
         .ok_or("filter operator must be a string")?;
-    let definition = &schema[field];
-    let full_text_search = definition.get("full_text_search") == Some(&Value::Bool(true));
+    let definition = schema
+        .get(field)
+        .ok_or(format!("attribute {field} is not filterable"))?;
+    if matches!(field_type(definition), "bytes" | "{}f16") {
+        return Err(format!("attribute {field} is not filterable"));
+    }
+    let full_text_search = has_full_text_search(definition);
     let filterable = definition
         .get("filterable")
         .and_then(Value::as_bool)
-        .unwrap_or(!full_text_search);
+        .unwrap_or(
+            !full_text_search
+                && definition.get("fuzzy") != Some(&Value::Bool(true))
+                && definition.get("regex") != Some(&Value::Bool(true))
+                && definition.get("glob") != Some(&Value::Bool(true)),
+        );
     if !filterable
         && !matches!(
             op,
@@ -713,6 +727,7 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
                 | "IGlob"
                 | "NotIGlob"
                 | "Regex"
+                | "Fuzzy"
         )
     {
         return Err(format!("attribute {field} is not filterable"));
@@ -733,9 +748,7 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
         if !matches!(field_type(&schema[field]), "string" | "[]string") {
             return Err(format!("attribute {field} is not a text field"));
         }
-        if !schema.get(field).is_some_and(|definition| {
-            definition.get("full_text_search") == Some(&Value::Bool(true))
-        }) {
+        if !schema.get(field).is_some_and(has_full_text_search) {
             return Err(format!(
                 "attribute {field} is not configured for full-text search"
             ));
@@ -787,6 +800,55 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
         }
         return Ok(());
     }
+    if op == "Fuzzy" {
+        if parts.len() != 4
+            || !matches!(field_type(definition), "string" | "[]string")
+            || definition.get("fuzzy") != Some(&Value::Bool(true))
+            || !parts[2].is_string()
+        {
+            return Err(format!(
+                "attribute {field} does not enable fuzzy text filtering"
+            ));
+        }
+        let options = parts[3]
+            .as_object()
+            .ok_or("Fuzzy options must be an object")?;
+        if options
+            .keys()
+            .any(|key| !matches!(key.as_str(), "case_sensitive" | "max_edit_distance"))
+            || options
+                .get("case_sensitive")
+                .is_some_and(|value| !value.is_boolean())
+        {
+            return Err("invalid Fuzzy options".into());
+        }
+        let thresholds = options
+            .get("max_edit_distance")
+            .and_then(Value::as_array)
+            .ok_or("Fuzzy requires max_edit_distance thresholds")?;
+        if thresholds.is_empty()
+            || thresholds.iter().any(|threshold| {
+                threshold.as_object().is_none_or(|entry| {
+                    entry.len() != 2
+                        || entry
+                            .get("min_query_chars")
+                            .and_then(Value::as_u64)
+                            .is_none()
+                        || entry
+                            .get("distance")
+                            .and_then(Value::as_u64)
+                            .is_none_or(|distance| {
+                                distance > 2
+                                    || entry["min_query_chars"].as_u64().unwrap()
+                                        < 3 * (distance + 1)
+                            })
+                })
+            })
+        {
+            return Err("invalid Fuzzy max_edit_distance thresholds".into());
+        }
+        return Ok(());
+    }
     if parts.len() == 4 {
         return Err(format!("{op} does not take options"));
     }
@@ -806,6 +868,12 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
         }
         _ => Err(format!("unsupported filter operator {op}")),
     }
+}
+
+fn has_full_text_search(definition: &Value) -> bool {
+    definition
+        .get("full_text_search")
+        .is_some_and(|config| config == &Value::Bool(true) || config.is_object())
 }
 
 pub(crate) fn filter_matches(filter: &Value, row: &Map<String, Value>) -> bool {
@@ -873,8 +941,61 @@ pub(crate) fn filter_matches(filter: &Value, row: &Map<String, Value>) -> bool {
         "Regex" => left
             .as_str()
             .is_some_and(|text| Regex::new(right.as_str().unwrap()).unwrap().is_match(text)),
+        "Fuzzy" => fuzzy_matches(left, right.as_str().unwrap(), &parts[3]),
         _ => false,
     }
+}
+
+fn fuzzy_matches(value: &Value, query: &str, options: &Value) -> bool {
+    let max_distance = options["max_edit_distance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| {
+            query.chars().count() >= entry["min_query_chars"].as_u64().unwrap() as usize
+        })
+        .filter_map(|entry| entry["distance"].as_u64())
+        .max();
+    let Some(max_distance) = max_distance else {
+        return false;
+    };
+    let case_sensitive = options
+        .get("case_sensitive")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let query = if case_sensitive {
+        query.to_owned()
+    } else {
+        query.to_lowercase()
+    };
+    let candidates: Vec<&str> = match value {
+        Value::String(text) => vec![text],
+        Value::Array(values) => values.iter().filter_map(Value::as_str).collect(),
+        _ => return false,
+    };
+    candidates.into_iter().any(|candidate| {
+        let candidate = if case_sensitive {
+            candidate.to_owned()
+        } else {
+            candidate.to_lowercase()
+        };
+        fuzzy_substring_distance(&query, &candidate) <= max_distance as usize
+    })
+}
+
+fn fuzzy_substring_distance(query: &str, text: &str) -> usize {
+    let query: Vec<char> = query.chars().collect();
+    let mut previous: Vec<usize> = (0..=query.len()).collect();
+    for character in text.chars() {
+        let mut current = vec![0; query.len() + 1];
+        for (index, expected) in query.iter().enumerate() {
+            current[index + 1] = (previous[index + 1] + 1)
+                .min(current[index] + 1)
+                .min(previous[index] + usize::from(*expected != character));
+        }
+        previous = current;
+    }
+    previous[query.len()]
 }
 
 fn token_filter_matches(parts: &[Value], left: &Value) -> bool {
@@ -980,6 +1101,66 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
         }
         return Ok(());
     }
+    if parts.len() == 3 && parts[0] == "Max" {
+        let (floor, expression) = if parts[1].is_number() {
+            (&parts[1], &parts[2])
+        } else {
+            (&parts[2], &parts[1])
+        };
+        if floor.as_f64().is_none_or(|number| !number.is_finite()) {
+            return Err("Max requires a numeric floor".into());
+        }
+        return validate_rank(expression, schema);
+    }
+    if parts.len() == 3 && matches!(parts[0].as_str(), Some("Saturate" | "Decay")) {
+        validate_rank(&parts[1], schema)?;
+        let config = parts[2]
+            .as_object()
+            .ok_or("Saturate/Decay requires a config object")?;
+        if config
+            .keys()
+            .any(|key| !matches!(key.as_str(), "midpoint" | "exponent"))
+        {
+            return Err("unsupported Saturate/Decay option".into());
+        }
+        let midpoint = config
+            .get("midpoint")
+            .ok_or("Saturate/Decay requires midpoint")?;
+        if midpoint
+            .as_f64()
+            .is_none_or(|number| !number.is_finite() || number <= 0.0)
+            && midpoint.as_str().and_then(parse_duration_ms).is_none()
+        {
+            return Err("Saturate/Decay midpoint must be positive".into());
+        }
+        if config.get("exponent").is_some_and(|exponent| {
+            exponent
+                .as_f64()
+                .is_none_or(|number| !number.is_finite() || number <= 0.0)
+        }) {
+            return Err("Saturate/Decay exponent must be positive".into());
+        }
+        return Ok(());
+    }
+    if parts.len() == 3 && parts[0] == "Dist" {
+        let attribute = parts[1]
+            .as_array()
+            .ok_or("Dist requires an Attribute expression")?;
+        if attribute.len() != 2 || attribute[0] != "Attribute" {
+            return Err("Dist requires an Attribute expression".into());
+        }
+        let field = attribute[1].as_str().ok_or("Dist requires a field name")?;
+        let definition = schema.get(field).ok_or("Dist attribute does not exist")?;
+        let valid = match field_type(definition) {
+            "uint" | "int" | "float" => parts[2].is_number(),
+            "datetime" => parts[2].as_str().and_then(parse_datetime_ms).is_some(),
+            _ => false,
+        };
+        if !valid {
+            return Err("Dist origin must match a numeric or datetime attribute".into());
+        }
+        return Ok(());
+    }
     if parts.len() == 3 && parts[0] == "Product" {
         let (weight, expression) = if parts[1].is_number() {
             (&parts[1], &parts[2])
@@ -1021,6 +1202,64 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
     }
     let operator = parts[1].as_str().ok_or("rank operator must be a string")?;
     match operator {
+        "SparseKNN" if parts.len() == 3 => {
+            if schema
+                .get(field)
+                .is_none_or(|definition| field_type(definition) != "{}f16")
+                || schema
+                    .get(field)
+                    .and_then(|definition| definition.get("sparse_knn"))
+                    .and_then(|config| config.get("distance_metric"))
+                    != Some(&json!("dot_product"))
+            {
+                return Err(format!("attribute {field} does not enable SparseKNN"));
+            }
+            let sparse = parts[2]
+                .as_object()
+                .ok_or("SparseKNN query must be an object")?;
+            if sparse.len() > 1024 || sparse.values().any(|value| !value.is_number()) {
+                return Err("SparseKNN query must contain at most 1024 numeric dimensions".into());
+            }
+            Ok(())
+        }
+        "ANN" | "kNN"
+            if parts.len() == 3
+                && schema
+                    .get(field)
+                    .and_then(vector::multi_dimensions)
+                    .is_some() =>
+        {
+            let dimensions = schema
+                .get(field)
+                .and_then(vector::multi_dimensions)
+                .unwrap();
+            let vectors = parts[2]
+                .as_array()
+                .ok_or("multi-vector query must be an array")?;
+            if vectors.is_empty()
+                || vectors.iter().any(|vector| {
+                    vector.as_array().is_none_or(|elements| {
+                        elements.len() != dimensions
+                            || elements.iter().any(|value| !value.is_number())
+                    })
+                })
+            {
+                return Err(format!(
+                    "query vectors have wrong dimensions for attribute {field}"
+                ));
+            }
+            if operator == "ANN"
+                && schema[field]
+                    .get("ann")
+                    .and_then(|ann| ann.get("late_interaction"))
+                    != Some(&Value::Bool(true))
+            {
+                return Err(format!(
+                    "attribute {field} does not enable late-interaction ANN"
+                ));
+            }
+            Ok(())
+        }
         "ANN" | "kNN"
             if parts.len() == 3
                 && parts[2]
@@ -1060,15 +1299,22 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
             Ok(())
         }
         "BM25" if parts.len() == 3 && parts[2].is_string() => {
-            let definition = &schema[field];
+            let definition = schema.get(field).unwrap_or(&Value::Null);
             if !matches!(field_type(definition), "string" | "[]string")
-                || definition.get("full_text_search") != Some(&Value::Bool(true))
+                || !has_full_text_search(definition)
             {
                 return Err(format!("attribute {field} has no full-text index"));
             }
             Ok(())
         }
-        "asc" | "desc" if parts.len() == 2 => Ok(()),
+        "asc" | "desc"
+            if parts.len() == 2
+                && schema
+                    .get(field)
+                    .is_some_and(|definition| field_type(definition) != "bytes") =>
+        {
+            Ok(())
+        }
         _ => Err(format!("unsupported rank operator {operator}")),
     }
 }
@@ -1146,6 +1392,7 @@ fn score_rank(
     rank: &Value,
     row: &Map<String, Value>,
     corpus: &std::collections::BTreeMap<String, Map<String, Value>>,
+    schema: &Map<String, Value>,
     metric: &str,
 ) -> f64 {
     let parts = rank.as_array().unwrap();
@@ -1157,11 +1404,56 @@ fn score_rank(
             .as_array()
             .unwrap()
             .iter()
-            .map(|child| score_rank(child, row, corpus, metric));
+            .map(|child| score_rank(child, row, corpus, schema, metric));
         return if parts[0] == "Sum" {
             scores.sum()
         } else {
             scores.fold(f64::NEG_INFINITY, f64::max)
+        };
+    }
+    if parts[0] == "Max" && parts.len() == 3 {
+        let (floor, expression) = if parts[1].is_number() {
+            (&parts[1], &parts[2])
+        } else {
+            (&parts[2], &parts[1])
+        };
+        return floor
+            .as_f64()
+            .unwrap()
+            .max(score_rank(expression, row, corpus, schema, metric));
+    }
+    if matches!(parts[0].as_str(), Some("Saturate" | "Decay")) {
+        let value = score_rank(&parts[1], row, corpus, schema, metric).max(0.0);
+        let midpoint = parts[2]["midpoint"]
+            .as_f64()
+            .or_else(|| parts[2]["midpoint"].as_str().and_then(parse_duration_ms))
+            .unwrap();
+        let exponent = parts[2]
+            .get("exponent")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0);
+        let value = value.powf(exponent);
+        let midpoint = midpoint.powf(exponent);
+        return if parts[0] == "Decay" {
+            midpoint / (value + midpoint)
+        } else {
+            value / (value + midpoint)
+        };
+    }
+    if parts[0] == "Dist" {
+        let field = parts[1][1].as_str().unwrap();
+        let Some(value) = row.get(field) else {
+            return f64::INFINITY;
+        };
+        return if let (Some(value), Some(origin)) = (value.as_f64(), parts[2].as_f64()) {
+            (value - origin).abs()
+        } else if let (Some(value), Some(origin)) = (
+            value.as_str().and_then(parse_datetime_ms),
+            parts[2].as_str().and_then(parse_datetime_ms),
+        ) {
+            (value - origin).abs()
+        } else {
+            f64::INFINITY
         };
     }
     if parts[0] == "Product" {
@@ -1170,7 +1462,7 @@ fn score_rank(
         } else {
             (&parts[2], &parts[1])
         };
-        return weight.as_f64().unwrap() * score_rank(expression, row, corpus, metric);
+        return weight.as_f64().unwrap() * score_rank(expression, row, corpus, schema, metric);
     }
     if parts[0] == "Attribute" {
         return row
@@ -1184,43 +1476,108 @@ fn score_rank(
             let query = parts[2].as_array().unwrap();
             let vector = row.get(field).and_then(Value::as_array);
             match vector {
-                Some(vector) if vector.len() == query.len() => {
-                    if metric == "euclidean_squared" {
-                        return vector
+                Some(vector) if query.first().is_some_and(Value::is_array) => query
+                    .iter()
+                    .map(|query_token| {
+                        vector
                             .iter()
-                            .zip(query)
-                            .map(|(a, b)| (a.as_f64().unwrap() - b.as_f64().unwrap()).powi(2))
-                            .sum();
-                    }
-                    let dot: f64 = vector
-                        .iter()
-                        .zip(query)
-                        .map(|(a, b)| a.as_f64().unwrap() * b.as_f64().unwrap())
-                        .sum();
-                    let norm_a: f64 = vector
-                        .iter()
-                        .map(|a| a.as_f64().unwrap().powi(2))
-                        .sum::<f64>()
-                        .sqrt();
-                    let norm_b: f64 = query
-                        .iter()
-                        .map(|a| a.as_f64().unwrap().powi(2))
-                        .sum::<f64>()
-                        .sqrt();
-                    if norm_a == 0.0 || norm_b == 0.0 {
-                        f64::INFINITY
-                    } else {
-                        1.0 - dot / norm_a / norm_b
-                    }
+                            .filter_map(Value::as_array)
+                            .map(|document_token| {
+                                dense_distance(
+                                    query_token.as_array().unwrap(),
+                                    document_token,
+                                    metric,
+                                )
+                            })
+                            .fold(f64::INFINITY, f64::min)
+                    })
+                    .sum(),
+                Some(vector) if vector.len() == query.len() => {
+                    dense_distance(query, vector, metric)
                 }
                 _ => f64::INFINITY,
             }
         }
-        "BM25" => bm25(field, parts[2].as_str().unwrap(), row, corpus),
+        "SparseKNN" => {
+            let query = parts[2].as_object().unwrap();
+            let Some(document) = row.get(field).and_then(Value::as_object) else {
+                return 0.0;
+            };
+            query
+                .iter()
+                .map(|(key, weight)| {
+                    weight.as_f64().unwrap()
+                        * document.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+                })
+                .sum()
+        }
+        "BM25" => bm25(field, parts[2].as_str().unwrap(), row, corpus, schema),
         "Eq" | "NotEq" | "In" | "NotIn" | "Gt" | "Gte" | "Lt" | "Lte" => {
             f64::from(filter_matches(rank, row))
         }
         _ => 0.0,
+    }
+}
+
+fn parse_datetime_ms(value: &str) -> Option<f64> {
+    DateTime::<FixedOffset>::parse_from_rfc3339(value)
+        .ok()
+        .map(|time| time.timestamp_millis() as f64)
+        .or_else(|| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|time| time.and_utc().timestamp_millis() as f64)
+        })
+}
+
+fn parse_duration_ms(value: &str) -> Option<f64> {
+    let split = value.find(|character: char| character.is_ascii_alphabetic())?;
+    let number = value[..split].parse::<f64>().ok()?;
+    if !number.is_finite() || number <= 0.0 {
+        return None;
+    }
+    let factor = match &value[split..] {
+        "s" => 1_000.0,
+        "m" => 60_000.0,
+        "h" => 3_600_000.0,
+        "d" => 86_400_000.0,
+        "w" => 604_800_000.0,
+        _ => return None,
+    };
+    Some(number * factor)
+}
+
+fn dense_distance(query: &[Value], vector: &[Value], metric: &str) -> f64 {
+    if query.len() != vector.len() {
+        return f64::INFINITY;
+    }
+    if metric == "euclidean_squared" {
+        return vector
+            .iter()
+            .zip(query)
+            .map(|(a, b)| (a.as_f64().unwrap() - b.as_f64().unwrap()).powi(2))
+            .sum();
+    }
+    let dot: f64 = vector
+        .iter()
+        .zip(query)
+        .map(|(a, b)| a.as_f64().unwrap() * b.as_f64().unwrap())
+        .sum();
+    let norm_a = vector
+        .iter()
+        .map(|a| a.as_f64().unwrap().powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let norm_b = query
+        .iter()
+        .map(|a| a.as_f64().unwrap().powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        f64::INFINITY
+    } else {
+        1.0 - dot / norm_a / norm_b
     }
 }
 
@@ -1248,7 +1605,21 @@ fn bm25(
     query: &str,
     row: &Map<String, Value>,
     corpus: &std::collections::BTreeMap<String, Map<String, Value>>,
+    schema: &Map<String, Value>,
 ) -> f64 {
+    let config = schema[field].get("full_text_search");
+    let k1 = config
+        .and_then(|value| value.get("k1"))
+        .and_then(Value::as_f64)
+        .unwrap_or(1.2);
+    let b = config
+        .and_then(|value| value.get("b"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.75);
+    let k3 = config
+        .and_then(|value| value.get("k3"))
+        .and_then(Value::as_f64)
+        .unwrap_or(8.0);
     let doc_tokens = row.get(field).map(value_tokens).unwrap_or_default();
     let query_tokens = tokens(query);
     if query_tokens.is_empty() || doc_tokens.is_empty() {
@@ -1279,8 +1650,9 @@ fn bm25(
                 .count() as f64;
             let n = corpus.len() as f64;
             let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
-            let norm = 1.2 * (1.0 - 0.75 + 0.75 * doc_tokens.len() as f64 / avg_len);
-            query_freq as f64 * idf * freq * 2.2 / (freq + norm)
+            let norm = k1 * (1.0 - b + b * doc_tokens.len() as f64 / avg_len);
+            let query_weight = query_freq as f64 * (k3 + 1.0) / (query_freq as f64 + k3);
+            query_weight * idf * freq * (k1 + 1.0) / (freq + norm)
         })
         .sum()
 }

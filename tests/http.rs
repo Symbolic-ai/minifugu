@@ -650,14 +650,14 @@ async fn unsupported_fields_fail_loudly() {
     let (status, body) = post(
         &client,
         &ns,
-        json!({"schema":{"title":{"type":"string","fuzzy":true}}}),
+        json!({"schema":{"title":{"type":"string","geo":true}}}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"]
         .as_str()
         .unwrap()
-        .contains("unsupported schema option fuzzy"));
+        .contains("unsupported schema option geo"));
     let (status, body) = post(
         &client,
         &format!("{ns}/query"),

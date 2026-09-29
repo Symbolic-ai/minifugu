@@ -12,6 +12,13 @@ pub(crate) fn dimensions(definition: &Value) -> Option<usize> {
     kind.strip_prefix('[')?.split(']').next()?.parse().ok()
 }
 
+pub(crate) fn multi_dimensions(definition: &Value) -> Option<usize> {
+    let kind = definition
+        .as_str()
+        .or_else(|| definition.get("type")?.as_str())?;
+    kind.strip_prefix("[][")?.strip_suffix("]f32")?.parse().ok()
+}
+
 pub(crate) fn decode(value: &str, dimensions: usize) -> Result<Value, String> {
     let bytes = STANDARD
         .decode(value)

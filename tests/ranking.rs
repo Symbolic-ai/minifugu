@@ -110,6 +110,245 @@ async fn bm25_ranks_term_frequency_and_excludes_non_matches() {
 }
 
 #[tokio::test]
+async fn sparse_knn_ranks_dot_products_and_excludes_non_matches() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/sparse");
+    let (status, _) = post(&client, &url, json!({
+        "schema":{"id":"uint","terms":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}}},
+        "upsert_rows":[
+            {"id":1,"terms":{"fugu":1.0,"blue":0.25}},
+            {"id":2,"terms":{"fugu":0.5}},
+            {"id":3,"terms":{"whale":1.0}}
+        ]
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["terms","SparseKNN",{"fugu":1.0}],"limit":3
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(result["rows"][0]["id"], 1);
+    assert_eq!(result["rows"][0]["$dist"], 1.0);
+    assert_eq!(result["rows"][1]["id"], 2);
+    let (status, _) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["terms","SparseKNN",{"fugu":"invalid"}],"limit":3
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn late_interaction_vectors_sum_best_document_token_distances() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/multivector");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","tokens":{"type":"[][2]f32","ann":{"late_interaction":true}}},
+            "distance_metric":"euclidean_squared",
+            "upsert_rows":[
+                {"id":1,"tokens":[[1.0,0.0],[0.0,1.0]]},
+                {"id":2,"tokens":[[0.9,0.1],[0.9,0.1]]}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["tokens","ANN",[[1.0,0.0],[0.0,1.0]]],"limit":2
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"][0]["id"], 1);
+    assert_eq!(result["rows"][0]["$dist"], 0.0);
+    assert_eq!(result["rows"][1]["id"], 2);
+    let (status, _) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["tokens","ANN",[[1.0]]],"limit":2
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn fuzzy_filter_matches_edit_distance_with_case_option() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/fuzzy");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","name":{"type":"string","fuzzy":true}},
+            "upsert_rows":[{"id":1,"name":"Small Pufferfish"},{"id":2,"name":"blue whale"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let options =
+        json!({"max_edit_distance":[{"min_query_chars":6,"distance":1}],"case_sensitive":false});
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "filters":["name","Fuzzy","pufferfsh",options],"limit":10
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(result["rows"][0]["id"], 1);
+    let (status, result) = post(&client, &format!("{url}/query"), json!({
+        "filters":["name","Fuzzy","pufferfsh",{"max_edit_distance":[{"min_query_chars":6,"distance":1}],"case_sensitive":true}],"limit":10
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(result["rows"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn numeric_ranking_saturates_and_decays_distances() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/numeric-rank");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","clicks":"uint","published_at":"datetime"},
+            "upsert_rows":[
+                {"id":1,"clicks":100,"published_at":"2026-01-01T00:00:00Z"},
+                {"id":2,"clicks":10,"published_at":"2026-01-02T00:00:00Z"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["Saturate",["Attribute","clicks"],{"midpoint":100}],"limit":2
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"][0]["id"], 1);
+    assert_eq!(result["rows"][0]["$dist"], 0.5);
+    let (status, result) = post(&client, &format!("{url}/query"), json!({
+        "rank_by":["Decay",["Dist",["Attribute","published_at"],"2026-01-01T00:00:00Z"],{"midpoint":"1d"}],"limit":2
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"][0]["id"], 1);
+    assert_eq!(result["rows"][0]["$dist"], 1.0);
+    assert_eq!(result["rows"][1]["$dist"], 0.5);
+    let (status, _) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["Saturate",["Attribute","clicks"],{"midpoint":0}],"limit":2
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn bytes_round_trip_and_reject_invalid_base64_or_filtering() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/bytes");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","blob":"bytes"},
+            "upsert_rows":[{"id":1,"blob":"AP8="}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["id","asc"],"limit":10,"include_attributes":true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"][0]["blob"], "AP8=");
+    let (status, _) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "filters":["blob","Eq","AP8="],"limit":10
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({"upsert_rows":[{"id":2,"blob":"invalid"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn full_text_object_config_tunes_bm25_and_rejects_unimplemented_options() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/tuned-fts");
+    let (status, _) = post(&client, &url, json!({
+        "schema":{"id":"uint","title":{"type":"string","full_text_search":{"k1":2.0,"b":0.0,"k3":8.0}}},
+        "upsert_rows":[{"id":1,"title":"fugu fugu"},{"id":2,"title":"fugu"}]
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["title","BM25","fugu fugu"],"limit":2
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"][0]["id"], 1);
+    assert!(
+        result["rows"][0]["$dist"].as_f64().unwrap() > result["rows"][1]["$dist"].as_f64().unwrap()
+    );
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"title":{"type":"string","full_text_search":{"stemming":true}}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn deterministic_native_vectors_can_be_queried_with_the_same_embedder() {
     let base = serve(minifugu::router()).await;
     let client = Client::new();
@@ -131,6 +370,24 @@ async fn deterministic_native_vectors_can_be_queried_with_the_same_embedder() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["rows"][0]["id"], 1);
     assert!(result["rows"][0]["$dist"].as_f64().unwrap().abs() < 0.00001);
+    let (status, _) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["embed_content","BM25","red"],"limit":2
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "filters":["embed_content","Eq",[1.0,0.0]],"limit":2
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
