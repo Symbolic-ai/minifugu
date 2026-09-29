@@ -308,6 +308,19 @@ impl Namespace {
                 self.schema.insert(field.clone(), definition);
             }
         }
+        // Live Turbopuffer infers an undeclared `vector` attribute as an ANN-indexed
+        // `[N]f32` from the upserted values, so the metric checks below must see it.
+        if self
+            .schema
+            .get("vector")
+            .is_none_or(|definition| definition == "[]unknown")
+        {
+            if let Some(dimensions) = inferred_vector_dimensions(object)? {
+                let definition = json!({"type": format!("[{dimensions}]f32"), "ann": true});
+                validate_definition("vector", &definition)?;
+                self.schema.insert("vector".into(), definition);
+            }
+        }
         let generated_vectors = self
             .schema
             .iter()
@@ -372,7 +385,7 @@ impl Namespace {
                     || has_embed(v)
             }) {
                 return Err(WriteError::Invalid(
-                    "distance_metric requires a vector attribute".into(),
+                    "the `distance_metric` field cannot be provided, namespace configured without vector indexing".into(),
                 ));
             }
             self.distance_metric = Some(metric.into());
@@ -527,7 +540,7 @@ impl Namespace {
                     continue;
                 }
                 for (field, definition) in &self.schema {
-                    if is_fixed_vector(definition) && !row.contains_key(field) {
+                    if is_fixed_vector(definition) && row.get(field).is_none_or(Value::is_null) {
                         return Err(format!("upsert row requires vector attribute {field}").into());
                     }
                 }
@@ -717,6 +730,58 @@ fn write_rows(
         (None, Some(columns)) => Ok(Some(rows_from_columns(columns)?)),
         (None, None) => Ok(None),
     }
+}
+
+/// Dimensions of the `vector` values an upsert carries, or `None` when it
+/// carries none. Numeric arrays and base64 float32 vectors infer the same type.
+fn inferred_vector_dimensions(object: &Map<String, Value>) -> Result<Option<usize>, WriteError> {
+    let values: Vec<&Value> =
+        if let Some(rows) = object.get("upsert_rows").and_then(Value::as_array) {
+            rows.iter().filter_map(|row| row.get("vector")).collect()
+        } else if let Some(column) = object
+            .get("upsert_columns")
+            .and_then(|columns| columns.get("vector"))
+            .and_then(Value::as_array)
+        {
+            column.iter().collect()
+        } else {
+            return Ok(None);
+        };
+    let mut dimensions = None;
+    for value in values {
+        let length = match value {
+            Value::Array(vector) if !vector.is_empty() && vector.iter().all(Value::is_number) => {
+                vector.len()
+            }
+            Value::Array(vector) if vector.is_empty() => {
+                return Err("an empty vector was passed; each row must have a vector".into());
+            }
+            Value::String(encoded) => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|_| "invalid base64 vector")?;
+                if bytes.is_empty() || bytes.len() % 4 != 0 {
+                    return Err("base64 vector has invalid dimensions".into());
+                }
+                vector::decode(encoded, bytes.len() / 4)?;
+                bytes.len() / 4
+            }
+            Value::Null => return Err("each row must have a vector value".into()),
+            _ => return Err("vector must be a numeric array or base64 float32 value".into()),
+        };
+        match dimensions {
+            None => dimensions = Some(length),
+            Some(expected) if expected != length => {
+                return Err(format!(
+                    "All nested vectors must have the same number of dimensions, got: {expected} and {}",
+                    length
+                )
+                .into());
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(dimensions)
 }
 
 fn rows_from_columns(columns: &Value) -> Result<Vec<Value>, WriteError> {
@@ -998,16 +1063,16 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
         | "[]datetime" => Ok(()),
         _ if vector::multi_dimensions(definition).is_some_and(|n| n > 0 && n <= 3072) => Ok(()),
         value
-            if value.starts_with('[')
-                && (value.ends_with("]f16")
-                    || value.ends_with("]f32")
-                    || value.ends_with("]i8"))
-                && value
-                    .trim_start_matches('[')
-                    .split(']')
-                    .next()
-                    .and_then(|n| n.parse::<usize>().ok())
-                    .is_some_and(|n| n > 0 && n <= 3072) =>
+            if vector::dimensions(definition).is_some_and(|dimensions| {
+                let element_bytes = if value.ends_with("]f32") {
+                    4
+                } else if value.ends_with("]f16") {
+                    2
+                } else {
+                    1
+                };
+                dimensions > 0 && dimensions <= 8 * 1024 * 1024 / element_bytes
+            }) =>
         {
             Ok(())
         }

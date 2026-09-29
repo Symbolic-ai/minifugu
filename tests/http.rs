@@ -2237,6 +2237,17 @@ async fn embedded_upserts_require_text_or_accept_an_explicit_generated_vector() 
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"patch_rows":[{"id":1,"embed_content":"not base64"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("does not exist in schema"));
 }
 
 #[tokio::test]
@@ -2408,4 +2419,98 @@ async fn inferred_numeric_and_array_types_follow_live_rules() {
         .await
         .unwrap();
     assert_eq!(schema["tokens"]["type"], "[][2]f32");
+}
+
+#[tokio::test]
+async fn undeclared_vector_attribute_is_inferred_like_live() {
+    let base = server().await;
+    let client = Client::new();
+    for (name, write) in [
+        (
+            "infer-rows",
+            json!({"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"vector":[0.5,1.0]},{"id":2,"vector":[1,0]}]}),
+        ),
+        (
+            "infer-columns",
+            json!({"distance_metric":"cosine_distance","upsert_columns":{"id":[1,2],"vector":[[0.5,1.0],[1,0]]}}),
+        ),
+        (
+            "infer-partial-schema",
+            json!({"distance_metric":"cosine_distance","schema":{"t":{"type":"string","full_text_search":true}},"upsert_rows":[{"id":1,"t":"a","vector":[0.5,1.0]},{"id":2,"t":"b","vector":[1,0]}]}),
+        ),
+        (
+            "infer-base64",
+            json!({"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"vector":"AAAAPwAAgD8="},{"id":2,"vector":[1,0]}]}),
+        ),
+    ] {
+        let url = format!("{base}/{name}");
+        let (status, body) = post(&client, &url, write).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+        let schema: Value = client
+            .get(format!("{}/{name}/schema", base.replace("/v2/", "/v1/")))
+            .bearer_auth("dummy")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(schema["vector"]["type"], "[2]f32", "{name}: {schema}");
+        assert_eq!(schema["vector"]["ann"], true, "{name}: {schema}");
+        let (status, result) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({"rank_by":["vector","ANN",[1.0,0.0]],"top_k":2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name}: {result}");
+        assert_eq!(result["rows"][0]["id"], 2, "{name}: {result}");
+        assert_eq!(result["rows"][1]["id"], 1, "{name}: {result}");
+    }
+
+    for (write, error) in [
+        (
+            json!({"upsert_rows":[{"id":1,"vector":[0.5,1.0]}]}),
+            "distance_metric must be specified for write to namespace with a vector",
+        ),
+        (
+            json!({"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"x":1}]}),
+            "the `distance_metric` field cannot be provided, namespace configured without vector indexing",
+        ),
+        (
+            json!({"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"vector":[0.5,1.0]},{"id":2,"vector":[1,0,0]}]}),
+            "All nested vectors must have the same number of dimensions, got: 2 and 3",
+        ),
+    ] {
+        let (status, body) = post(&client, &format!("{base}/infer-rejected"), write).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], error);
+    }
+    for write in [
+        json!({"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"vector":[]}]}),
+        json!({"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"vector":null}]}),
+        json!({"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"vector":"not base64"}]}),
+        json!({"distance_metric":"cosine_distance","schema":{"id":"uint","vector":{"type":"[3]f32","ann":true}},"upsert_rows":[{"id":1,"vector":[0.5,1.0]}]}),
+        json!({"distance_metric":"cosine_distance","schema":{"id":"uint","vector":{"type":"[2]f32","ann":true}},"upsert_rows":[{"id":1,"vector":null}]}),
+    ] {
+        let (status, body) = post(&client, &format!("{base}/infer-edge-rejected"), write).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    for (name, schema) in [
+        ("infer-long", Value::Null),
+        (
+            "explicit-long",
+            json!({"id":"uint","vector":{"type":"[3073]f32","ann":true}}),
+        ),
+    ] {
+        let mut write = json!({
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"vector":vec![0.1;3073]}]
+        });
+        if !schema.is_null() {
+            write["schema"] = schema;
+        }
+        let (status, body) = post(&client, &format!("{base}/{name}"), write).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+    }
 }
