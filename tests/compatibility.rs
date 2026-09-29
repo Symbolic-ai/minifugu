@@ -762,6 +762,7 @@ async fn local_contract() {
     ann_contract(&format!("http://{address}"), "dummy").await;
     null_sort_contract(&format!("http://{address}"), "dummy").await;
     regex_array_contract(&format!("http://{address}"), "dummy").await;
+    inferred_vector_contract(&format!("http://{address}"), "dummy").await;
 }
 
 #[tokio::test]
@@ -781,6 +782,52 @@ async fn optional_real_turbopuffer_contract() {
     ann_contract(base.trim_end_matches('/'), &token).await;
     null_sort_contract(base.trim_end_matches('/'), &token).await;
     regex_array_contract(base.trim_end_matches('/'), &token).await;
+    inferred_vector_contract(base.trim_end_matches('/'), &token).await;
+}
+
+async fn inferred_vector_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-inferred-vector-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let schema_url = format!("{base}/v1/namespaces/{name}/schema");
+    let write = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[
+                {"id":1,"vector":"AAAAPwAAgD8="},
+                {"id":2,"vector":[1.0,0.0]}
+            ]
+        }),
+    )
+    .await;
+    let schema: Value = client
+        .get(&schema_url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let query = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["vector","ANN",[1.0,0.0]],"limit":2
+        }),
+    )
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(write.0, StatusCode::OK, "{write:?}");
+    assert_eq!(schema["vector"]["type"], "[2]f32");
+    assert_eq!(schema["vector"]["ann"], true);
+    assert_eq!(query.0, StatusCode::OK, "{query:?}");
+    assert_eq!(ids(&query.1), vec![2, 1]);
+    assert_eq!(cleanup.status(), StatusCode::OK);
 }
 
 async fn null_sort_contract(base: &str, token: &str) {
