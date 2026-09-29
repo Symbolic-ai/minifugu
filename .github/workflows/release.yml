@@ -40,7 +40,8 @@ jobs:
           PRS: ${{ steps.release.outputs.prs }}
         run: |
           jq -r '.[].headBranchName' <<< "$PRS" | while IFS= read -r branch; do
-            gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"
+            gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch" \
+              || echo "::warning::failed to dispatch CI for $branch"
           done
       - name: Resolve release tag
         id: resolve
