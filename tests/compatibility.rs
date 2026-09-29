@@ -1821,6 +1821,13 @@ async fn write_response_contract(base: &str, token: &str) {
         json!({"schema":{"t":"string"},"upsert_rows":[]}),
     )
     .await;
+    let never_created = client
+        .get(format!("{base}/v1/namespaces/{name}/metadata"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .status();
     let setup = response(
         &client,
         token,
@@ -1833,10 +1840,15 @@ async fn write_response_contract(base: &str, token: &str) {
         json!({}),
         json!({"upsert_rows":[],"deletes":[]}),
         json!({"upsert_columns":{"id":[]}}),
-        json!({"upsert_rows":null,"disable_backpressure":true}),
+        json!({"upsert_rows":null}),
+        json!({"disable_backpressure":true}),
         json!({"patch_condition":["id","Eq",2]}),
         json!({"upsert_rows":"x"}),
         json!({"upsert_columns":{}}),
+        json!({"patch_rows":"x"}),
+        json!({"deletes":"x"}),
+        json!({"patch_columns":{"t":["a"]}}),
+        json!({"upsert_columns":{"id":[2],"t":"x"}}),
         json!({"upsert_rows":[{"id":2,"t":"y"}],"return_affected_ids":false}),
         json!({"patch_rows":[{"id":1,"t":"z"}],"deletes":[3]}),
         json!({"patch_rows":[{"id":42,"t":"z"}]}),
@@ -1859,55 +1871,54 @@ async fn write_response_contract(base: &str, token: &str) {
     let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
     assert_eq!(new_empty.0, StatusCode::BAD_REQUEST, "{new_empty:?}");
     assert_eq!(new_empty.1["error"], "💔 no writes provided");
+    assert_eq!(never_created, StatusCode::NOT_FOUND);
     assert_eq!(setup.0, StatusCode::OK, "{setup:?}");
     let no_writes = json!({"status":"error","error":"no writes provided"});
-    for result in &results[..4] {
+    for result in &results[..5] {
         assert_eq!(result, &(StatusCode::BAD_REQUEST, no_writes.clone()));
     }
     assert_eq!(
-        results[4],
+        results[5],
         (
             StatusCode::BAD_REQUEST,
             json!({"status":"error","error":"cannot set patch_condition without corresponding patch writes"})
         )
     );
     let shape = json!({"status":"error","error":"Failed to deserialize the JSON body into the target type"});
-    assert_eq!(
-        results[5],
-        (StatusCode::UNPROCESSABLE_ENTITY, shape.clone())
-    );
-    assert_eq!(results[6], (StatusCode::UNPROCESSABLE_ENTITY, shape));
+    for result in &results[6..12] {
+        assert_eq!(result, &(StatusCode::UNPROCESSABLE_ENTITY, shape.clone()));
+    }
     let committed = "documents committed successfully";
     assert_eq!(
-        results[7],
+        results[12],
         (
             StatusCode::OK,
             json!({"status":"OK","message":committed,"rows_affected":1,"rows_upserted":1})
         )
     );
     assert_eq!(
-        results[8],
+        results[13],
         (
             StatusCode::OK,
             json!({"status":"OK","message":committed,"rows_affected":2,"rows_patched":1,"rows_deleted":1})
         )
     );
     assert_eq!(
-        results[9],
+        results[14],
         (
             StatusCode::OK,
             json!({"status":"OK","message":committed,"rows_affected":0})
         )
     );
     assert_eq!(
-        results[10],
+        results[15],
         (
             StatusCode::OK,
             json!({"status":"OK","message":"filter matched 0 documents, schema updated successfully","rows_affected":0})
         )
     );
     assert_eq!(
-        results[11],
+        results[16],
         (
             StatusCode::OK,
             json!({"status":"OK","message":"schema updated successfully","rows_affected":0})
