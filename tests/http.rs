@@ -293,7 +293,14 @@ async fn patches_filters_and_namespace_inspection_work() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["approx_row_count"], 2);
-    assert_eq!(body["schema"]["tag"], "string");
+    assert_eq!(
+        body["schema"]["tag"],
+        json!({"type":"string","filterable":true})
+    );
+    assert!(body["last_write_at"]
+        .as_str()
+        .unwrap()
+        .ends_with(".000000000Z"));
     assert!(body["approx_logical_bytes"].as_u64().unwrap() > 0);
     assert!(body["created_at"].as_str().unwrap().ends_with('Z'));
     assert!(body["updated_at"].as_str().unwrap().ends_with('Z'));
@@ -322,7 +329,15 @@ async fn patches_filters_and_namespace_inspection_work() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["new"], "string");
+    // The response is the live service's normalized schema view.
+    assert_eq!(
+        body["new"],
+        json!({"type":"string","filterable":true,"full_text_search":null})
+    );
+    assert_eq!(
+        body["id"],
+        json!({"type":"uint","filterable":null,"full_text_search":null})
+    );
 }
 
 #[tokio::test]
@@ -406,10 +421,10 @@ async fn recall_selects_an_ann_index_or_native_embedding() {
         &client,
         &ns,
         json!({
-            "schema":{"id":"uint","a_storage":{"type":"[2]f32","ann":false},
+            "schema":{"id":"uint","a_storage":{"type":"[][2]f32"},
                       "z_search":{"type":"[2]f32","ann":true}},
             "distance_metric":"cosine_distance",
-            "upsert_rows":[{"id":1,"a_storage":[0,1],"z_search":[1,0]}]
+            "upsert_rows":[{"id":1,"a_storage":[[0,1]],"z_search":[1,0]}]
         }),
     )
     .await;
@@ -989,4 +1004,41 @@ async fn namespaces_can_be_copied_and_then_diverge() {
         .await
         .unwrap();
     assert_eq!(prefix["namespaces"][0]["id"], "branch");
+}
+
+#[tokio::test]
+async fn schema_views_match_the_live_service() {
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/live_schema.json")).unwrap();
+    let base = server().await;
+    let client = Client::new();
+    let origin = base.trim_end_matches("/v2/namespaces");
+    let (status, body) = post(&client, &format!("{base}/shapes"), fixture["write"].clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let schema: Value = client
+        .get(format!("{origin}/v1/namespaces/shapes/schema"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for (field, expected) in fixture["schema"].as_object().unwrap() {
+        assert_eq!(&schema[field], expected, "schema view of {field}");
+    }
+    let metadata: Value = client
+        .get(format!("{origin}/v1/namespaces/shapes/metadata"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for (field, expected) in fixture["metadata_schema"].as_object().unwrap() {
+        assert_eq!(
+            &metadata["schema"][field], expected,
+            "metadata view of {field}"
+        );
+    }
 }

@@ -1,5 +1,6 @@
 use crate::embedding::EmbeddingMode;
 use crate::query::{filter_matches, validate_filter};
+use crate::text;
 use crate::vector;
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -40,15 +41,71 @@ impl Namespace {
             .unwrap_or_else(|| self.compute_logical_bytes())
     }
 
+    /// The schema as the live service reports it. `GET .../schema` lists every attribute
+    /// with `type`, `filterable` and `full_text_search`, using `null` where an option does
+    /// not apply. Metadata leaves out null options and describes the vector indexes.
+    pub(crate) fn schema_view(&self, view: SchemaView) -> Value {
+        let mut attributes = Map::new();
+        for (field, definition) in &self.schema {
+            let kind = field_type(definition);
+            let mut attribute = Map::new();
+            attribute.insert("type".into(), json!(kind));
+            let filterable = (field != "id").then(|| {
+                definition
+                    .get("filterable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_else(|| default_filterable(definition))
+            });
+            let full_text_search = definition
+                .get("full_text_search")
+                .filter(|config| config.is_object() || **config == json!(true))
+                .map(text::normalized_config);
+            let fixed_vector = vector::dimensions(definition).is_some()
+                && vector::multi_dimensions(definition).is_none();
+            match view {
+                SchemaView::Schema => {
+                    attribute.insert("filterable".into(), json!(filterable));
+                    attribute.insert("full_text_search".into(), json!(full_text_search));
+                    if fixed_vector {
+                        attribute.insert("ann".into(), json!(true));
+                    }
+                }
+                SchemaView::Metadata => {
+                    if let Some(filterable) = filterable {
+                        attribute.insert("filterable".into(), json!(filterable));
+                    }
+                    if let Some(config) = full_text_search {
+                        attribute.insert("full_text_search".into(), config);
+                    }
+                    if fixed_vector {
+                        let metric = self.distance_metric.as_deref().unwrap_or("cosine_distance");
+                        attribute.insert("ann".into(), json!({"distance_metric": metric}));
+                    }
+                    if let Some(sparse) = definition.get("sparse_knn") {
+                        attribute.insert("sparse_knn".into(), sparse.clone());
+                    }
+                }
+            }
+            for option in ["regex", "glob", "fuzzy"] {
+                if definition.get(option) == Some(&Value::Bool(true)) {
+                    attribute.insert(option.into(), json!(true));
+                }
+            }
+            attributes.insert(field.clone(), Value::Object(attribute));
+        }
+        Value::Object(attributes)
+    }
+
     pub(crate) fn metadata(&self) -> Value {
         let created_at = self.created_at.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
         let updated_at = self.updated_at.unwrap_or(created_at);
         json!({
-            "schema": self.schema,
+            "schema": self.schema_view(SchemaView::Metadata),
             "approx_row_count": self.rows.len(),
             "approx_logical_bytes": self.logical_bytes(),
             "created_at": created_at,
             "updated_at": updated_at,
+            "last_write_at": updated_at.format("%Y-%m-%dT%H:%M:%S.000000000Z").to_string(),
             "encryption": {"sse": true},
             "index": {"status": "up-to-date"}
         })
@@ -158,6 +215,7 @@ impl Namespace {
         body: &Value,
         embedder: &EmbeddingMode,
     ) -> Result<Value, WriteError> {
+        crate::query::reset_text_caches();
         let object = body.as_object().ok_or("write body must be an object")?;
         validate_write_keys(object)?;
         if let Some(schema) = object.get("schema") {
@@ -247,8 +305,8 @@ impl Namespace {
         if let Some(filter) = object.get("delete_by_filter") {
             validate_filter(filter, &self.schema)?;
             self.rows.retain(|_, row| {
-                if filter_matches(filter, row)
-                    && condition_matches(object, "delete_condition", Some(row))
+                if filter_matches(filter, row, &self.schema)
+                    && condition_matches(object, "delete_condition", Some(row), &self.schema)
                 {
                     deleted_ids.push(row["id"].clone());
                     false
@@ -261,8 +319,12 @@ impl Namespace {
             let deletes = deletes.as_array().ok_or("deletes must be an array")?;
             for id in deletes {
                 let key = id_key(id)?;
-                if condition_matches(object, "delete_condition", self.rows.get(&key))
-                    && self.rows.remove(&key).is_some()
+                if condition_matches(
+                    object,
+                    "delete_condition",
+                    self.rows.get(&key),
+                    &self.schema,
+                ) && self.rows.remove(&key).is_some()
                 {
                     deleted_ids.push(id.clone());
                 }
@@ -285,8 +347,8 @@ impl Namespace {
             validate_filter(filter, &self.schema)?;
             self.validate_patch(values)?;
             for row in self.rows.values_mut() {
-                if filter_matches(filter, row)
-                    && condition_matches(object, "patch_condition", Some(row))
+                if filter_matches(filter, row, &self.schema)
+                    && condition_matches(object, "patch_condition", Some(row), &self.schema)
                 {
                     for (field, value) in values {
                         row.insert(field.clone(), value.clone());
@@ -304,7 +366,8 @@ impl Namespace {
                 validate_id(id, self.schema.get("id"))?;
                 self.validate_patch(patch)?;
                 let key = id_key(id)?;
-                if !condition_matches(object, "patch_condition", self.rows.get(&key)) {
+                if !condition_matches(object, "patch_condition", self.rows.get(&key), &self.schema)
+                {
                     continue;
                 }
                 if let Some(row) = self.rows.get_mut(&key) {
@@ -325,12 +388,26 @@ impl Namespace {
                     .clone();
                 let id = row.get("id").ok_or("upsert row requires id")?.clone();
                 validate_id(&id, self.schema.get("id"))?;
-                if !condition_matches(object, "upsert_condition", self.rows.get(&id_key(&id)?)) {
+                if !condition_matches(
+                    object,
+                    "upsert_condition",
+                    self.rows.get(&id_key(&id)?),
+                    &self.schema,
+                ) {
                     continue;
                 }
                 for (field, value) in &row {
-                    if !self.schema.contains_key(field) {
-                        self.schema.insert(field.clone(), infer_type(value)?);
+                    // `[]unknown` comes from an empty array; the first non-empty array
+                    // settles the element type.
+                    let unknown = self.schema.get(field) == Some(&json!("[]unknown"))
+                        && value.as_array().is_some_and(|values| !values.is_empty());
+                    if !self.schema.contains_key(field) || unknown {
+                        match infer_type(field, value)? {
+                            Some(inferred) => {
+                                self.schema.insert(field.clone(), inferred);
+                            }
+                            None => continue,
+                        }
                     }
                     validate_value(field, value, &self.schema[field])?;
                 }
@@ -403,10 +480,11 @@ fn condition_matches(
     object: &Map<String, Value>,
     condition: &str,
     current: Option<&Map<String, Value>>,
+    schema: &Map<String, Value>,
 ) -> bool {
     object
         .get(condition)
-        .is_none_or(|filter| filter_matches(filter, current.unwrap_or(&Map::new())))
+        .is_none_or(|filter| filter_matches(filter, current.unwrap_or(&Map::new()), schema))
 }
 
 pub(crate) fn validate_write_keys(object: &Map<String, Value>) -> Result<(), String> {
@@ -476,6 +554,30 @@ fn rows_from_columns(columns: &Value) -> Result<Vec<Value>, WriteError> {
     Ok(rows.into_iter().map(Value::Object).collect())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum SchemaView {
+    Schema,
+    Metadata,
+}
+
+/// Indexed text, fixed vectors, sparse vectors and bytes are not filterable unless the
+/// schema says so; every other attribute is.
+fn default_filterable(definition: &Value) -> bool {
+    let enabled = |option: &str| {
+        definition
+            .get(option)
+            .is_some_and(|value| value == &json!(true) || value.is_object())
+    };
+    let fixed_vector =
+        vector::dimensions(definition).is_some() && vector::multi_dimensions(definition).is_none();
+    !(enabled("full_text_search")
+        || enabled("regex")
+        || enabled("glob")
+        || enabled("fuzzy")
+        || fixed_vector
+        || matches!(field_type(definition), "{}f16" | "bytes"))
+}
+
 pub(crate) fn field_type(definition: &Value) -> &str {
     definition
         .as_str()
@@ -515,22 +617,19 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
                     return Err(format!("invalid ann configuration for attribute {field}"));
                 }
                 "full_text_search" if value.is_object() => {
-                    let config = value.as_object().unwrap();
-                    if !matches!(field_type(definition), "string" | "[]string")
-                        || config.iter().any(|(key, value)| {
-                            let number = value.as_f64();
-                            match key.as_str() {
-                                "k1" | "k3" => number.is_none_or(|n| !n.is_finite() || n <= 0.0),
-                                "b" => number
-                                    .is_none_or(|n| !n.is_finite() || !(0.0..=1.0).contains(&n)),
-                                _ => true,
-                            }
-                        })
-                    {
+                    if !matches!(field_type(definition), "string" | "[]string") {
                         return Err(format!(
-                            "unsupported full_text_search configuration for attribute {field}"
+                            "full_text_search requires a string or []string attribute: {field}"
                         ));
                     }
+                    text::validate_config(field_type(definition), value).map_err(|error| {
+                        match error {
+                            text::ConfigError::Shape(message) => {
+                                crate::shape_error(format!("schema.{field}: {message}"))
+                            }
+                            text::ConfigError::Invalid(message) => message,
+                        }
+                    })?;
                 }
                 "ann" if value.is_object() => {
                     if vector::multi_dimensions(definition).is_none()
@@ -590,6 +689,15 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
             return Err(format!("invalid embed configuration for attribute {field}"));
         }
     }
+    if vector::dimensions(definition).is_some()
+        && vector::multi_dimensions(definition).is_none()
+        && !definition
+            .get("ann")
+            .is_some_and(|ann| ann == &json!(true) || ann.is_object())
+        && definition.get("embed").is_none()
+    {
+        return Err(format!("vector attribute '{field}' must have ann:true"));
+    }
     if matches!(field_type(definition), "bytes" | "{}f16")
         && definition.get("filterable") == Some(&Value::Bool(true))
     {
@@ -600,9 +708,8 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
     }
     match field_type(definition) {
         "uuid" | "uint" | "int" | "float" | "string" | "bool" | "datetime" | "bytes" | "{}f16"
-        | "[]uuid" | "[]uint" | "[]int" | "[]float" | "[]string" | "[]bool" | "[]datetime" => {
-            Ok(())
-        }
+        | "[]unknown" | "[]uuid" | "[]uint" | "[]int" | "[]float" | "[]string" | "[]bool"
+        | "[]datetime" => Ok(()),
         _ if vector::multi_dimensions(definition).is_some_and(|n| n > 0 && n <= 3072) => Ok(()),
         value
             if value.starts_with('[')
@@ -638,16 +745,60 @@ fn id_key(value: &Value) -> Result<String, String> {
     }
 }
 
-fn infer_type(value: &Value) -> Result<Value, String> {
-    let name = match value {
-        Value::String(_) => "string",
-        Value::Bool(_) => "bool",
-        Value::Number(n) if n.as_u64().is_some() => "uint",
-        Value::Number(_) => "float",
-        Value::Null => return Err("cannot infer schema from null attribute".into()),
-        _ => return Err("cannot infer schema from array or object attribute".into()),
+/// Infers an attribute type from its first value with the live service's rules: numbers are
+/// `int`, arrays take their element type, arrays of arrays are multi-vectors and objects are
+/// sparse vectors. `None` means the value is null and adds no schema entry.
+fn infer_type(field: &str, value: &Value) -> Result<Option<Value>, String> {
+    let incompatible = |inferred: &str, detail: String| {
+        format!(
+            "inferred schema type for attribute '{field}' as {inferred}, but got an incompatible value ({detail}). consider specifying the explicit type you want for this attribute in the schema"
+        )
     };
-    Ok(json!(name))
+    let name = match value {
+        Value::Null => return Ok(None),
+        Value::Number(_) if field == "id" => "uint".to_owned(),
+        Value::String(_) => "string".to_owned(),
+        Value::Bool(_) => "bool".to_owned(),
+        Value::Number(number) if number.is_i64() => "int".to_owned(),
+        Value::Number(_) => {
+            return Err(incompatible(
+                "int",
+                "of type number, number cannot be represented as signed 64-bit integer".into(),
+            ))
+        }
+        Value::Object(_) => "{}f16".to_owned(),
+        Value::Array(values) => match values.first() {
+            None => "[]unknown".to_owned(),
+            Some(Value::Bool(_)) => "[]bool".to_owned(),
+            Some(Value::String(_)) => "[]string".to_owned(),
+            Some(Value::Number(_)) => {
+                if let Some(index) = values.iter().position(|value| !value.is_i64()) {
+                    return Err(incompatible(
+                        "int",
+                        format!("of type number, number at index {index} cannot be represented as signed 64-bit integer"),
+                    ));
+                }
+                "[]int".to_owned()
+            }
+            Some(Value::Array(first)) => {
+                let dimensions = first.len();
+                if let Some((index, vector)) = values.iter().enumerate().find(|(_, vector)| {
+                    vector
+                        .as_array()
+                        .is_none_or(|vector| vector.len() != dimensions)
+                }) {
+                    let actual = vector.as_array().map_or(0, Vec::len);
+                    return Err(incompatible(
+                        &format!("vector with {dimensions} dimensions"),
+                        format!("of type vector with {actual} dimensions, vector at index {index} has {actual} dimensions, expected {dimensions}"),
+                    ));
+                }
+                format!("[][{dimensions}]f32")
+            }
+            Some(_) => return Err("cannot infer schema from this array".into()),
+        },
+    };
+    Ok(Some(json!(name)))
 }
 
 fn validate_value(field: &str, value: &Value, definition: &Value) -> Result<(), String> {
@@ -655,6 +806,7 @@ fn validate_value(field: &str, value: &Value, definition: &Value) -> Result<(), 
         return Ok(());
     }
     let valid = match field_type(definition) {
+        "[]unknown" => value.as_array().is_some_and(Vec::is_empty),
         "uuid" => value.as_str().is_some_and(uuid_like),
         "uint" => value.as_u64().is_some(),
         "int" => value.as_i64().is_some(),

@@ -1,4 +1,6 @@
+use crate::highlight;
 use crate::store::{field_type, known_field, Namespace};
+use crate::text::TextAnalysis;
 use crate::vector;
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use globset::GlobBuilder;
@@ -8,6 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 
 impl Namespace {
     pub fn query(&self, body: &Value) -> Result<Value, String> {
+        reset_text_caches();
         let mut normalized = body.clone();
         vector::normalize_query(&mut normalized, &self.schema)?;
         let mut result = self.query_inner(&normalized)?;
@@ -142,7 +145,11 @@ impl Namespace {
                         "computed attribute {name} conflicts with an existing field"
                     ));
                 }
-                validate_computed(expression, &self.schema)?;
+                if highlight::is_highlight(expression) {
+                    highlight::validate(name, expression, object.get("rank_by"), &self.schema)?;
+                } else {
+                    validate_computed(expression, &self.schema)?;
+                }
             }
         }
         validate_query_options(object)?;
@@ -258,7 +265,7 @@ impl Namespace {
             .rows
             .values()
             .filter_map(|row| {
-                if filter.is_some_and(|f| !filter_matches(f, row)) {
+                if filter.is_some_and(|f| !filter_matches(f, row, &self.schema)) {
                     return None;
                 }
                 let score = rank.map_or(0.0, |rank| {
@@ -360,8 +367,11 @@ impl Namespace {
                 if let Some(computed) = object.get("compute_attributes").and_then(Value::as_object)
                 {
                     for (name, expression) in computed {
-                        let value =
-                            computed_value(expression, row, &self.rows, &self.schema, metric);
+                        let value = if highlight::is_highlight(expression) {
+                            highlight::compute(expression, rank, row, &self.schema, metric)
+                        } else {
+                            computed_value(expression, row, &self.rows, &self.schema, metric)
+                        };
                         result.insert(name.clone(), value);
                     }
                 }
@@ -448,7 +458,7 @@ impl Namespace {
             .filter(|row| {
                 object
                     .get("filters")
-                    .is_none_or(|filter| filter_matches(filter, row))
+                    .is_none_or(|filter| filter_matches(filter, row, &self.schema))
             })
             .collect::<Vec<_>>();
         let aggregates = object["aggregate_by"].as_object().unwrap();
@@ -760,11 +770,19 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
                 "attribute {field} is not configured for full-text search"
             ));
         }
-        if !parts[2].is_string()
-            && !parts[2]
-                .as_array()
-                .is_some_and(|tokens| tokens.iter().all(Value::is_string))
-        {
+        let pre_tokenized = TextAnalysis::for_field(&schema[field])
+            .is_some_and(|analysis| analysis.is_pre_tokenized());
+        let string_array = parts[2]
+            .as_array()
+            .is_some_and(|tokens| tokens.iter().all(Value::is_string));
+        if pre_tokenized && !string_array {
+            return Err(format!(
+                "filter error in key `{field}`: type mismatch, {op} expects []string, but got {} (cannot cast {} into type []string)",
+                json_type(&parts[2]),
+                json_type(&parts[2])
+            ));
+        }
+        if !parts[2].is_string() && !string_array {
             return Err(format!("{op} requires a string or string array"));
         }
         if parts.len() == 4 {
@@ -883,7 +901,11 @@ fn has_full_text_search(definition: &Value) -> bool {
         .is_some_and(|config| config == &Value::Bool(true) || config.is_object())
 }
 
-pub(crate) fn filter_matches(filter: &Value, row: &Map<String, Value>) -> bool {
+pub(crate) fn filter_matches(
+    filter: &Value,
+    row: &Map<String, Value>,
+    schema: &Map<String, Value>,
+) -> bool {
     let parts = filter.as_array().unwrap();
     if parts.len() == 2 {
         return match parts[0].as_str().unwrap() {
@@ -891,13 +913,13 @@ pub(crate) fn filter_matches(filter: &Value, row: &Map<String, Value>) -> bool {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|f| filter_matches(f, row)),
+                .all(|f| filter_matches(f, row, schema)),
             "Or" => parts[1]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|f| filter_matches(f, row)),
-            "Not" => !filter_matches(&parts[1], row),
+                .any(|f| filter_matches(f, row, schema)),
+            "Not" => !filter_matches(&parts[1], row, schema),
             _ => false,
         };
     }
@@ -930,7 +952,7 @@ pub(crate) fn filter_matches(filter: &Value, row: &Map<String, Value>) -> bool {
             })
         }),
         "ContainsAllTokens" | "ContainsAnyToken" | "ContainsTokenSequence" => {
-            token_filter_matches(parts, left)
+            token_filter_matches(parts, left, schema.get(field).unwrap_or(&Value::Null))
         }
         "Glob" | "NotGlob" | "IGlob" | "NotIGlob" => left.as_str().is_some_and(|text| {
             let matches = GlobBuilder::new(right.as_str().unwrap())
@@ -1017,17 +1039,13 @@ fn fuzzy_substring_within(query: &str, text: &str, max_distance: usize) -> bool 
     false
 }
 
-fn token_filter_matches(parts: &[Value], left: &Value) -> bool {
-    let document = value_tokens(left);
-    let terms = match &parts[2] {
-        Value::String(query) => tokens(query),
-        Value::Array(terms) => terms
-            .iter()
-            .flat_map(|term| tokens(term.as_str().unwrap()))
-            .collect(),
-        _ => return false,
+fn token_filter_matches(parts: &[Value], left: &Value, definition: &Value) -> bool {
+    let Some(analysis) = TextAnalysis::for_field(definition) else {
+        return false;
     };
-    if document.is_empty() || terms.is_empty() {
+    let document = analysis.analyze(left);
+    let query = analysis.analyze(&parts[2]);
+    if document.is_empty() || query.is_empty() {
         return false;
     }
     let last_as_prefix = parts
@@ -1037,23 +1055,40 @@ fn token_filter_matches(parts: &[Value], left: &Value) -> bool {
         .unwrap_or(false);
     let matches_term = |index: usize, token: &str| {
         document.iter().any(|candidate| {
-            if last_as_prefix && index + 1 == terms.len() {
-                candidate.starts_with(token)
+            if last_as_prefix && index + 1 == query.len() {
+                candidate.text.starts_with(token)
             } else {
-                candidate == token
+                candidate.text == token
             }
         })
     };
     match parts[1].as_str().unwrap() {
-        "ContainsAllTokens" => terms
+        "ContainsAllTokens" => query
             .iter()
             .enumerate()
-            .all(|(index, token)| matches_term(index, token)),
-        "ContainsAnyToken" => terms
+            .all(|(index, token)| matches_term(index, &token.text)),
+        "ContainsAnyToken" => query
             .iter()
             .enumerate()
-            .any(|(index, token)| matches_term(index, token)),
-        "ContainsTokenSequence" => document.windows(terms.len()).any(|window| window == terms),
+            .any(|(index, token)| matches_term(index, &token.text)),
+        // Positions keep the gaps a stopword leaves, on both sides, so "visited the café"
+        // matches "visited a café" once stopwords are removed.
+        "ContainsTokenSequence" => {
+            let first = query[0].position;
+            let at: HashMap<(usize, &str), ()> = document
+                .iter()
+                .map(|token| ((token.position, token.text.as_str()), ()))
+                .collect();
+            document.iter().any(|start| {
+                start.text == query[0].text
+                    && query.iter().all(|token| {
+                        at.contains_key(&(
+                            start.position + token.position - first,
+                            token.text.as_str(),
+                        ))
+                    })
+            })
+        }
         _ => false,
     }
 }
@@ -1099,7 +1134,7 @@ fn compare_values(left: &Value, right: &Value) -> Option<i8> {
     })
 }
 
-fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String> {
+pub(crate) fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String> {
     let parts = rank.as_array().ok_or("rank_by must be an array")?;
     if !parts.is_empty() && parts.iter().all(Value::is_array) {
         for part in parts {
@@ -1207,12 +1242,9 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
         }
         return Ok(());
     }
-    if parts.len() == 3
+    if (parts.len() == 3 || parts.len() == 4)
         && parts[0].is_string()
-        && matches!(
-            parts[1].as_str(),
-            Some("Eq" | "NotEq" | "In" | "NotIn" | "Gt" | "Gte" | "Lt" | "Lte")
-        )
+        && parts[1].as_str().is_some_and(is_filter_operator)
     {
         return validate_filter(rank, schema);
     }
@@ -1322,12 +1354,28 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
             }
             Ok(())
         }
-        "BM25" if (parts.len() == 3 || parts.len() == 4) && parts[2].is_string() => {
+        "BM25" if parts.len() == 3 || parts.len() == 4 => {
             let definition = schema.get(field).unwrap_or(&Value::Null);
             if !matches!(field_type(definition), "string" | "[]string")
                 || !has_full_text_search(definition)
             {
                 return Err(format!("attribute {field} has no full-text index"));
+            }
+            let pre_tokenized = TextAnalysis::for_field(definition)
+                .is_some_and(|analysis| analysis.is_pre_tokenized());
+            let operand_ok = if pre_tokenized {
+                parts[2]
+                    .as_array()
+                    .is_some_and(|tokens| tokens.iter().all(Value::is_string))
+            } else {
+                parts[2].is_string()
+            };
+            if !operand_ok {
+                return Err(format!(
+                    "invalid input of type {} for rank_by field \"{field}\", expecting {}",
+                    json_type(&parts[2]),
+                    if pre_tokenized { "[]string" } else { "string" }
+                ));
             }
             if parts.len() == 4 {
                 let options = parts[3]
@@ -1450,6 +1498,38 @@ fn validate_nonnegative_rank(
     }
 }
 
+/// Operators that make a clause a filter. Inside `rank_by` a filter scores 1 for a matching
+/// row and 0 otherwise.
+fn is_filter_operator(operator: &str) -> bool {
+    matches!(
+        operator,
+        "Eq" | "NotEq"
+            | "In"
+            | "NotIn"
+            | "Gt"
+            | "Gte"
+            | "Lt"
+            | "Lte"
+            | "Contains"
+            | "NotContains"
+            | "ContainsAny"
+            | "NotContainsAny"
+            | "AnyGt"
+            | "AnyGte"
+            | "AnyLt"
+            | "AnyLte"
+            | "ContainsAllTokens"
+            | "ContainsAnyToken"
+            | "ContainsTokenSequence"
+            | "Glob"
+            | "NotGlob"
+            | "IGlob"
+            | "NotIGlob"
+            | "Regex"
+            | "Fuzzy"
+    )
+}
+
 fn is_ann(rank: &Value) -> bool {
     rank.as_array()
         .is_some_and(|a| a.len() == 3 && (a[1] == "ANN" || a[1] == "kNN"))
@@ -1519,7 +1599,7 @@ fn is_ascending(rank: &Value) -> bool {
         .is_some_and(|a| a.len() == 2 && a[1] == "asc")
 }
 
-fn score_rank(
+pub(crate) fn score_rank(
     rank: &Value,
     row: &Map<String, Value>,
     corpus: &std::collections::BTreeMap<String, Map<String, Value>>,
@@ -1633,7 +1713,7 @@ fn score_rank(
         }
         "BM25" => bm25(
             field,
-            parts[2].as_str().unwrap(),
+            &parts[2],
             parts
                 .get(3)
                 .and_then(|options| options.get("last_as_prefix"))
@@ -1643,9 +1723,7 @@ fn score_rank(
             corpus,
             schema,
         ),
-        "Eq" | "NotEq" | "In" | "NotIn" | "Gt" | "Gte" | "Lt" | "Lte" => {
-            f64::from(filter_matches(rank, row))
-        }
+        operator if is_filter_operator(operator) => f64::from(filter_matches(rank, row, schema)),
         _ => 0.0,
     }
 }
@@ -1726,28 +1804,63 @@ fn dense_distance(query: &[Value], vector: &[Value], metric: &str) -> f64 {
     }
 }
 
-fn tokens(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(str::to_lowercase)
-        .collect()
+/// Corpus statistics of one full-text attribute, shared by every row a query scores.
+struct FieldStats {
+    average_length: f64,
+    document_frequency: HashMap<String, usize>,
 }
 
-fn value_tokens(value: &Value) -> Vec<String> {
-    match value {
-        Value::String(text) => tokens(text),
-        Value::Array(values) => values
-            .iter()
-            .filter_map(Value::as_str)
-            .flat_map(tokens)
-            .collect(),
-        _ => Vec::new(),
+thread_local! {
+    static FIELD_STATS: std::cell::RefCell<HashMap<String, std::rc::Rc<FieldStats>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Drops the cached statistics of one attribute, for corpora that change within a request.
+pub(crate) fn forget_field_stats(field: &str) {
+    FIELD_STATS.with(|stats| stats.borrow_mut().remove(field));
+}
+
+/// Drops per-request text caches. Every request that reads rows calls this first.
+pub(crate) fn reset_text_caches() {
+    FIELD_STATS.with(|stats| stats.borrow_mut().clear());
+    crate::text::reset_cache();
+}
+
+fn field_stats(
+    field: &str,
+    analysis: &TextAnalysis,
+    corpus: &BTreeMap<String, Map<String, Value>>,
+) -> std::rc::Rc<FieldStats> {
+    if let Some(stats) = FIELD_STATS.with(|stats| stats.borrow().get(field).cloned()) {
+        return stats;
     }
+    let mut lengths = Vec::new();
+    let mut document_frequency = HashMap::new();
+    for row in corpus.values() {
+        let Some(value) = row.get(field) else {
+            continue;
+        };
+        let tokens = analysis.analyze(value);
+        lengths.push(tokens.len());
+        let mut seen = std::collections::HashSet::new();
+        for token in tokens.iter() {
+            if seen.insert(token.text.as_str()) {
+                *document_frequency.entry(token.text.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let stats = std::rc::Rc::new(FieldStats {
+        average_length: (lengths.iter().sum::<usize>() as f64 / lengths.len().max(1) as f64)
+            .max(1.0),
+        document_frequency,
+    });
+    FIELD_STATS.with(|cache| cache.borrow_mut().insert(field.to_owned(), stats.clone()));
+    stats
 }
 
 fn bm25(
     field: &str,
-    query: &str,
+    query: &Value,
     last_as_prefix: bool,
     row: &Map<String, Value>,
     corpus: &std::collections::BTreeMap<String, Map<String, Value>>,
@@ -1766,8 +1879,14 @@ fn bm25(
         .and_then(|value| value.get("k3"))
         .and_then(Value::as_f64)
         .unwrap_or(8.0);
-    let doc_tokens = row.get(field).map(value_tokens).unwrap_or_default();
-    let mut query_tokens = tokens(query);
+    let Some(analysis) = TextAnalysis::for_field(&schema[field]) else {
+        return 0.0;
+    };
+    let doc_tokens = row
+        .get(field)
+        .map(|value| analysis.analyze(value))
+        .unwrap_or_default();
+    let mut query_tokens = analysis.query_tokens(query);
     if query_tokens.is_empty() || doc_tokens.is_empty() {
         return 0.0;
     }
@@ -1776,11 +1895,8 @@ fn bm25(
     } else {
         None
     };
-    let lengths = corpus
-        .values()
-        .filter_map(|r| r.get(field).map(|value| value_tokens(value).len()))
-        .collect::<Vec<_>>();
-    let avg_len = (lengths.iter().sum::<usize>() as f64 / lengths.len().max(1) as f64).max(1.0);
+    let stats = field_stats(field, &analysis, corpus);
+    let avg_len = stats.average_length;
     let mut terms = HashMap::new();
     for token in query_tokens {
         *terms.entry(token).or_insert(0_usize) += 1;
@@ -1788,17 +1904,11 @@ fn bm25(
     let score: f64 = terms
         .into_iter()
         .map(|(term, query_freq)| {
-            let freq = doc_tokens.iter().filter(|token| **token == term).count() as f64;
+            let freq = doc_tokens.iter().filter(|token| token.text == term).count() as f64;
             if freq == 0.0 {
                 return 0.0;
             }
-            let df = corpus
-                .values()
-                .filter(|r| {
-                    r.get(field)
-                        .is_some_and(|value| value_tokens(value).contains(&term))
-                })
-                .count() as f64;
+            let df = stats.document_frequency.get(&term).copied().unwrap_or(0) as f64;
             let n = corpus.len() as f64;
             let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
             let norm = k1 * (1.0 - b + b * doc_tokens.len() as f64 / avg_len);
@@ -1807,7 +1917,21 @@ fn bm25(
         })
         .sum();
     score
-        + f64::from(
-            prefix.is_some_and(|prefix| doc_tokens.iter().any(|token| token.starts_with(&prefix))),
-        )
+        + f64::from(prefix.is_some_and(|prefix| {
+            doc_tokens
+                .iter()
+                .any(|token| token.text.starts_with(&prefix))
+        }))
+}
+
+/// The live service's name for a JSON value's type in error messages.
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }

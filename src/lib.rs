@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
 mod embedding;
+mod highlight;
 mod persistence;
 mod query;
 mod store;
+mod text;
 mod vector;
 
 use axum::{
@@ -42,8 +44,41 @@ impl axum::response::IntoResponse for ApiError {
     }
 }
 
+/// Marks a validation message as a JSON shape error. The live service reports those as HTTP
+/// 422 from its request deserializer, and semantic errors as HTTP 400.
+const SHAPE_ERROR: &str = "\u{1}shape:";
+
+/// A validation message that becomes an HTTP 422 shape error.
+pub(crate) fn shape_error(message: impl std::fmt::Display) -> String {
+    format!("{SHAPE_ERROR}{message}")
+}
+
 fn bad(message: impl Into<String>) -> ApiError {
-    ApiError(StatusCode::BAD_REQUEST, message.into())
+    let message = message.into();
+    match message.strip_prefix(SHAPE_ERROR) {
+        Some(detail) => ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("Failed to deserialize the JSON body into the target type: {detail}"),
+        ),
+        None => ApiError(StatusCode::BAD_REQUEST, message),
+    }
+}
+
+/// A JSON request body. Parse failures use the API error shape, as they do live, instead of
+/// the extractor's plain-text rejection.
+struct JsonBody(Value);
+
+impl<S: Send + Sync> axum::extract::FromRequest<S> for JsonBody {
+    type Rejection = ApiError;
+
+    async fn from_request(request: axum::extract::Request, state: &S) -> Result<Self, ApiError> {
+        let bytes = axum::body::Bytes::from_request(request, state)
+            .await
+            .map_err(|rejection| ApiError(rejection.status(), rejection.body_text()))?;
+        serde_json::from_slice(&bytes)
+            .map(JsonBody)
+            .map_err(|error| bad(format!("Failed to parse the request body as JSON: {error}")))
+    }
 }
 
 fn authorized(headers: &HeaderMap) -> Result<(), ApiError> {
@@ -166,7 +201,7 @@ async fn get_schema(
     let namespace = guard
         .get(&name)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "namespace does not exist".into()))?;
-    Ok(Json(json!(namespace.schema)))
+    Ok(Json(namespace.schema_view(store::SchemaView::Schema)))
 }
 
 async fn get_metadata(
@@ -208,7 +243,7 @@ async fn recall(
     Path(name): Path<String>,
     State(state): State<Shared>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    JsonBody(body): JsonBody,
 ) -> Result<Json<Value>, ApiError> {
     authorized(&headers)?;
     namespace_name(&name)?;
@@ -223,7 +258,7 @@ async fn explain_query(
     Path(name): Path<String>,
     State(state): State<Shared>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    JsonBody(body): JsonBody,
 ) -> Result<Json<Value>, ApiError> {
     authorized(&headers)?;
     namespace_name(&name)?;
@@ -261,7 +296,7 @@ async fn update_schema(
     Path(name): Path<String>,
     State(state): State<Shared>,
     headers: HeaderMap,
-    Json(schema): Json<Value>,
+    JsonBody(schema): JsonBody,
 ) -> Result<Json<Value>, ApiError> {
     authorized(&headers)?;
     namespace_name(&name)?;
@@ -278,7 +313,7 @@ async fn update_schema(
             store::WriteError::EmbeddingUnavailable => bad("embedding provider unavailable"),
         })?;
     namespace.touch();
-    let response = json!(namespace.schema);
+    let response = namespace.schema_view(store::SchemaView::Schema);
     persist_namespace(&state, &mut guard, name, namespace)?;
     Ok(Json(response))
 }
@@ -309,7 +344,7 @@ async fn write(
     Path(name): Path<String>,
     State(state): State<Shared>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    JsonBody(body): JsonBody,
 ) -> Result<Json<Value>, ApiError> {
     authorized(&headers)?;
     namespace_name(&name)?;
@@ -390,7 +425,7 @@ async fn query_namespace(
     Path(name): Path<String>,
     State(state): State<Shared>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    JsonBody(body): JsonBody,
 ) -> Result<Json<Value>, ApiError> {
     authorized(&headers)?;
     namespace_name(&name)?;

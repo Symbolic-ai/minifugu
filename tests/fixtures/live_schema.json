@@ -1,0 +1,391 @@
+{
+ "_source": "Captured from the live service on 2026-09-29 with synthetic data.",
+ "metadata_schema": {
+  "b": {
+   "filterable": true,
+   "type": "bool"
+  },
+  "by": {
+   "filterable": false,
+   "type": "bytes"
+  },
+  "d": {
+   "filterable": true,
+   "type": "datetime"
+  },
+  "f": {
+   "filterable": true,
+   "type": "float"
+  },
+  "fa2": {
+   "filterable": true,
+   "type": "[]float"
+  },
+  "fl": {
+   "filterable": true,
+   "type": "string"
+  },
+  "fs": {
+   "filterable": true,
+   "full_text_search": {
+    "ascii_folding": false,
+    "b": 0.75,
+    "case_sensitive": false,
+    "k1": 1.2,
+    "k3": 8.0,
+    "language": "english",
+    "max_token_length": 39,
+    "remove_stopwords": false,
+    "stemming": false,
+    "tokenizer": "word_v4"
+   },
+   "type": "string"
+  },
+  "fts2": {
+   "filterable": false,
+   "full_text_search": {
+    "ascii_folding": false,
+    "b": 0.75,
+    "case_sensitive": false,
+    "k1": 2.0,
+    "k3": 8.0,
+    "language": "french",
+    "max_token_length": 39,
+    "remove_stopwords": false,
+    "stemming": false,
+    "tokenizer": "word_v4"
+   },
+   "type": "[]string"
+  },
+  "fz": {
+   "filterable": false,
+   "fuzzy": true,
+   "type": "string"
+  },
+  "gl": {
+   "filterable": false,
+   "glob": true,
+   "type": "string"
+  },
+  "i": {
+   "filterable": true,
+   "type": "int"
+  },
+  "ia": {
+   "filterable": true,
+   "type": "[]int"
+  },
+  "id": {
+   "type": "uuid"
+  },
+  "mv": {
+   "filterable": true,
+   "type": "[][2]f32"
+  },
+  "nf": {
+   "filterable": false,
+   "type": "string"
+  },
+  "rx": {
+   "filterable": false,
+   "regex": true,
+   "type": "string"
+  },
+  "s": {
+   "filterable": true,
+   "type": "string"
+  },
+  "sa": {
+   "filterable": true,
+   "type": "[]string"
+  },
+  "sp": {
+   "filterable": false,
+   "sparse_knn": {
+    "distance_metric": "dot_product"
+   },
+   "type": "{}f16"
+  },
+  "u": {
+   "filterable": true,
+   "type": "int"
+  },
+  "v": {
+   "ann": {
+    "distance_metric": "cosine_distance"
+   },
+   "filterable": false,
+   "type": "[2]f32"
+  },
+  "vf": {
+   "ann": {
+    "distance_metric": "cosine_distance"
+   },
+   "filterable": false,
+   "type": "[2]f16"
+  },
+  "vi": {
+   "ann": {
+    "distance_metric": "cosine_distance"
+   },
+   "filterable": false,
+   "type": "[2]i8"
+  }
+ },
+ "schema": {
+  "b": {
+   "filterable": true,
+   "full_text_search": null,
+   "type": "bool"
+  },
+  "by": {
+   "filterable": false,
+   "full_text_search": null,
+   "type": "bytes"
+  },
+  "d": {
+   "filterable": true,
+   "full_text_search": null,
+   "type": "datetime"
+  },
+  "f": {
+   "filterable": true,
+   "full_text_search": null,
+   "type": "float"
+  },
+  "fa2": {
+   "filterable": true,
+   "full_text_search": null,
+   "type": "[]float"
+  },
+  "fl": {
+   "filterable": true,
+   "full_text_search": null,
+   "type": "string"
+  },
+  "fs": {
+   "filterable": true,
+   "full_text_search": {
+    "ascii_folding": false,
+    "b": 0.75,
+    "case_sensitive": false,
+    "k1": 1.2,
+    "k3": 8.0,
+    "language": "english",
+    "max_token_length": 39,
+    "remove_stopwords": false,
+    "stemming": false,
+    "tokenizer": "word_v4"
+   },
+   "type": "string"
+  },
+  "fts2": {
+   "filterable": false,
+   "full_text_search": {
+    "ascii_folding": false,
+    "b": 0.75,
+    "case_sensitive": false,
+    "k1": 2.0,
+    "k3": 8.0,
+    "language": "french",
+    "max_token_length": 39,
+    "remove_stopwords": false,
+    "stemming": false,
+    "tokenizer": "word_v4"
+   },
+   "type": "[]string"
+  },
+  "fz": {
+   "filterable": false,
+   "full_text_search": null,
+   "fuzzy": true,
+   "type": "string"
+  },
+  "gl": {
+   "filterable": false,
+   "full_text_search": null,
+   "glob": true,
+   "type": "string"
+  },
+  "i": {
+   "filterable": true,
+   "full_text_search": null,
+   "type": "int"
+  },
+  "ia": {
+   "filterable": true,
+   "full_text_search": null,
+   "type": "[]int"
+  },
+  "id": {
+   "filterable": null,
+   "full_text_search": null,
+   "type": "uuid"
+  },
+  "mv": {
+   "filterable": true,
+   "full_text_search": null,
+   "type": "[][2]f32"
+  },
+  "nf": {
+   "filterable": false,
+   "full_text_search": null,
+   "type": "string"
+  },
+  "rx": {
+   "filterable": false,
+   "full_text_search": null,
+   "regex": true,
+   "type": "string"
+  },
+  "s": {
+   "filterable": true,
+   "full_text_search": null,
+   "type": "string"
+  },
+  "sa": {
+   "filterable": true,
+   "full_text_search": null,
+   "type": "[]string"
+  },
+  "sp": {
+   "filterable": false,
+   "full_text_search": null,
+   "type": "{}f16"
+  },
+  "u": {
+   "filterable": true,
+   "full_text_search": null,
+   "type": "int"
+  },
+  "v": {
+   "ann": true,
+   "filterable": false,
+   "full_text_search": null,
+   "type": "[2]f32"
+  },
+  "vf": {
+   "ann": true,
+   "filterable": false,
+   "full_text_search": null,
+   "type": "[2]f16"
+  },
+  "vi": {
+   "ann": true,
+   "filterable": false,
+   "full_text_search": null,
+   "type": "[2]i8"
+  }
+ },
+ "write": {
+  "distance_metric": "cosine_distance",
+  "schema": {
+   "by": "bytes",
+   "d": "datetime",
+   "f": "float",
+   "fa2": "[]float",
+   "fl": {
+    "filterable": true,
+    "type": "string"
+   },
+   "fs": {
+    "filterable": true,
+    "full_text_search": true,
+    "type": "string"
+   },
+   "fts2": {
+    "full_text_search": {
+     "k1": 2,
+     "language": "french"
+    },
+    "type": "[]string"
+   },
+   "fz": {
+    "fuzzy": true,
+    "type": "string"
+   },
+   "gl": {
+    "glob": true,
+    "type": "string"
+   },
+   "id": "uuid",
+   "nf": {
+    "filterable": false,
+    "type": "string"
+   },
+   "rx": {
+    "regex": true,
+    "type": "string"
+   },
+   "sp": {
+    "sparse_knn": {
+     "distance_metric": "dot_product"
+    },
+    "type": "{}f16"
+   },
+   "v": {
+    "ann": true,
+    "type": "[2]f32"
+   },
+   "vf": {
+    "ann": true,
+    "type": "[2]f16"
+   },
+   "vi": {
+    "ann": true,
+    "type": "[2]i8"
+   }
+  },
+  "upsert_rows": [
+   {
+    "b": true,
+    "by": "AP8=",
+    "d": "2026-01-01T00:00:00Z",
+    "f": 1.5,
+    "fa2": [
+     1.5
+    ],
+    "fl": "x",
+    "fs": "x",
+    "fts2": [
+     "a b"
+    ],
+    "fz": "x",
+    "gl": "x",
+    "i": -1,
+    "ia": [
+     1
+    ],
+    "id": "6f1c1a2e-9b7a-4c55-8d1e-1a2b3c4d5e6f",
+    "mv": [
+     [
+      0.1,
+      0.2
+     ]
+    ],
+    "nf": "x",
+    "rx": "x",
+    "s": "x",
+    "sa": [
+     "a"
+    ],
+    "sp": {
+     "a": 1.0
+    },
+    "u": 3,
+    "v": [
+     0.1,
+     0.2
+    ],
+    "vf": [
+     0.1,
+     0.2
+    ],
+    "vi": [
+     1,
+     2
+    ]
+   }
+  ]
+ }
+}
