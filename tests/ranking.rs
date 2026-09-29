@@ -107,6 +107,26 @@ async fn bm25_ranks_term_frequency_and_excludes_non_matches() {
     assert_eq!(rows[0]["id"], 1);
     assert_eq!(rows[1]["id"], 2);
     assert!(rows[0]["$dist"].as_f64().unwrap() > rows[1]["$dist"].as_f64().unwrap());
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["title","BM25","oran",{"last_as_prefix":true}],"limit":3
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(result["rows"][0]["$dist"], 1.0);
+    let (status, _) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["title","BM25","oran",{"last_as_prefix":"yes"}],"limit":3
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

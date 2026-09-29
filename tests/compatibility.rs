@@ -673,6 +673,15 @@ async fn gap_contract(base: &str, token: &str) {
         }),
     )
     .await;
+    let prefix = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["title","BM25","ora",{"last_as_prefix":true}],"limit":2
+        }),
+    )
+    .await;
     let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
     assert_eq!(write.0, StatusCode::OK, "gap write: {:?}", write.1);
     assert_eq!(sparse.0, StatusCode::OK, "sparse response: {:?}", sparse.1);
@@ -687,6 +696,8 @@ async fn gap_contract(base: &str, token: &str) {
         numeric.1
     );
     assert_eq!(numeric.1["rows"][0]["id"], 1);
+    assert_eq!(prefix.0, StatusCode::OK, "prefix response: {:?}", prefix.1);
+    assert_eq!(prefix.1["rows"][0]["id"], 1);
     assert_eq!(cleanup.status(), StatusCode::OK);
 }
 

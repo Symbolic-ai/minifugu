@@ -544,11 +544,11 @@ fn validate_computed(expression: &Value, schema: &Map<String, Value>) -> Result<
     let parts = expression
         .as_array()
         .ok_or("computed attribute expression must be an array")?;
+    if parts.get(1) == Some(&json!("BM25")) {
+        return validate_rank(expression, schema);
+    }
     if parts.len() != 3 {
         return Err("computed attribute requires a three-part expression".into());
-    }
-    if parts[1] == "BM25" {
-        return validate_rank(expression, schema);
     }
     if parts[1] == "VectorDist" {
         let mut rank = parts.clone();
@@ -1193,7 +1193,7 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
     {
         return validate_filter(rank, schema);
     }
-    if parts.len() != 3 && parts.len() != 2 {
+    if parts.len() != 4 && parts.len() != 3 && parts.len() != 2 {
         return Err("unsupported rank_by expression".into());
     }
     let field = parts[0].as_str().ok_or("rank attribute must be a string")?;
@@ -1298,12 +1298,22 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
             }
             Ok(())
         }
-        "BM25" if parts.len() == 3 && parts[2].is_string() => {
+        "BM25" if (parts.len() == 3 || parts.len() == 4) && parts[2].is_string() => {
             let definition = schema.get(field).unwrap_or(&Value::Null);
             if !matches!(field_type(definition), "string" | "[]string")
                 || !has_full_text_search(definition)
             {
                 return Err(format!("attribute {field} has no full-text index"));
+            }
+            if parts.len() == 4 {
+                let options = parts[3]
+                    .as_object()
+                    .ok_or("BM25 options must be an object")?;
+                if options.len() != 1
+                    || !options.get("last_as_prefix").is_some_and(Value::is_boolean)
+                {
+                    return Err("only boolean last_as_prefix is supported for BM25".into());
+                }
             }
             Ok(())
         }
@@ -1511,7 +1521,18 @@ fn score_rank(
                 })
                 .sum()
         }
-        "BM25" => bm25(field, parts[2].as_str().unwrap(), row, corpus, schema),
+        "BM25" => bm25(
+            field,
+            parts[2].as_str().unwrap(),
+            parts
+                .get(3)
+                .and_then(|options| options.get("last_as_prefix"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            row,
+            corpus,
+            schema,
+        ),
         "Eq" | "NotEq" | "In" | "NotIn" | "Gt" | "Gte" | "Lt" | "Lte" => {
             f64::from(filter_matches(rank, row))
         }
@@ -1603,6 +1624,7 @@ fn value_tokens(value: &Value) -> Vec<String> {
 fn bm25(
     field: &str,
     query: &str,
+    last_as_prefix: bool,
     row: &Map<String, Value>,
     corpus: &std::collections::BTreeMap<String, Map<String, Value>>,
     schema: &Map<String, Value>,
@@ -1621,10 +1643,15 @@ fn bm25(
         .and_then(Value::as_f64)
         .unwrap_or(8.0);
     let doc_tokens = row.get(field).map(value_tokens).unwrap_or_default();
-    let query_tokens = tokens(query);
+    let mut query_tokens = tokens(query);
     if query_tokens.is_empty() || doc_tokens.is_empty() {
         return 0.0;
     }
+    let prefix = if last_as_prefix {
+        query_tokens.pop()
+    } else {
+        None
+    };
     let lengths = corpus
         .values()
         .filter_map(|r| r.get(field).map(|value| value_tokens(value).len()))
@@ -1634,7 +1661,7 @@ fn bm25(
     for token in query_tokens {
         *terms.entry(token).or_insert(0_usize) += 1;
     }
-    terms
+    let score: f64 = terms
         .into_iter()
         .map(|(term, query_freq)| {
             let freq = doc_tokens.iter().filter(|token| **token == term).count() as f64;
@@ -1654,5 +1681,9 @@ fn bm25(
             let query_weight = query_freq as f64 * (k3 + 1.0) / (query_freq as f64 + k3);
             query_weight * idf * freq * (k1 + 1.0) / (freq + norm)
         })
-        .sum()
+        .sum();
+    score
+        + f64::from(
+            prefix.is_some_and(|prefix| doc_tokens.iter().any(|token| token.starts_with(&prefix))),
+        )
 }
