@@ -2145,6 +2145,17 @@ async fn embedded_upserts_require_text_or_accept_an_explicit_generated_vector() 
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["id","asc"],"limit":10,"include_attributes":["embed_content"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for value in body["rows"][0]["embed_content"].as_array().unwrap() {
+        let stored = value.as_f64().unwrap() as f32;
+        assert_eq!(stored, half::f16::from_f32(stored).to_f32());
+    }
     for row in [
         json!({"id":2}),
         json!({"id":3,"content":null}),
@@ -2188,10 +2199,44 @@ async fn embedded_upserts_require_text_or_accept_an_explicit_generated_vector() 
         json!([1.0, 0.0, 0.0, 0.0])
     );
     assert_eq!(body["rows"][1]["id"], 7);
+    assert_eq!(body["rows"][1]["content"], "pufferfish");
     assert_eq!(
         body["rows"][1]["embed_content"],
         json!([1.0, 0.0, 0.0, 0.0])
     );
+    let explicit = [0.1234567_f32, 0.0, 0.0, 0.0];
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"upsert_columns":{"id":[9],"embed_content":[STANDARD.encode(explicit.iter().flat_map(|number| number.to_le_bytes()).collect::<Vec<_>>())]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["id","asc"],"filters":["id","Eq",9],"limit":1,"include_attributes":["embed_content"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["rows"][0]["embed_content"][0].as_f64().unwrap() as f32,
+        half::f16::from_f32(explicit[0]).to_f32()
+    );
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"upsert_rows":[{"id":10,"embed_content":[1e6,0.0,0.0,0.0]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"schema":{"wrong":{"type":"int","embed":{"model":"openai/text-embedding-3-small","dims":4}}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
 #[tokio::test]

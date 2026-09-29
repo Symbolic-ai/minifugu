@@ -1022,6 +1022,9 @@ async fn embedded_write_contract(base: &str, token: &str) {
     .await;
     let mut vector = vec![0.0; 256];
     vector[0] = 1.0;
+    vector[1] = 0.1234567;
+    let mut out_of_range = vector.clone();
+    out_of_range[0] = 1e6;
     let cases = [
         ("missing", json!({"id":2}), StatusCode::BAD_REQUEST),
         (
@@ -1047,6 +1050,11 @@ async fn embedded_write_contract(base: &str, token: &str) {
         (
             "wrong_dims",
             json!({"id":7,"embed_content":[1.0,0.0]}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "out_of_range",
+            json!({"id":8,"embed_content":out_of_range}),
             StatusCode::BAD_REQUEST,
         ),
     ];
@@ -1084,8 +1092,16 @@ async fn embedded_write_contract(base: &str, token: &str) {
     assert_eq!(status, StatusCode::OK, "embedded query: {body}");
     assert_eq!(ids(&body), vec![1, 5, 6]);
     assert!(body["rows"][1].get("content").is_none());
-    assert_eq!(body["rows"][1]["embed_content"][0], 1.0);
-    assert_eq!(body["rows"][2]["embed_content"][0], 1.0);
+    let mut stored_vector = vector;
+    stored_vector[1] = half::f16::from_f32(stored_vector[1] as f32).to_f32() as f64;
+    for row in &body["rows"].as_array().unwrap()[1..] {
+        let values = row["embed_content"].as_array().unwrap();
+        assert_eq!(values.len(), stored_vector.len());
+        for (actual, expected) in values.iter().zip(&stored_vector) {
+            assert_eq!(actual.as_f64().unwrap() as f32, *expected as f32);
+        }
+    }
+    assert_eq!(body["rows"][2]["content"], "fish");
 }
 
 async fn null_sort_contract(base: &str, token: &str) {

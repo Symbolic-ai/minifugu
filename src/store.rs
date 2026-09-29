@@ -317,10 +317,8 @@ impl Namespace {
                 Some((format!("embed_{field}"), json!(format!("[{dims}]f16"))))
             })
             .collect::<Map<_, _>>();
-        let mut normalization_schema = self.schema.clone();
-        normalization_schema.extend(generated_vectors.clone());
         let mut normalized = body.clone();
-        vector::normalize_write(&mut normalized, &normalization_schema)?;
+        vector::normalize_write(&mut normalized, &self.schema, &generated_vectors)?;
         let object = normalized
             .as_object()
             .ok_or("write body must be an object")?;
@@ -583,6 +581,7 @@ impl Namespace {
                         row.insert(vector_field, json!(vector));
                     }
                 }
+                vector::normalize_row(&mut row, &generated_vectors)?;
                 row.retain(|field, value| field == "id" || !value.is_null());
                 self.rows.insert(id_key(&id)?, row);
                 upserted_ids.push(id);
@@ -966,7 +965,8 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
         }
     }
     if let Some(embed) = definition.get("embed") {
-        if !embed.get("model").is_some_and(Value::is_string)
+        if field_type(definition) != "string"
+            || !embed.get("model").is_some_and(Value::is_string)
             || !embed
                 .get("dims")
                 .and_then(Value::as_u64)
