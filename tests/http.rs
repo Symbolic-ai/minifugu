@@ -1557,7 +1557,7 @@ async fn euclidean_metric_and_i8_vectors_rank_exactly() {
     assert_eq!(response["rows"][0]["id"], 1);
     assert_eq!(response["rows"][0]["$dist"], 2.0);
     assert_eq!(response["rows"][1]["$dist"], 13.0);
-    let (status, override_result) = post(
+    let (status, mismatch) = post(
         &client,
         &format!("{ns}/query"),
         json!({
@@ -1566,9 +1566,11 @@ async fn euclidean_metric_and_i8_vectors_rank_exactly() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(override_result["rows"][0]["id"], 2);
-    assert_eq!(override_result["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(mismatch["error"]
+        .as_str()
+        .unwrap()
+        .contains("Distance metric mismatch"));
 }
 
 #[tokio::test]
@@ -1650,8 +1652,14 @@ async fn unsupported_fields_fail_loudly() {
         .as_str()
         .unwrap()
         .contains("unsupported schema option geo"));
+    let (status, _) = post(
+        &client,
+        &format!("{base}/invalid-sparse-metric"),
+        json!({"schema":{"terms":{"type":"{}f16","sparse_knn":{"distance_metric":"cosine_distance"}}},"upsert_rows":[{"id":1}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     for (index, schema) in [
-        json!({"terms":{"type":"{}f16","sparse_knn":{"distance_metric":"cosine_distance"}}}),
         json!({"terms":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"},"filterable":true}}),
         json!({"blob":{"type":"bytes","filterable":true}}),
         json!({"vector":{"type":"[2]f32","ann":{"late_interaction":true}}}),

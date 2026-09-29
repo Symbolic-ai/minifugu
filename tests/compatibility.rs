@@ -759,6 +759,7 @@ async fn local_contract() {
     null_filter_contract(&format!("http://{address}"), "dummy").await;
     conditional_contract(&format!("http://{address}"), "dummy").await;
     gap_contract(&format!("http://{address}"), "dummy").await;
+    ann_contract(&format!("http://{address}"), "dummy").await;
 }
 
 #[tokio::test]
@@ -775,6 +776,265 @@ async fn optional_real_turbopuffer_contract() {
     null_filter_contract(base.trim_end_matches('/'), &token).await;
     conditional_contract(base.trim_end_matches('/'), &token).await;
     gap_contract(base.trim_end_matches('/'), &token).await;
+    ann_contract(base.trim_end_matches('/'), &token).await;
+}
+
+async fn ann_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let cases = [
+        (json!({}), Some("cosine_distance"), StatusCode::OK),
+        (
+            json!({"distance_metric":"cosine_distance"}),
+            Some("cosine_distance"),
+            StatusCode::OK,
+        ),
+        (
+            json!({"custom_option":"ignored"}),
+            Some("cosine_distance"),
+            StatusCode::OK,
+        ),
+        (
+            json!({"distance_metric":null}),
+            Some("cosine_distance"),
+            StatusCode::OK,
+        ),
+        (json!(true), None, StatusCode::BAD_REQUEST),
+        (
+            json!({"distance_metric":"cosine_distance"}),
+            None,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"distance_metric":"euclidean_squared"}),
+            Some("cosine_distance"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"distance_metric":"invalid"}),
+            Some("cosine_distance"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ];
+    for (ann, metric, expected) in cases {
+        let name = format!("minifugu-ann-{}", Uuid::new_v4().simple());
+        let url = format!("{base}/v2/namespaces/{name}");
+        let mut body = json!({
+            "schema":{"id":"uint","vector":{"type":"[2]f32","ann":ann}},
+            "upsert_rows":[{"id":1,"vector":[1.0,0.0]}]
+        });
+        if let Some(metric) = metric {
+            body["distance_metric"] = json!(metric);
+        }
+        let (status, reply) = response(&client, token, &url, body).await;
+        let schema = if status == StatusCode::OK {
+            let schema_url = format!("{base}/v1/namespaces/{name}/schema");
+            let schema: Value = client
+                .get(schema_url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            Some(schema)
+        } else {
+            None
+        };
+        let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+        assert_eq!(status, expected, "ANN write: {reply}");
+        if let Some(schema) = schema {
+            assert_eq!(cleanup.status(), StatusCode::OK);
+            assert_eq!(schema["vector"]["ann"], true);
+        }
+    }
+    for (ann, expected) in [
+        (json!(true), StatusCode::BAD_REQUEST),
+        (json!(false), StatusCode::OK),
+        (json!({}), StatusCode::BAD_REQUEST),
+    ] {
+        let name = format!("minifugu-ann-scalar-{}", Uuid::new_v4().simple());
+        let url = format!("{base}/v2/namespaces/{name}");
+        let (status, reply) = response(
+            &client,
+            token,
+            &url,
+            json!({
+                "schema":{"id":"uint","label":{"type":"string","ann":ann}},
+                "upsert_rows":[{"id":1,"label":"one"}]
+            }),
+        )
+        .await;
+        let checks = if status == StatusCode::OK {
+            let query_url = format!("{url}/query");
+            let scalar_metric = response(
+                &client,
+                token,
+                &query_url,
+                json!({"rank_by":["id","asc"],"limit":1,"distance_metric":"cosine_distance"}),
+            )
+            .await;
+            let aggregate_metric = response(
+                &client,
+                token,
+                &query_url,
+                json!({"aggregate_by":{"total":["Count"]},"distance_metric":"cosine_distance"}),
+            )
+            .await;
+            Some((scalar_metric, aggregate_metric))
+        } else {
+            None
+        };
+        let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+        assert_eq!(status, expected, "scalar ANN write: {reply}");
+        if let Some((scalar_metric, aggregate_metric)) = checks {
+            assert_eq!(cleanup.status(), StatusCode::OK);
+            assert_eq!(
+                scalar_metric.0,
+                StatusCode::BAD_REQUEST,
+                "scalar metric: {}",
+                scalar_metric.1
+            );
+            assert_eq!(
+                aggregate_metric.0,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "aggregate metric: {}",
+                aggregate_metric.1
+            );
+        }
+    }
+    for (metric, expected) in [
+        (None, StatusCode::BAD_REQUEST),
+        (Some("cosine_distance"), StatusCode::OK),
+    ] {
+        let name = format!("minifugu-embed-metric-{}", Uuid::new_v4().simple());
+        let url = format!("{base}/v2/namespaces/{name}");
+        let mut body = json!({
+            "schema":{"id":"uint","content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":1536}}},
+            "upsert_rows":[{"id":1,"content":"tiny orange pufferfish"}]
+        });
+        if let Some(metric) = metric {
+            body["distance_metric"] = json!(metric);
+        }
+        let (status, reply) = response(&client, token, &url, body).await;
+        let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+        assert_eq!(status, expected, "embed metric: {reply}");
+        if status == StatusCode::OK {
+            assert_eq!(cleanup.status(), StatusCode::OK);
+        }
+    }
+    for (metric, expected) in [
+        ("cosine_distance", StatusCode::UNPROCESSABLE_ENTITY),
+        ("dot_product", StatusCode::OK),
+    ] {
+        let name = format!("minifugu-sparse-metric-{}", Uuid::new_v4().simple());
+        let url = format!("{base}/v2/namespaces/{name}");
+        let (status, reply) = response(
+            &client,
+            token,
+            &url,
+            json!({
+                "schema":{"id":"uint","s":{"type":"{}f16","sparse_knn":{"distance_metric":metric}}},
+                "upsert_rows":[{"id":1,"s":{"fish":1.0}}]
+            }),
+        )
+        .await;
+        let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+        assert_eq!(status, expected, "sparse metric {metric}: {reply}");
+        if status == StatusCode::OK {
+            assert_eq!(cleanup.status(), StatusCode::OK);
+        }
+    }
+    let name = format!("minifugu-ann-update-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let create = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","vector":{"type":"[2]f32","ann":true}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"vector":[1.0,0.0]}]
+        }),
+    )
+    .await;
+    let mut query_results = Vec::new();
+    for (metric, expected) in [
+        ("cosine_distance", StatusCode::OK),
+        ("euclidean_squared", StatusCode::BAD_REQUEST),
+    ] {
+        let (status, reply) = response(
+            &client,
+            token,
+            &format!("{url}/query"),
+            json!({"rank_by":["vector","ANN",[1.0,0.0]],"distance_metric":metric,"limit":1}),
+        )
+        .await;
+        query_results.push((metric, expected, status, reply));
+    }
+    let schema_url = format!("{base}/v1/namespaces/{name}/schema");
+    let matching = response(
+        &client,
+        token,
+        &schema_url,
+        json!({"vector":{"type":"[2]f32","ann":{"distance_metric":"cosine_distance"}}}),
+    )
+    .await;
+    let followup = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"vector":{"type":"[2]f32","ann":{"distance_metric":"cosine_distance"}}},
+            "upsert_rows":[{"id":2,"vector":[0.5,0.5]}]
+        }),
+    )
+    .await;
+    let mismatch = response(
+        &client,
+        token,
+        &schema_url,
+        json!({"vector":{"type":"[2]f32","ann":{"distance_metric":"euclidean_squared"}}}),
+    )
+    .await;
+    let changed_metric = response(
+        &client,
+        token,
+        &url,
+        json!({"distance_metric":"euclidean_squared","upsert_rows":[{"id":2,"vector":[2.0,0.0]}]}),
+    )
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(create.0, StatusCode::OK, "ANN update setup: {}", create.1);
+    assert_eq!(cleanup.status(), StatusCode::OK);
+    for (metric, expected, status, reply) in query_results {
+        assert_eq!(status, expected, "query metric {metric}: {reply}");
+    }
+    assert_eq!(
+        matching.0,
+        StatusCode::OK,
+        "matching ANN update: {}",
+        matching.1
+    );
+    assert_eq!(matching.1["vector"]["ann"], true);
+    assert_eq!(
+        followup.0,
+        StatusCode::OK,
+        "ANN follow-up write: {}",
+        followup.1
+    );
+    assert_eq!(
+        mismatch.0,
+        StatusCode::BAD_REQUEST,
+        "ANN update: {}",
+        mismatch.1
+    );
+    assert_eq!(
+        changed_metric.0,
+        StatusCode::BAD_REQUEST,
+        "namespace metric change: {}",
+        changed_metric.1
+    );
 }
 
 fn ids(result: &Value) -> Vec<u64> {

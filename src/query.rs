@@ -111,8 +111,17 @@ impl Namespace {
 
     fn validate_query(&self, body: &Value) -> Result<(), String> {
         let object = body.as_object().ok_or("subquery must be an object")?;
+        validate_query_options(object)?;
         if object.contains_key("aggregate_by") {
             return self.validate_aggregation(object);
+        }
+        if let Some(requested) = object.get("distance_metric").and_then(Value::as_str) {
+            let configured = self.distance_metric.as_deref().unwrap_or("euclidean");
+            if requested != configured {
+                return Err(format!(
+                    "Distance metric mismatch; namespace was configured with {configured}, but query specified {requested}"
+                ));
+            }
         }
         for key in object.keys() {
             if !matches!(
@@ -162,7 +171,6 @@ impl Namespace {
                 }
             }
         }
-        validate_query_options(object)?;
         if let Some(include) = object.get("include_attributes") {
             if !include.is_boolean() {
                 let fields = include.as_array().ok_or_else(|| {

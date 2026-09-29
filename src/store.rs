@@ -348,6 +348,14 @@ impl Namespace {
                     "distance_metric must be cosine_distance or euclidean_squared".into(),
                 ));
             }
+            if let Some(existing) = self.distance_metric.as_deref() {
+                if metric != existing {
+                    return Err(format!(
+                        "distance metric mismatch, expected {existing}, got {metric}"
+                    )
+                    .into());
+                }
+            }
             if !self.schema.values().any(|v| {
                 vector::dimensions(v).is_some()
                     || vector::multi_dimensions(v).is_some()
@@ -358,6 +366,35 @@ impl Namespace {
                 ));
             }
             self.distance_metric = Some(metric.into());
+        }
+        if let Some(schema) = object.get("schema").and_then(Value::as_object) {
+            for definition in schema.values() {
+                if let Some(metric) = definition.pointer("/ann/distance_metric") {
+                    if metric.is_null() {
+                        continue;
+                    }
+                    let Some(namespace_metric) = self.distance_metric.as_deref() else {
+                        return Err("distance_metric must be specified at the top level of the write request, not in ann".into());
+                    };
+                    if metric.as_str() != Some(namespace_metric) {
+                        return Err(format!(
+                            "distance metric mismatch, expected {namespace_metric}, got {metric}"
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        if self.distance_metric.is_none()
+            && self.schema.values().any(|definition| {
+                (vector::dimensions(definition).is_some()
+                    && vector::multi_dimensions(definition).is_none())
+                    || has_embed(definition)
+            })
+        {
+            return Err(
+                "distance_metric must be specified for write to namespace with a vector".into(),
+            );
         }
         for (condition, operations) in [
             ("upsert_condition", &["upsert_rows", "upsert_columns"][..]),
@@ -772,6 +809,13 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
                 "ann" if !value.is_boolean() && !value.is_object() => {
                     return Err(format!("invalid ann configuration for attribute {field}"));
                 }
+                "ann"
+                    if value == &Value::Bool(true)
+                        && vector::dimensions(definition).is_none()
+                        && vector::multi_dimensions(definition).is_none() =>
+                {
+                    return Err(format!("ann requires a vector attribute: {field}"));
+                }
                 "full_text_search" if value.is_object() => {
                     if !matches!(field_type(definition), "string" | "[]string") {
                         return Err(format!(
@@ -788,27 +832,46 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
                     })?;
                 }
                 "ann" if value.is_object() => {
-                    if vector::multi_dimensions(definition).is_none()
-                        || value.as_object().is_none_or(|ann| {
-                            ann.len() != 1
-                                || ann.get("late_interaction") != Some(&Value::Bool(true))
-                        })
-                    {
-                        return Err(format!(
-                            "invalid late-interaction configuration for attribute {field}"
-                        ));
+                    let ann = value.as_object().unwrap();
+                    if vector::multi_dimensions(definition).is_some() {
+                        if ann.len() != 1 || ann.get("late_interaction") != Some(&Value::Bool(true))
+                        {
+                            return Err(format!(
+                                "invalid late-interaction configuration for attribute {field}"
+                            ));
+                        }
+                    } else if vector::dimensions(definition).is_some() {
+                        if ann.contains_key("late_interaction") {
+                            return Err(format!("invalid ann configuration for attribute {field}"));
+                        }
+                        if ann.get("distance_metric").is_some_and(|metric| {
+                            !metric.is_null()
+                                && !matches!(
+                                    metric.as_str(),
+                                    Some("cosine_distance" | "euclidean_squared")
+                                )
+                        }) {
+                            return Err(crate::shape_error(format!(
+                                "schema.{field}.ann.distance_metric is invalid"
+                            )));
+                        }
+                    } else {
+                        return Err(format!("invalid ann configuration for attribute {field}"));
                     }
                 }
                 "sparse_knn" => {
-                    if field_type(definition) != "{}f16"
-                        || value.as_object().is_none_or(|config| {
-                            config.len() != 1
-                                || config.get("distance_metric") != Some(&json!("dot_product"))
-                        })
-                    {
+                    if field_type(definition) != "{}f16" {
                         return Err(format!(
-                            "invalid sparse_knn configuration for attribute {field}"
+                            "sparse_knn is only supported on sparse vector attributes: {field}"
                         ));
+                    }
+                    if value.as_object().is_none_or(|config| {
+                        config.len() != 1
+                            || config.get("distance_metric") != Some(&json!("dot_product"))
+                    }) {
+                        return Err(crate::shape_error(format!(
+                            "schema.{field}.sparse_knn.distance_metric is invalid"
+                        )));
                     }
                 }
                 "embed" if !value.is_object() => {
