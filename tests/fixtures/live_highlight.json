@@ -1,0 +1,914 @@
+{
+ "_source": "Captured from the live service on 2026-09-29 with synthetic data.",
+ "write": {
+  "upsert_rows": [
+   {
+    "id": 1,
+    "text": "turbopuffer is a search engine built on object storage. Writes land in a write-ahead log for durability.\n\nWarm queries are served from an NVMe cache. Highlighting returns the most relevant fragments of an attribute.\nA fragment can be a word, a sentence, a paragraph, or the whole attribute. Pufferfish café 🐡 naïve storage.",
+    "tags": [
+     "object storage",
+     "cold cache",
+     "warm"
+    ],
+    "plain": "object storage"
+   },
+   {
+    "id": 2,
+    "text": "Nothing relevant here. Just cache.",
+    "tags": [
+     "x"
+    ],
+    "plain": "x"
+   },
+   {
+    "id": 3,
+    "text": "unrelated words only",
+    "tags": [
+     "y"
+    ],
+    "plain": "y"
+   }
+  ],
+  "schema": {
+   "id": "uint",
+   "text": {
+    "type": "string",
+    "full_text_search": true
+   },
+   "tags": {
+    "type": "[]string",
+    "full_text_search": true
+   },
+   "plain": "string"
+  }
+ },
+ "cases": [
+  {
+   "label": "default",
+   "rank_by": [
+    "text",
+    "BM25",
+    "object storage cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "text"
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "turbopuffer is a search engine built on object storage."
+      },
+      {
+       "text": "Warm queries are served from an NVMe cache."
+      },
+      {
+       "text": "Pufferfish café 🐡 naïve storage."
+      }
+     ],
+     "$dist": 1.801863
+    },
+    {
+     "id": 2,
+     "h": [
+      {
+       "text": "Just cache."
+      }
+     ],
+     "$dist": 0.68128055
+    }
+   ]
+  },
+  {
+   "label": "offsets",
+   "rank_by": [
+    "text",
+    "BM25",
+    "object storage cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "include_offsets": "utf-8"
+    }
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "turbopuffer is a search engine built on object storage.",
+       "fragment_range": [
+        0,
+        55
+       ],
+       "match_ranges": [
+        [
+         40,
+         46
+        ],
+        [
+         47,
+         54
+        ]
+       ]
+      },
+      {
+       "text": "Warm queries are served from an NVMe cache.",
+       "fragment_range": [
+        106,
+        149
+       ],
+       "match_ranges": [
+        [
+         143,
+         148
+        ]
+       ]
+      },
+      {
+       "text": "Pufferfish café 🐡 naïve storage.",
+       "fragment_range": [
+        291,
+        328
+       ],
+       "match_ranges": [
+        [
+         320,
+         327
+        ]
+       ]
+      }
+     ],
+     "$dist": 1.801863
+    },
+    {
+     "id": 2,
+     "h": [
+      {
+       "text": "Just cache.",
+       "fragment_range": [
+        23,
+        34
+       ],
+       "match_ranges": [
+        [
+         28,
+         33
+        ]
+       ]
+      }
+     ],
+     "$dist": 0.68128055
+    }
+   ]
+  },
+  {
+   "label": "word",
+   "rank_by": [
+    "text",
+    "BM25",
+    "object storage cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "fragment_by": "word",
+     "include_offsets": "utf-8"
+    }
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "object",
+       "fragment_range": [
+        40,
+        46
+       ],
+       "match_ranges": [
+        [
+         40,
+         46
+        ]
+       ]
+      },
+      {
+       "text": "cache",
+       "fragment_range": [
+        143,
+        148
+       ],
+       "match_ranges": [
+        [
+         143,
+         148
+        ]
+       ]
+      },
+      {
+       "text": "storage",
+       "fragment_range": [
+        47,
+        54
+       ],
+       "match_ranges": [
+        [
+         47,
+         54
+        ]
+       ]
+      }
+     ],
+     "$dist": 1.801863
+    },
+    {
+     "id": 2,
+     "h": [
+      {
+       "text": "cache",
+       "fragment_range": [
+        28,
+        33
+       ],
+       "match_ranges": [
+        [
+         28,
+         33
+        ]
+       ]
+      }
+     ],
+     "$dist": 0.68128055
+    }
+   ]
+  },
+  {
+   "label": "paragraph",
+   "rank_by": [
+    "text",
+    "BM25",
+    "object storage cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "fragment_by": "paragraph",
+     "include_offsets": "utf-8"
+    }
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "turbopuffer is a search engine built on object storage. Writes land in a write-ahead log for durability.",
+       "fragment_range": [
+        0,
+        104
+       ],
+       "match_ranges": [
+        [
+         40,
+         46
+        ],
+        [
+         47,
+         54
+        ]
+       ]
+      },
+      {
+       "text": "Warm queries are served from an NVMe cache. Highlighting returns the most relevant fragments of an attribute.",
+       "fragment_range": [
+        106,
+        215
+       ],
+       "match_ranges": [
+        [
+         143,
+         148
+        ]
+       ]
+      },
+      {
+       "text": "A fragment can be a word, a sentence, a paragraph, or the whole attribute. Pufferfish café 🐡 naïve storage.",
+       "fragment_range": [
+        216,
+        328
+       ],
+       "match_ranges": [
+        [
+         320,
+         327
+        ]
+       ]
+      }
+     ],
+     "$dist": 1.801863
+    },
+    {
+     "id": 2,
+     "h": [
+      {
+       "text": "Nothing relevant here. Just cache.",
+       "fragment_range": [
+        0,
+        34
+       ],
+       "match_ranges": [
+        [
+         28,
+         33
+        ]
+       ]
+      }
+     ],
+     "$dist": 0.68128055
+    }
+   ]
+  },
+  {
+   "label": "none",
+   "rank_by": [
+    "text",
+    "BM25",
+    "object storage cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "fragment_by": "none",
+     "include_offsets": "utf-8"
+    }
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "turbopuffer is a search engine built on object storage. Writes land in a write-ahead log for durability.\n\nWarm queries are served from an NVMe cache. Highlighting returns the most relevant fragments of an attribute.\nA fragment can be a word, a sentence, a paragraph, or the whole attribute. Pufferfish café 🐡 naïve storage.",
+       "fragment_range": [
+        0,
+        328
+       ],
+       "match_ranges": [
+        [
+         40,
+         46
+        ],
+        [
+         47,
+         54
+        ],
+        [
+         143,
+         148
+        ],
+        [
+         320,
+         327
+        ]
+       ]
+      }
+     ],
+     "$dist": 1.801863
+    },
+    {
+     "id": 2,
+     "h": [
+      {
+       "text": "Nothing relevant here. Just cache.",
+       "fragment_range": [
+        0,
+        34
+       ],
+       "match_ranges": [
+        [
+         28,
+         33
+        ]
+       ]
+      }
+     ],
+     "$dist": 0.68128055
+    }
+   ]
+  },
+  {
+   "label": "limit1",
+   "rank_by": [
+    "text",
+    "BM25",
+    "object storage cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "fragment_limit": 1
+    }
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "turbopuffer is a search engine built on object storage."
+      }
+     ],
+     "$dist": 1.801863
+    },
+    {
+     "id": 2,
+     "h": [
+      {
+       "text": "Just cache."
+      }
+     ],
+     "$dist": 0.68128055
+    }
+   ]
+  },
+  {
+   "label": "limit10",
+   "rank_by": [
+    "text",
+    "BM25",
+    "object storage cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "fragment_limit": 10
+    }
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "turbopuffer is a search engine built on object storage."
+      },
+      {
+       "text": "Warm queries are served from an NVMe cache."
+      },
+      {
+       "text": "Pufferfish café 🐡 naïve storage."
+      }
+     ],
+     "$dist": 1.801863
+    },
+    {
+     "id": 2,
+     "h": [
+      {
+       "text": "Just cache."
+      }
+     ],
+     "$dist": 0.68128055
+    }
+   ]
+  },
+  {
+   "label": "utf16",
+   "rank_by": [
+    "text",
+    "BM25",
+    "naïve storage"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "fragment_by": "none",
+     "include_offsets": "utf-16"
+    }
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "turbopuffer is a search engine built on object storage. Writes land in a write-ahead log for durability.\n\nWarm queries are served from an NVMe cache. Highlighting returns the most relevant fragments of an attribute.\nA fragment can be a word, a sentence, a paragraph, or the whole attribute. Pufferfish café 🐡 naïve storage.",
+       "fragment_range": [
+        0,
+        324
+       ],
+       "match_ranges": [
+        [
+         47,
+         54
+        ],
+        [
+         310,
+         315
+        ],
+        [
+         316,
+         323
+        ]
+       ]
+      }
+     ],
+     "$dist": 1.5186982
+    }
+   ]
+  },
+  {
+   "label": "codepoints",
+   "rank_by": [
+    "text",
+    "BM25",
+    "naïve storage"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "fragment_by": "none",
+     "include_offsets": "codepoints"
+    }
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "turbopuffer is a search engine built on object storage. Writes land in a write-ahead log for durability.\n\nWarm queries are served from an NVMe cache. Highlighting returns the most relevant fragments of an attribute.\nA fragment can be a word, a sentence, a paragraph, or the whole attribute. Pufferfish café 🐡 naïve storage.",
+       "fragment_range": [
+        0,
+        323
+       ],
+       "match_ranges": [
+        [
+         47,
+         54
+        ],
+        [
+         309,
+         314
+        ],
+        [
+         315,
+         322
+        ]
+       ]
+      }
+     ],
+     "$dist": 1.5186982
+    }
+   ]
+  },
+  {
+   "label": "utf8b",
+   "rank_by": [
+    "text",
+    "BM25",
+    "naïve storage"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "fragment_by": "none",
+     "include_offsets": "utf-8"
+    }
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "turbopuffer is a search engine built on object storage. Writes land in a write-ahead log for durability.\n\nWarm queries are served from an NVMe cache. Highlighting returns the most relevant fragments of an attribute.\nA fragment can be a word, a sentence, a paragraph, or the whole attribute. Pufferfish café 🐡 naïve storage.",
+       "fragment_range": [
+        0,
+        328
+       ],
+       "match_ranges": [
+        [
+         47,
+         54
+        ],
+        [
+         313,
+         319
+        ],
+        [
+         320,
+         327
+        ]
+       ]
+      }
+     ],
+     "$dist": 1.5186982
+    }
+   ]
+  },
+  {
+   "label": "rankfrag",
+   "rank_by": [
+    "id",
+    "asc"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "rank_fragments_by": [
+      "$fragment",
+      "BM25",
+      "durability"
+     ],
+     "include_offsets": "utf-8"
+    }
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "Writes land in a write-ahead log for durability.",
+       "fragment_range": [
+        56,
+        104
+       ],
+       "match_ranges": [
+        [
+         93,
+         103
+        ]
+       ]
+      }
+     ],
+     "$dist": null
+    },
+    {
+     "id": 2,
+     "h": [],
+     "$dist": null
+    },
+    {
+     "id": 3,
+     "h": [],
+     "$dist": null
+    }
+   ]
+  },
+  {
+   "label": "noftsrank",
+   "rank_by": [
+    "id",
+    "asc"
+   ],
+   "highlight": [
+    "Highlight",
+    "text"
+   ],
+   "status": 400,
+   "rows": null
+  },
+  {
+   "label": "tags",
+   "rank_by": [
+    "tags",
+    "BM25",
+    "cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "tags",
+    {
+     "include_offsets": "utf-8"
+    }
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "cold cache",
+       "fragment_range": [
+        0,
+        10
+       ],
+       "match_ranges": [
+        [
+         5,
+         10
+        ]
+       ],
+       "array_index": 1
+      }
+     ],
+     "$dist": 0.6683526
+    }
+   ]
+  },
+  {
+   "label": "tags_word",
+   "rank_by": [
+    "tags",
+    "BM25",
+    "cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "tags",
+    {
+     "fragment_by": "word",
+     "include_offsets": "utf-8"
+    }
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "cache",
+       "fragment_range": [
+        5,
+        10
+       ],
+       "match_ranges": [
+        [
+         5,
+         10
+        ]
+       ],
+       "array_index": 1
+      }
+     ],
+     "$dist": 0.6683526
+    }
+   ]
+  },
+  {
+   "label": "plain",
+   "rank_by": [
+    "text",
+    "BM25",
+    "object storage cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "plain"
+   ],
+   "status": 400,
+   "rows": null
+  },
+  {
+   "label": "otherfield",
+   "rank_by": [
+    "tags",
+    "BM25",
+    "cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "include_offsets": "utf-8"
+    }
+   ],
+   "status": 400,
+   "rows": null
+  },
+  {
+   "label": "sum",
+   "rank_by": [
+    "Sum",
+    [
+     [
+      "text",
+      "BM25",
+      "durability"
+     ],
+     [
+      "tags",
+      "BM25",
+      "warm"
+     ]
+    ]
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "include_offsets": "utf-8"
+    }
+   ],
+   "status": 200,
+   "rows": [
+    {
+     "id": 1,
+     "h": [
+      {
+       "text": "Writes land in a write-ahead log for durability.",
+       "fragment_range": [
+        56,
+        104
+       ],
+       "match_ranges": [
+        [
+         93,
+         103
+        ]
+       ]
+      }
+     ],
+     "$dist": 1.2592762
+    }
+   ]
+  },
+  {
+   "label": "badfrag",
+   "rank_by": [
+    "text",
+    "BM25",
+    "object storage cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "fragment_by": "line"
+    }
+   ],
+   "status": 422,
+   "rows": null
+  },
+  {
+   "label": "badlimit",
+   "rank_by": [
+    "text",
+    "BM25",
+    "object storage cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "fragment_limit": 0
+    }
+   ],
+   "status": 400,
+   "rows": null
+  },
+  {
+   "label": "biglimit",
+   "rank_by": [
+    "text",
+    "BM25",
+    "object storage cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "fragment_limit": 1025
+    }
+   ],
+   "status": 400,
+   "rows": null
+  },
+  {
+   "label": "badopt",
+   "rank_by": [
+    "text",
+    "BM25",
+    "object storage cache"
+   ],
+   "highlight": [
+    "Highlight",
+    "text",
+    {
+     "foo": 1
+    }
+   ],
+   "status": 422,
+   "rows": null
+  }
+ ]
+}

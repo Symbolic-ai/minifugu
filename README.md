@@ -66,7 +66,7 @@ MiniFugu calls OpenAI's embeddings endpoint for native `embed` fields, using the
 | Route | Behavior |
 | --- | --- |
 | `POST /v2/namespaces/{name}` | Schema and vector metric, row/column upserts and patches, conditional writes, ID deletes, patch/delete by filter, affected IDs, local copy/branch |
-| `POST /v2/namespaces/{name}/query` | Single and multiqueries, exact dense and sparse ANN/kNN, late-interaction ranking, BM25, RRF fusion, text and fuzzy filters, numeric ranking expressions, ordering, `limit`/`top_k`, offset, attribute selection, computed BM25/vector scores, Count/Sum aggregations |
+| `POST /v2/namespaces/{name}/query` | Single and multiqueries, exact dense and sparse ANN/kNN, late-interaction ranking, BM25, RRF fusion, text and fuzzy filters, numeric ranking expressions, ordering, `limit`/`top_k`, offset, attribute selection, computed BM25/vector scores, text highlighting, Count/Sum aggregations with multiple group fields |
 | `DELETE /v2/namespaces/{name}` | Delete a namespace |
 | `GET /v1/namespaces` | List namespace IDs with prefix, cursor, and page size |
 | `GET/POST /v1/namespaces/{name}/schema` | Read and extend a schema |
@@ -75,7 +75,9 @@ MiniFugu calls OpenAI's embeddings endpoint for native `embed` fields, using the
 | `POST /v1/namespaces/{name}/_debug/recall` | Measure exact local vector recall |
 | `POST /v2/namespaces/{name}/explain_query` | Explain the local exact scan plan |
 
-Supported filters include `And`, `Or`, `Not`, equality, `In`/`NotIn`, numeric/date ranges, array containment, full-text token matching, and fuzzy substring matching. Dense vectors can be sent as float arrays or little-endian float32 base64; base64 query responses use the schema's f32, f16, or i8 element width. Sparse vectors use `{}f16` maps and multi-vectors use `[][N]f32` arrays. Queries validate referenced attributes even when no rows match. Unsupported request fields return HTTP 400. This prevents a test from silently passing when MiniFugu cannot emulate the operation. See [API coverage](docs/api-coverage.md) for exact details and remaining gaps.
+Supported filters include `And`, `Or`, `Not`, equality, `In`/`NotIn`, numeric/date ranges, array containment, full-text token matching, and fuzzy substring matching. Dense vectors can be sent as float arrays or little-endian float32 base64; base64 query responses use the schema's f32, f16, or i8 element width. Sparse vectors use `{}f16` maps and multi-vectors use `[][N]f32` arrays. Queries validate referenced attributes even when no rows match. Unsupported request fields fail, so a test cannot silently pass when MiniFugu cannot emulate the operation. See [API coverage](docs/api-coverage.md) for exact details and remaining gaps.
+
+Behavior checked against live Turbopuffer includes full-text analysis options, highlighting, normalized schema responses, aggregation edge cases, and generated query results. The [parity checks](docs/api-coverage.md#behavioral-parity-checks) show the evidence and scope for each area. MiniFugu still uses exact local scans and local estimates, so approximate ANN recall, cloud billing, and distributed consistency differ.
 
 ## Development and compatibility checks
 
@@ -85,7 +87,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked
 ```
 
-All ordinary tests are local and keyless. `tests/compatibility.rs` can also run its disposable synthetic namespace against a real Turbopuffer development account when `TURBOPUFFER_BASE_URL` and `TURBOPUFFER_API_KEY` are set. It deletes the test namespace when finished. `tests/openai_live.rs` similarly requires `MINIFUGU_LIVE_OPENAI=1` and `OPENAI_API_KEY`. Neither live test runs in CI.
+All ordinary tests are local and keyless. With `TURBOPUFFER_BASE_URL` and `TURBOPUFFER_API_KEY` set, `tests/compatibility.rs` runs its disposable synthetic contract against live Turbopuffer, and `tests/differential.rs` compares 36 generated queries against live. Run them with `cargo test --locked --test compatibility --test differential`. They delete their namespaces when finished. `tests/openai_live.rs` separately requires `MINIFUGU_LIVE_OPENAI=1` and `OPENAI_API_KEY`. The live tests do not run in CI.
 
 Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Please report security issues privately as described in [SECURITY.md](SECURITY.md).
 

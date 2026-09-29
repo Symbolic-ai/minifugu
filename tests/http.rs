@@ -22,6 +22,118 @@ async fn post(client: &Client, url: &str, body: Value) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
+async fn aggregates_match_live_grouping_edges() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/aggregation-edges");
+    let query_url = format!("{url}/query");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","g":"uint","h":"string","f":"float"},
+            "upsert_rows":[
+                {"id":1,"g":10,"h":"b","f":1.5},
+                {"id":2,"g":2,"h":"c","f":2.5},
+                {"id":3,"g":2,"h":"a","f":-4.0},
+                {"id":4,"h":"z"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let aggregate = json!({"aggregate_by":{"count":["Count"],"sum":["Sum","f"]}});
+    let (status, result) = post(
+        &client,
+        &query_url,
+        json!({
+            "aggregate_by":aggregate["aggregate_by"],"group_by":[]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["aggregations"], json!({"count":4,"sum":0.0}));
+
+    let (status, result) = post(
+        &client,
+        &query_url,
+        json!({
+            "aggregate_by":aggregate["aggregate_by"],"group_by":["g","h"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        result["aggregation_groups"],
+        json!([
+            {"g":null,"h":"z","count":1,"sum":0.0},
+            {"g":2,"h":"a","count":1,"sum":-4.0},
+            {"g":2,"h":"c","count":1,"sum":2.5},
+            {"g":10,"h":"b","count":1,"sum":1.5}
+        ])
+    );
+
+    for fields in [json!(["id"]), json!(["g", "g"])] {
+        let (status, _) = post(
+            &client,
+            &query_url,
+            json!({
+                "aggregate_by":{"count":["Count"]},"group_by":fields
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn query_shape_errors_use_live_status_codes() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/query-shapes");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint"},"upsert_rows":[{"id":1}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query_url = format!("{url}/query");
+    for query in [
+        json!({"rank_by":["id","asc"],"limit":"x"}),
+        json!({"rank_by":["id","sideways"],"limit":1}),
+        json!({"rank_by":["id","asc"],"filters":["id","Equals",1],"limit":1}),
+        json!({"aggregate_by":{"count":["Avg","id"]}}),
+        json!({"aggregate_by":{"count":["Count"]},"group_by":["id"],"limit":1}),
+        json!({"rank_by":"id","limit":1}),
+        json!({"queries":{}}),
+        json!({"rank_by":["id","asc"],"limit":1,"include_attributes":"id"}),
+        json!({"rank_by":["id","asc"],"limit":1,"exclude_attributes":"id"}),
+        json!({"rank_by":["id","asc"],"limit":1,"compute_attributes":[]}),
+        json!({"rank_by":["id","asc"],"limit":1,"compute_attributes":{"x":["id","VectorDist"]}}),
+        json!({"aggregate_by":{"count":["Count"]},"group_by":"id"}),
+    ] {
+        let (status, body) = post(&client, &query_url, query.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{query}: {body}");
+        assert_eq!(body["status"], "error");
+    }
+    let malformed = client
+        .post(&query_url)
+        .bearer_auth("dummy")
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    let body: Value = malformed.json().await.unwrap();
+    assert_eq!(body["status"], "error");
+}
+
+#[tokio::test]
 async fn rejects_unknown_document_selector_even_for_empty_namespace() {
     let base = server().await;
     let client = Client::new();
@@ -293,7 +405,14 @@ async fn patches_filters_and_namespace_inspection_work() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["approx_row_count"], 2);
-    assert_eq!(body["schema"]["tag"], "string");
+    assert_eq!(
+        body["schema"]["tag"],
+        json!({"type":"string","filterable":true})
+    );
+    assert!(body["last_write_at"]
+        .as_str()
+        .unwrap()
+        .ends_with(".000000000Z"));
     assert!(body["approx_logical_bytes"].as_u64().unwrap() > 0);
     assert!(body["created_at"].as_str().unwrap().ends_with('Z'));
     assert!(body["updated_at"].as_str().unwrap().ends_with('Z'));
@@ -322,7 +441,15 @@ async fn patches_filters_and_namespace_inspection_work() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["new"], "string");
+    // The response is the live service's normalized schema view.
+    assert_eq!(
+        body["new"],
+        json!({"type":"string","filterable":true,"full_text_search":null})
+    );
+    assert_eq!(
+        body["id"],
+        json!({"type":"uint","filterable":null,"full_text_search":null})
+    );
 }
 
 #[tokio::test]
@@ -406,10 +533,10 @@ async fn recall_selects_an_ann_index_or_native_embedding() {
         &client,
         &ns,
         json!({
-            "schema":{"id":"uint","a_storage":{"type":"[2]f32","ann":false},
+            "schema":{"id":"uint","a_storage":{"type":"[][2]f32"},
                       "z_search":{"type":"[2]f32","ann":true}},
             "distance_metric":"cosine_distance",
-            "upsert_rows":[{"id":1,"a_storage":[0,1],"z_search":[1,0]}]
+            "upsert_rows":[{"id":1,"a_storage":[[0,1]],"z_search":[1,0]}]
         }),
     )
     .await;
@@ -737,32 +864,37 @@ async fn unsupported_fields_fail_loudly() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(body["error"].as_str().unwrap().contains("aggregation"));
-    for (query, expected) in [
+    for (query, expected, expected_status) in [
         (
             json!({"rank_by":["id","asc"],"top_k":{"total":1,"per":{"attributes":["title"],"limit":1}},"include_attributes":["title"]}),
             "top_k must",
+            StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (
             json!({"rank_by":["id","asc"],"limit":{"total":1,"extra":true}}),
             "unsupported limit field",
+            StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (
             json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["title"],"limit":1,"extra":true}},"include_attributes":["title"]}),
             "unsupported limit.per field",
+            StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (
             json!({"aggregate_by":{"count":["Count"]},"top_k":1}),
             "top_k requires group_by",
+            StatusCode::BAD_REQUEST,
         ),
         (
             json!({"aggregate_by":{"title":["Count"]},"group_by":["title"],"top_k":1}),
             "conflicts with a group field",
+            StatusCode::BAD_REQUEST,
         ),
     ] {
         let (status, body) = post(&client, &format!("{ns}/query"), query).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, expected_status);
         assert!(body["error"].as_str().unwrap().contains(expected), "{body}");
     }
     let (status, body) = post(
@@ -989,4 +1121,190 @@ async fn namespaces_can_be_copied_and_then_diverge() {
         .await
         .unwrap();
     assert_eq!(prefix["namespaces"][0]["id"], "branch");
+}
+
+#[tokio::test]
+async fn schema_views_match_the_live_service() {
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/live_schema.json")).unwrap();
+    let base = server().await;
+    let client = Client::new();
+    let origin = base.trim_end_matches("/v2/namespaces");
+    let (status, body) = post(&client, &format!("{base}/shapes"), fixture["write"].clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let schema: Value = client
+        .get(format!("{origin}/v1/namespaces/shapes/schema"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for (field, expected) in fixture["schema"].as_object().unwrap() {
+        assert_eq!(&schema[field], expected, "schema view of {field}");
+    }
+    let metadata: Value = client
+        .get(format!("{origin}/v1/namespaces/shapes/metadata"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for (field, expected) in fixture["metadata_schema"].as_object().unwrap() {
+        assert_eq!(
+            &metadata["schema"][field], expected,
+            "metadata view of {field}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn embedded_attribute_schema_views_match_live_shapes() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/embedded-schema");
+    let origin = base.trim_end_matches("/v2/namespaces");
+    let (status, body) = post(&client, &url, json!({
+        "schema":{"id":"uint","body":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":1536}}},
+        "distance_metric":"cosine_distance",
+        "upsert_rows":[{"id":1,"body":"red fish"}]
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let schema: Value = client
+        .get(format!("{origin}/v1/namespaces/embedded-schema/schema"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        schema["body"],
+        json!({
+            "type":"string","filterable":true,"full_text_search":null
+        })
+    );
+    assert_eq!(
+        schema["embed_body"],
+        json!({
+            "type":"[1536]f16","filterable":false,"full_text_search":null,"ann":true
+        })
+    );
+    let metadata: Value = client
+        .get(format!("{origin}/v1/namespaces/embedded-schema/metadata"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        metadata["schema"]["body"],
+        json!({
+            "type":"string","filterable":true,
+            "embed":{"attribute":"embed_body","model":"openai/text-embedding-3-small"}
+        })
+    );
+    assert_eq!(
+        metadata["schema"]["embed_body"],
+        json!({
+            "type":"[1536]f16","filterable":false,
+            "ann":{"distance_metric":"cosine_distance"}
+        })
+    );
+}
+
+#[tokio::test]
+async fn integer_sum_keeps_values_beyond_float_precision() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/exact-sum");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","big":"uint"},
+            "upsert_rows":[{"id":1,"big":9007199254740992_u64},{"id":2,"big":1}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "aggregate_by":{"sum":["Sum","big"]}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["aggregations"]["sum"], json!(9007199254740993_u64));
+}
+
+#[tokio::test]
+async fn inferred_numeric_and_array_types_follow_live_rules() {
+    let base = server().await;
+    let client = Client::new();
+    let origin = base.trim_end_matches("/v2/namespaces");
+    let url = format!("{base}/inferred-types");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({
+            "upsert_rows":[{"id":1,"count":3,"empty":[]}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let schema: Value = client
+        .get(format!("{origin}/v1/namespaces/inferred-types/schema"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(schema["count"]["type"], "int");
+    assert_eq!(schema["empty"]["type"], "[]unknown");
+
+    let (status, body) = post(
+        &client,
+        &format!("{base}/inferred-decimal"),
+        json!({
+            "upsert_rows":[{"id":1,"fraction":1.5}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("signed 64-bit integer"));
+
+    let (status, body) = post(
+        &client,
+        &format!("{base}/inferred-multivector"),
+        json!({
+            "upsert_rows":[{"id":1,"tokens":[[1.0,0.0],[0.0,1.0]]}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let schema: Value = client
+        .get(format!(
+            "{origin}/v1/namespaces/inferred-multivector/schema"
+        ))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(schema["tokens"]["type"], "[][2]f32");
 }
