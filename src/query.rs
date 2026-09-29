@@ -185,6 +185,9 @@ impl Namespace {
             if fields.iter().any(|field| !field.is_string()) {
                 return Err("exclude_attributes entries must be strings".into());
             }
+            if fields.contains(&json!("id")) {
+                return Err("cannot exclude id attribute".into());
+            }
         }
         if object.contains_key("include_attributes") && object.contains_key("exclude_attributes") {
             return Err("include_attributes and exclude_attributes cannot be combined".into());
@@ -192,8 +195,13 @@ impl Namespace {
         if object.contains_key("limit") && object.contains_key("top_k") {
             return Err("limit and top_k cannot be combined".into());
         }
-        if object.get("top_k").is_some_and(|value| !value.is_number()) {
-            return Err(crate::shape_error("top_k must be an integer"));
+        if let Some(top_k) = object.get("top_k") {
+            if top_k.is_null() {
+                return Err("top_k must be an integer".into());
+            }
+            if top_k.as_u64().is_none() {
+                return Err(crate::shape_error("top_k must be a nonnegative integer"));
+            }
         }
         let limit = object.get("limit").or_else(|| object.get("top_k"));
         match limit {
@@ -203,61 +211,84 @@ impl Namespace {
                     .and_then(Value::as_u64)
                     .is_some_and(|n| n > 0 && n <= 10_000) =>
             {
-                if v.keys().any(|key| !matches!(key.as_str(), "total" | "per")) {
-                    return Err(crate::shape_error("unsupported limit field"));
-                }
-                if let Some(per) = v.get("per") {
-                    let per = per.as_object().ok_or("limit.per must be an object")?;
-                    if per
-                        .keys()
-                        .any(|key| !matches!(key.as_str(), "attributes" | "limit"))
-                    {
-                        return Err(crate::shape_error("unsupported limit.per field"));
-                    }
+                if let Some(per) = v.get("per").filter(|value| !value.is_null()) {
+                    let per = per
+                        .as_object()
+                        .ok_or_else(|| crate::shape_error("limit.per must be an object"))?;
                     let fields = per
                         .get("attributes")
                         .and_then(Value::as_array)
-                        .ok_or("limit.per requires attributes")?;
-                    if fields.iter().any(|field| {
-                        !field
-                            .as_str()
-                            .is_some_and(|name| known_field(&self.schema, name))
-                    }) {
+                        .ok_or_else(|| crate::shape_error("limit.per requires attributes"))?;
+                    if fields.is_empty() {
+                        return Err("limit.per must contain at least one attribute".into());
+                    }
+                    if fields.iter().any(|field| !field.is_string()) {
+                        return Err(crate::shape_error("limit.per attributes must be strings"));
+                    }
+                    if fields
+                        .iter()
+                        .any(|field| !known_field(&self.schema, field.as_str().unwrap()))
+                    {
                         return Err("limit.per contains an unknown attribute".into());
+                    }
+                    let per_limit = per
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| crate::shape_error("limit.per requires an integer limit"))?;
+                    if per_limit == 0 || per_limit > v["total"].as_u64().unwrap() {
+                        return Err(
+                            "limit.per requires a positive limit no greater than total".into()
+                        );
                     }
                     for field in fields {
                         let field = field.as_str().unwrap();
-                        let included = match object.get("include_attributes") {
-                            Some(Value::Bool(true)) => true,
-                            Some(Value::Array(selected)) => selected.contains(&json!(field)),
-                            _ => object
-                                .get("exclude_attributes")
+                        let included = if field == "id" {
+                            object
+                                .get("include_attributes")
                                 .and_then(Value::as_array)
-                                .is_some_and(|excluded| !excluded.contains(&json!(field))),
+                                .is_some_and(|selected| selected.contains(&json!(field)))
+                        } else {
+                            match object.get("include_attributes") {
+                                Some(Value::Bool(true)) => true,
+                                Some(Value::Array(selected)) => selected.contains(&json!(field)),
+                                _ => object
+                                    .get("exclude_attributes")
+                                    .and_then(Value::as_array)
+                                    .is_some_and(|excluded| !excluded.contains(&json!(field))),
+                            }
                         };
-                        if field != "id" && !included {
+                        if !included {
                             return Err(format!(
                                 "limit.per attribute {field} must be included in response"
                             ));
                         }
                     }
-                    if !per
-                        .get("limit")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|n| n > 0 && n <= 10_000)
-                    {
-                        return Err("limit.per requires a positive limit".into());
-                    }
                 }
             }
             None => return Err("rank_by queries must specify top_k or limit".into()),
+            Some(Value::Number(n)) if n.as_u64().is_none() => {
+                return Err(crate::shape_error("limit must be a nonnegative integer"));
+            }
             Some(Value::Number(_)) => {
                 return Err("limit or top_k must be an integer at most 10000".into());
             }
             Some(Value::Object(v)) if v.get("total").and_then(Value::as_u64) == Some(0) => {
                 return Err("limit.total must be positive".into());
             }
+            Some(Value::Object(v))
+                if v.get("total")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|total| total > 10_000) =>
+            {
+                return Err("limit.total must be at most 10000".into());
+            }
+            Some(Value::Null) => return Err("limit must be an integer or object".into()),
             _ => return Err(crate::shape_error("limit must be an integer or object")),
+        }
+        if object.get("rank_by").is_none()
+            && object.get("offset").is_some_and(|value| !value.is_null())
+        {
+            return Err("offset requires rank_by".into());
         }
         if object
             .get("offset")
@@ -338,7 +369,10 @@ impl Namespace {
                     .or_else(|| v.get("total").and_then(Value::as_u64))
             })
             .unwrap() as usize;
-        let per = object.get("limit").and_then(|v| v.get("per"));
+        let per = object
+            .get("limit")
+            .and_then(|v| v.get("per"))
+            .filter(|value| !value.is_null());
         let mut per_counts = HashMap::<String, usize>::new();
         let rows = scored
             .into_iter()
@@ -531,14 +565,20 @@ impl Namespace {
                 }
             }
         }
-        if object.contains_key("top_k") && !object.contains_key("group_by") {
-            return Err("top_k requires group_by for aggregation".into());
-        }
-        if object
-            .get("top_k")
-            .is_some_and(|value| !value.as_u64().is_some_and(|n| n <= 10_000))
-        {
-            return Err("top_k must be an integer at most 10000".into());
+        if let Some(top_k) = object.get("top_k").filter(|value| !value.is_null()) {
+            let top_k = top_k
+                .as_u64()
+                .ok_or_else(|| crate::shape_error("top_k must be a nonnegative integer"))?;
+            if object
+                .get("group_by")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            {
+                return Err("top_k requires a nonempty group_by for aggregation".into());
+            }
+            if top_k > 10_000 {
+                return Err("top_k must be at most 10000".into());
+            }
         }
         Ok(())
     }
@@ -1110,6 +1150,9 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
     };
     operator?;
     let kind = field_type(definition);
+    if kind.starts_with("[]") && matches!(op, "Gt" | "Gte" | "Lt" | "Lte") {
+        return Err(format!("{op} cannot compare array attribute {field}"));
+    }
     let operand_kind = if matches!(
         op,
         "Contains"

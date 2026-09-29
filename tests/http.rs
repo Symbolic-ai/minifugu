@@ -88,6 +88,7 @@ async fn metadata_read_only_blocks_writes_and_is_inherited_by_branches() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
     assert_eq!(
         error["error"],
         "💔 Writes not permitted. This namespace is read-only."
@@ -742,6 +743,59 @@ async fn aggregates_match_live_grouping_edges() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["aggregations"], json!({"count":4,"sum":0.0}));
+
+    let (status, result) = post(
+        &client,
+        &query_url,
+        json!({"aggregate_by":{"count":["Count"]},"group_by":["h"],"top_k":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        result["aggregation_groups"],
+        json!([{"h":"a","count":1},{"h":"b","count":1}])
+    );
+    let (status, result) = post(
+        &client,
+        &query_url,
+        json!({"aggregate_by":{"count":["Count"]},"group_by":["h"],"top_k":0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["aggregation_groups"], json!([]));
+    let (status, _) = post(
+        &client,
+        &query_url,
+        json!({"aggregate_by":{"count":["Count"]},"group_by":["h"],"top_k":10001}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    for top_k in [json!(-1), json!("1"), json!(1.0), json!(true)] {
+        let (status, _) = post(
+            &client,
+            &query_url,
+            json!({"aggregate_by":{"count":["Count"]},"group_by":["g"],"top_k":top_k}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    for group_by in [None, Some(json!([]))] {
+        let mut query = json!({"aggregate_by":{"count":["Count"]},"top_k":0});
+        if let Some(group_by) = group_by {
+            query["group_by"] = group_by;
+        }
+        let (status, _) = post(&client, &query_url, query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let (status, result) = post(
+        &client,
+        &query_url,
+        json!({"aggregate_by":{"count":["Count"]},"top_k":null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["aggregations"]["count"], 4);
     let (status, result) = post(
         &client,
         &query_url,
@@ -831,6 +885,10 @@ async fn query_shape_errors_use_live_status_codes() {
         json!({"rank_by":["id","asc"],"limit":1,"filters":["group","In",["a",1]]}),
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","ContainsAny",[null]]}),
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","In",[["fish"]]]}),
+        json!({"rank_by":["id","asc"],"limit":1.0}),
+        json!({"rank_by":["id","asc"],"top_k":-1}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":null,"limit":1}}}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["group"],"limit":null}},"include_attributes":["group"]}),
     ] {
         let (status, body) = post(&client, &query_url, query.clone()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{query}: {body}");
@@ -845,6 +903,18 @@ async fn query_shape_errors_use_live_status_codes() {
         json!({"rank_by":["id","asc"],"limit":1,"filters":["id","In",["1"]]}),
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Contains",null]}),
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","AnyGt",null]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Gt",["a"]]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Gte",["fish"]]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Lt",["z"]]}),
+        json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Lte",["fish"]]}),
+        json!({"rank_by":["id","asc"],"limit":null}),
+        json!({"rank_by":["id","asc"],"top_k":null}),
+        json!({"limit":1,"offset":0}),
+        json!({"rank_by":["id","asc"],"limit":1,"exclude_attributes":["id"]}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":[],"limit":1}}}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["group"],"limit":2}},"include_attributes":["group"]}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["id"],"limit":1}},"include_attributes":true}),
+        json!({"rank_by":["id","asc"],"limit":{"total":10001}}),
     ] {
         assert_eq!(
             post(&client, &query_url, query).await.0,
@@ -864,6 +934,10 @@ async fn query_shape_errors_use_live_status_codes() {
     for query in [
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","In",["fish"]]}),
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","NotIn",["other"]]}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"extra":true}}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":null}}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["id"],"limit":1,"extra":true}},"include_attributes":["id"]}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["group"],"limit":1}},"include_attributes":["group"]}),
     ] {
         let (status, body) = post(&client, &query_url, query).await;
         assert_eq!(status, StatusCode::OK);
@@ -1664,18 +1738,8 @@ async fn unsupported_fields_fail_loudly() {
             StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (
-            json!({"rank_by":["id","asc"],"limit":{"total":1,"extra":true}}),
-            "unsupported limit field",
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ),
-        (
-            json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["title"],"limit":1,"extra":true}},"include_attributes":["title"]}),
-            "unsupported limit.per field",
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ),
-        (
             json!({"aggregate_by":{"count":["Count"]},"top_k":1}),
-            "top_k requires group_by",
+            "top_k requires a nonempty group_by",
             StatusCode::BAD_REQUEST,
         ),
         (
