@@ -842,6 +842,27 @@ async fn openai_mode_embeds_native_text_and_queries_it() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["rows"][0]["id"], 1);
+    // OpenAI mode cannot serve other hosted models, so their embeddings fail as an
+    // unavailable provider on both writes and queries.
+    let (status, body) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["embed_content","ANN",["Embed","fugu",{"model":"voyage/voyage-4-lite"}]],"limit":1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    let (status, body) = post(
+        &client,
+        &format!("{base}/v2/namespaces/openai-voyage"),
+        json!({
+            "schema":{"id":"uint","content":{"type":"string","embed":{"model":"voyage/voyage-4-lite","dims":256}}},
+            "distance_metric":"cosine_distance","upsert_rows":[{"id":1,"content":"fugu"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
 }
 
 #[tokio::test]

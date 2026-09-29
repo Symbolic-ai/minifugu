@@ -1974,8 +1974,9 @@ async fn namespaces_can_be_copied_and_then_diverge() {
     .await;
     let (status, result) = post(&client, &branch, json!({"branch_from_namespace":"source"})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(result["rows_affected"], 1);
-    assert_eq!(result["message"], "namespace cloned successfully");
+    // Live reports a branch as affecting no rows.
+    assert_eq!(result["rows_affected"], 0);
+    assert_eq!(result["message"], "namespace branch successful");
     let (status, result) = post(
         &client,
         &copy,
@@ -2011,8 +2012,12 @@ async fn namespaces_can_be_copied_and_then_diverge() {
     assert_eq!(source_rows["rows"].as_array().unwrap().len(), 1);
     assert_eq!(copy_rows["rows"].as_array().unwrap().len(), 1);
     assert_eq!(branch_rows["rows"].as_array().unwrap().len(), 2);
-    let (status, _) = post(&client, &branch, json!({"branch_from_namespace":"source"})).await;
-    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, body) = post(&client, &branch, json!({"branch_from_namespace":"source"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .ends_with("` already exists"));
     let origin = base.trim_end_matches("/v2/namespaces");
     let first: Value = client
         .get(format!("{origin}/v1/namespaces?page_size=2"))
@@ -2821,6 +2826,43 @@ async fn customer_managed_keys_and_copy_regions_resolve_locally() {
         .await
         .unwrap();
     assert_eq!(metadata["encryption"], json!({"sse":true}));
+    // Without a destination `encryption`, a copy keeps the source key.
+    let (status, body) = post(
+        &client,
+        &format!("{base}/cmek-inherit"),
+        json!({"copy_from_namespace":"cmek-source"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let metadata: Value = client
+        .get(format!("{base}/cmek-inherit").replace("/v2/", "/v1/") + "/metadata")
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(metadata["encryption"], json!({"cmek":{"key_name":key}}));
+    // An existing namespace accepts its current setting and rejects a change.
+    let (status, body) = post(
+        &client,
+        &format!("{base}/cmek-source"),
+        json!({"upsert_rows":[{"id":2}],"encryption":{"cmek":{"key_name":key}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &client,
+        &format!("{base}/cmek-source"),
+        json!({"upsert_rows":[{"id":3}],"encryption":{"mode":"default"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("cannot be changed on an existing namespace"));
 }
 
 #[tokio::test]

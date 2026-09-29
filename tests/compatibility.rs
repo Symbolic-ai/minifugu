@@ -1737,6 +1737,68 @@ async fn hosted_model_contract(base: &str, token: &str) {
             "💔 `acme/not-a-model` is not supported in this region, please reach out to us".into()
         )
     );
+    // A query model must be a hosted model too; any hosted model can embed a query for
+    // a vector of a supported dimension. An explicit dtype must match a named target.
+    let name = format!("minifugu-hosted-query-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let mut vector = vec![0.0; 256];
+    vector[0] = 1.0;
+    let setup = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","vector":{"type":"[256]f32","ann":true}},
+            "distance_metric":"cosine_distance","upsert_rows":[{"id":1,"vector":vector}]
+        }),
+    )
+    .await;
+    let mut queried = Vec::new();
+    for model in ["text-embedding-3-small", "voyage/voyage-4-lite"] {
+        queried.push(
+            response(
+                &client,
+                token,
+                &format!("{url}/query"),
+                json!({"rank_by":["vector","ANN",["Embed","fugu",{"model":model}]],"limit":1}),
+            )
+            .await,
+        );
+    }
+    let _ = client.delete(&url).bearer_auth(token).send().await;
+    let mismatch_url = format!(
+        "{base}/v2/namespaces/minifugu-hosted-dtype-{}",
+        Uuid::new_v4().simple()
+    );
+    let mismatch = response(
+        &client,
+        token,
+        &mismatch_url,
+        json!({
+            "schema":{"id":"uint","vector":{"type":"[256]f16","ann":true},"t":{"type":"string","embed":{
+                "model":"openai/text-embedding-3-small","dims":256,"dtype":"f32","attribute":"vector"
+            }}},
+            "distance_metric":"cosine_distance","upsert_rows":[{"id":1,"t":"fugu"}]
+        }),
+    )
+    .await;
+    let _ = client.delete(&mismatch_url).bearer_auth(token).send().await;
+    assert_eq!(setup.0, StatusCode::OK, "{setup:?}");
+    assert_eq!(
+        queried[0],
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"status":"error","error":"💔 `text-embedding-3-small` is not supported in this region, please reach out to us"})
+        )
+    );
+    assert_eq!(queried[1].0, StatusCode::OK, "{queried:?}");
+    assert_eq!(
+        mismatch,
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"status":"error","error":"💔 embedded field's dtype doesn't match the target vector"})
+        )
+    );
 }
 
 async fn encryption_and_copy_contract(base: &str, token: &str) {
@@ -1762,6 +1824,10 @@ async fn encryption_and_copy_contract(base: &str, token: &str) {
         json!({"copy_from_namespace":source,"encryption":{"mode":"default"}}),
         json!({"copy_from_namespace":source,"upsert_rows":[{"id":2}]}),
         json!({"copy_from_namespace":{"source_region":"gcp-us-central1"}}),
+        json!({"branch_from_namespace":source}),
+        json!({"branch_from_namespace":source,"encryption":{"mode":"default"}}),
+        json!({"copy_from_namespace":source,"branch_from_namespace":source}),
+        json!({"copy_from_namespace":format!("{source}-missing")}),
     ] {
         let url = format!(
             "{base}/v2/namespaces/minifugu-copy-dest-{}",
@@ -1771,6 +1837,31 @@ async fn encryption_and_copy_contract(base: &str, token: &str) {
         let _ = client.delete(&url).bearer_auth(token).send().await;
         results.push(result);
     }
+    // Copying onto itself or onto another existing namespace fails.
+    let onto_itself = response(
+        &client,
+        token,
+        &source_url,
+        json!({"copy_from_namespace":source}),
+    )
+    .await;
+    let existing = format!("minifugu-copy-existing-{}", Uuid::new_v4().simple());
+    let existing_url = format!("{base}/v2/namespaces/{existing}");
+    let existing_setup = response(
+        &client,
+        token,
+        &existing_url,
+        json!({"upsert_rows":[{"id":1}]}),
+    )
+    .await;
+    let onto_existing = response(
+        &client,
+        token,
+        &existing_url,
+        json!({"copy_from_namespace":source}),
+    )
+    .await;
+    let _ = client.delete(&existing_url).bearer_auth(token).send().await;
     let cleanup = client
         .delete(&source_url)
         .bearer_auth(token)
@@ -1778,6 +1869,21 @@ async fn encryption_and_copy_contract(base: &str, token: &str) {
         .await
         .unwrap();
     assert_eq!(setup.0, StatusCode::OK, "{setup:?}");
+    assert_eq!(existing_setup.0, StatusCode::OK, "{existing_setup:?}");
+    assert_eq!(
+        onto_itself,
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"status":"error","error":"💔 Source and destination namespace can't be the same"})
+        )
+    );
+    assert_eq!(
+        onto_existing,
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"status":"error","error":format!("💔 Destination namespace `{existing}` already exists")})
+        )
+    );
     let statuses = results
         .iter()
         .map(|(status, _)| *status)
@@ -1795,8 +1901,25 @@ async fn encryption_and_copy_contract(base: &str, token: &str) {
             StatusCode::OK,
             StatusCode::BAD_REQUEST,
             StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
         ],
         "{results:?}"
+    );
+    // Live reports a branch as affecting no rows.
+    assert_eq!(results[10].1["message"], "namespace branch successful");
+    assert_eq!(results[10].1["rows_affected"], 0);
+    for result in &results[11..13] {
+        assert_eq!(
+            result.1["error"],
+            "💔 branch_from_namespace cannot be used with other write request fields"
+        );
+    }
+    assert_eq!(
+        results[13].1["error"],
+        format!("🤷 namespace '{source}-missing' was not found")
     );
     assert_eq!(results[4].1["message"], "namespace cloned successfully");
     assert!(results[5].1["error"].as_str().is_some_and(|error| error.starts_with(

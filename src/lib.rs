@@ -454,20 +454,18 @@ async fn write(
     if !store::has_write_operations(object, guard.contains_key(&name)) {
         return Err(bad("💔 no writes provided"));
     }
-    if let Some(source) = object
-        .get("branch_from_namespace")
-        .or_else(|| object.get("copy_from_namespace"))
-    {
-        // Live lets a copy carry only a destination `encryption` setting.
-        if object.keys().any(|key| {
-            !matches!(
-                key.as_str(),
-                "branch_from_namespace" | "copy_from_namespace" | "encryption"
-            )
-        }) {
-            return Err(bad(
-                "💔 copy_from_namespace cannot be used with other write request fields",
-            ));
+    let clone_kind = ["branch_from_namespace", "copy_from_namespace"]
+        .into_iter()
+        .find(|key| object.contains_key(*key));
+    if let Some(kind) = clone_kind {
+        let source = &object[kind];
+        // A branch takes no other field; a copy may carry a destination `encryption`.
+        let allowed =
+            |key: &str| key == kind || (kind == "copy_from_namespace" && key == "encryption");
+        if object.keys().any(|key| !allowed(key)) {
+            return Err(bad(format!(
+                "💔 {kind} cannot be used with other write request fields"
+            )));
         }
         // MiniFugu is one keyless region, so a source in any live region and with any
         // source API key resolves locally. Other config keys are ignored, as they are live.
@@ -508,11 +506,13 @@ async fn write(
             .map(store::cmek_key_name)
             .transpose()
             .map_err(bad)?;
+        if source == name {
+            return Err(bad("💔 Source and destination namespace can't be the same"));
+        }
         if guard.contains_key(&name) {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "destination namespace already exists".into(),
-            ));
+            return Err(bad(format!(
+                "💔 Destination namespace `{name}` already exists"
+            )));
         }
         let mut namespace = guard.get(source).cloned().ok_or_else(|| {
             ApiError(
@@ -524,10 +524,15 @@ async fn write(
         if let Some(cmek_key_name) = encryption {
             namespace.cmek_key_name = cmek_key_name;
         }
-        let rows = namespace.rows.len();
+        // Live reports a branch as affecting no rows; a copy reports the rows it copied.
+        let (message, rows) = if kind == "branch_from_namespace" {
+            ("namespace branch successful", 0)
+        } else {
+            ("namespace cloned successfully", namespace.rows.len())
+        };
         persist_namespace(&state, &mut guard, name, namespace)?;
         return Ok(Json(
-            json!({"status":"OK","message":"namespace cloned successfully","rows_affected":rows,"billing":{"billable_logical_bytes_written":0}}),
+            json!({"status":"OK","message":message,"rows_affected":rows,"billing":{"billable_logical_bytes_written":0}}),
         ));
     }
     if !guard.contains_key(&name)
@@ -543,10 +548,18 @@ async fn write(
         ));
     }
     let mut namespace = guard.get(&name).cloned().unwrap_or_default();
-    // A new namespace takes its customer-managed key from the creating write.
-    if !guard.contains_key(&name) {
-        if let Some(encryption) = object.get("encryption") {
-            namespace.cmek_key_name = store::cmek_key_name(encryption).map_err(bad)?;
+    // A new namespace takes its customer-managed key from the creating write. On an
+    // existing namespace, live accepts its current setting; whether live applies a
+    // different key cannot be checked without a cloud KMS, so MiniFugu rejects it
+    // rather than drop it silently.
+    if let Some(encryption) = object.get("encryption") {
+        let key_name = store::cmek_key_name(encryption).map_err(bad)?;
+        if !guard.contains_key(&name) {
+            namespace.cmek_key_name = key_name;
+        } else if key_name != namespace.cmek_key_name {
+            return Err(bad(
+                "encryption cannot be changed on an existing namespace in MiniFugu",
+            ));
         }
     }
     if namespace.read_only {

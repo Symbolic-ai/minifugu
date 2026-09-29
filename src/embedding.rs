@@ -80,9 +80,11 @@ impl EmbeddingMode {
         match self {
             Self::Deterministic => Ok(deterministic_embedding(text, dims)),
             Self::OpenAI { api_key, base_url } => {
+                // Other hosted models are valid schema models that this provider cannot
+                // serve, so the request fails as an unavailable provider (HTTP 502).
                 let model = model
                     .strip_prefix("openai/")
-                    .ok_or(EmbeddingError::InvalidModel)?;
+                    .ok_or(EmbeddingError::Unavailable)?;
                 let response = reqwest::Client::new()
                     .post(format!("{}/v1/embeddings", base_url.trim_end_matches('/')))
                     .bearer_auth(api_key)
@@ -306,6 +308,11 @@ fn collect_query_embeddings(
                 .ok_or(
                     "a model name must be provided when ranking a vector by an embedding query",
                 )?;
+            if model_dimensions(model).is_none() {
+                return Err(format!(
+                    "💔 `{model}` is not supported in this region, please reach out to us"
+                ));
+            }
             requests.push(QueryEmbedding {
                 pointer: pointer.to_owned(),
                 target,
