@@ -1047,17 +1047,9 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
     }
     if matches!(op, "Glob" | "NotGlob" | "IGlob" | "NotIGlob" | "Regex") {
         let kind = field_type(&schema[field]);
-        if parts.len() != 3
-            || (op == "Regex" && kind != "string")
-            || (op != "Regex" && !matches!(kind, "string" | "[]string"))
-        {
+        if parts.len() != 3 || !matches!(kind, "string" | "[]string") {
             return Err(format!(
-                "{op} requires a string{} attribute and a three-part filter",
-                if op == "Regex" {
-                    ""
-                } else {
-                    " or string-array"
-                }
+                "{op} requires a string or string-array attribute and a three-part filter"
             ));
         }
         let capability = if op == "Regex" { "regex" } else { "glob" };
@@ -1344,9 +1336,16 @@ pub(crate) fn filter_matches(
                 matches
             }
         }
-        "Regex" => left
-            .as_str()
-            .is_some_and(|text| Regex::new(right.as_str().unwrap()).unwrap().is_match(text)),
+        "Regex" => {
+            let regex = Regex::new(right.as_str().unwrap()).unwrap();
+            match left {
+                Value::String(text) => regex.is_match(text),
+                Value::Array(values) => values
+                    .iter()
+                    .any(|value| value.as_str().is_some_and(|text| regex.is_match(text))),
+                _ => false,
+            }
+        }
         "Fuzzy" => fuzzy_matches(left, right.as_str().unwrap(), &parts[3]),
         _ => false,
     }

@@ -761,6 +761,7 @@ async fn local_contract() {
     gap_contract(&format!("http://{address}"), "dummy").await;
     ann_contract(&format!("http://{address}"), "dummy").await;
     null_sort_contract(&format!("http://{address}"), "dummy").await;
+    regex_array_contract(&format!("http://{address}"), "dummy").await;
 }
 
 #[tokio::test]
@@ -779,6 +780,7 @@ async fn optional_real_turbopuffer_contract() {
     gap_contract(base.trim_end_matches('/'), &token).await;
     ann_contract(base.trim_end_matches('/'), &token).await;
     null_sort_contract(base.trim_end_matches('/'), &token).await;
+    regex_array_contract(base.trim_end_matches('/'), &token).await;
 }
 
 async fn null_sort_contract(base: &str, token: &str) {
@@ -830,6 +832,54 @@ async fn null_sort_contract(base: &str, token: &str) {
     for (rank, expected, status, reply) in results.expect("null-sort query failed") {
         assert_eq!(status, StatusCode::OK, "rank {rank}: {reply}");
         assert_eq!(ids(&reply), expected, "rank {rank}");
+    }
+}
+
+async fn regex_array_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-regex-array-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let write = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","tags":{"type":"[]string","regex":true,"filterable":true}},
+            "upsert_rows":[
+                {"id":1,"tags":["apple","fish"]},
+                {"id":2,"tags":["whale"]},
+                {"id":3,"tags":[]},
+                {"id":4},
+                {"id":5,"tags":[""]},
+                {"id":6,"tags":null}
+            ]
+        }),
+    )
+    .await;
+    let cases = [
+        ("^fish$", vec![1]),
+        ("apple.*fish", vec![]),
+        ("^$", vec![5]),
+        ("(?i)^WHALE$", vec![2]),
+        ("^a", vec![1]),
+    ];
+    let mut results = Vec::new();
+    for (pattern, expected) in cases {
+        let (status, reply) = response(
+            &client,
+            token,
+            &format!("{url}/query"),
+            json!({"rank_by":["id","asc"],"filters":["tags","Regex",pattern],"limit":10}),
+        )
+        .await;
+        results.push((pattern, expected, status, reply));
+    }
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(write.0, StatusCode::OK, "regex-array write: {}", write.1);
+    assert_eq!(cleanup.status(), StatusCode::OK);
+    for (pattern, expected, status, reply) in results {
+        assert_eq!(status, StatusCode::OK, "regex {pattern}: {reply}");
+        assert_eq!(ids(&reply), expected, "regex {pattern}");
     }
 }
 
