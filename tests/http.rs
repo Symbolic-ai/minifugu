@@ -1999,13 +1999,19 @@ async fn namespaces_can_be_copied_and_then_diverge() {
         .unwrap();
     assert_eq!(after_exact["namespaces"], json!([]));
     assert!(after_exact["next_cursor"].is_null());
-    for cursor in ["source", "e30=", "!!", ""] {
-        let response = client
-            .get(format!("{origin}/v1/namespaces?cursor={cursor}"))
-            .bearer_auth("dummy")
-            .send()
-            .await
-            .unwrap();
+    let malformed = [
+        "source".to_owned(),
+        "e30=".to_owned(),
+        String::new(),
+        STANDARD.encode(json!([1]).to_string()),
+        STANDARD.encode(json!({"continuation_token":"x","start_after":"a-table/"}).to_string()),
+        STANDARD.encode(json!({"continuation_token":null,"start_after":"a"}).to_string()),
+        STANDARD.encode(json!({"continuation_token":null,"start_after":"-table/"}).to_string()),
+    ];
+    for cursor in malformed {
+        let mut url = reqwest::Url::parse(&format!("{origin}/v1/namespaces")).unwrap();
+        url.query_pairs_mut().append_pair("cursor", &cursor);
+        let response = client.get(url).bearer_auth("dummy").send().await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
     let prefix: Value = client

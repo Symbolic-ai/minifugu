@@ -192,6 +192,8 @@ async fn list_namespaces(
     names.sort();
     let next_cursor = (names.len() >= page_size).then(|| {
         let last = names[page_size - 1];
+        // Keep the live STANDARD encoding. Valid namespace names and the fixed JSON
+        // envelope are ASCII bytes that cannot produce '+' or '/' in base64.
         STANDARD.encode(
             serde_json::to_vec(&json!({
                 "continuation_token": null,
