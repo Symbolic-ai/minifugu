@@ -560,6 +560,29 @@ impl Namespace {
                     if is_fixed_vector(definition) && row.get(field).is_none_or(Value::is_null) {
                         return Err(format!("upsert row requires vector attribute {field}").into());
                     }
+                    if vector::multi_dimensions(definition).is_some() {
+                        match row.get(field) {
+                            None => {
+                                return Err(format!(
+                                    "💔 missing writes for vector array attribute \"{field}\""
+                                )
+                                .into());
+                            }
+                            Some(Value::Null) => {
+                                return Err(format!(
+                                    "💔 vector array attribute \"{field}\" must not be null"
+                                )
+                                .into());
+                            }
+                            Some(Value::Array(vectors)) if vectors.is_empty() => {
+                                return Err(format!(
+                                    "💔 vector array attribute \"{field}\" must have at least one vector"
+                                )
+                                .into());
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 for (field, value) in &row {
                     validate_attribute_name(field)?;
