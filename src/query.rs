@@ -1986,31 +1986,32 @@ fn dense_distance(query: &[Value], vector: &[Value], metric: &str) -> f64 {
         return f64::INFINITY;
     }
     if metric == "euclidean_squared" {
-        return vector
+        let distance: f32 = vector
             .iter()
             .zip(query)
-            .map(|(a, b)| (a.as_f64().unwrap() - b.as_f64().unwrap()).powi(2))
+            .map(|(a, b)| (a.as_f64().unwrap() as f32 - b.as_f64().unwrap() as f32).powi(2))
             .sum();
+        return f64::from(distance);
     }
-    let dot: f64 = vector
+    let dot: f32 = vector
         .iter()
         .zip(query)
-        .map(|(a, b)| a.as_f64().unwrap() * b.as_f64().unwrap())
+        .map(|(a, b)| a.as_f64().unwrap() as f32 * b.as_f64().unwrap() as f32)
         .sum();
     let norm_a = vector
         .iter()
-        .map(|a| a.as_f64().unwrap().powi(2))
-        .sum::<f64>()
+        .map(|a| (a.as_f64().unwrap() as f32).powi(2))
+        .sum::<f32>()
         .sqrt();
     let norm_b = query
         .iter()
-        .map(|a| a.as_f64().unwrap().powi(2))
-        .sum::<f64>()
+        .map(|a| (a.as_f64().unwrap() as f32).powi(2))
+        .sum::<f32>()
         .sqrt();
     if norm_a == 0.0 || norm_b == 0.0 {
         f64::INFINITY
     } else {
-        1.0 - dot / norm_a / norm_b
+        f64::from(1.0 - dot / (norm_a * norm_b))
     }
 }
 

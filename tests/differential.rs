@@ -77,7 +77,9 @@ fn compare_write(
 }
 
 fn comparable(body: &Value) -> Value {
-    if body.get("rows").is_some() {
+    if let Some(results) = body.get("results").and_then(Value::as_array) {
+        json!({"results":results.iter().map(comparable).collect::<Vec<_>>()})
+    } else if body.get("rows").is_some() {
         json!({"rows":body["rows"]})
     } else if body.get("aggregation_groups").is_some() {
         json!({"aggregation_groups":body["aggregation_groups"]})
@@ -140,7 +142,8 @@ fn scenario(seed: u64) -> (Value, Vec<Value>) {
                 "score":generator.next(20) as i64,
                 "weight":generator.next(20) as f64 / 2.0,
                 "tags":tags,
-                "vector":[(1 + generator.next(9)) as f64 / 10.0,(1 + generator.next(9)) as f64 / 10.0]
+                "vector":[(1 + generator.next(9)) as f64 / 10.0,(1 + generator.next(9)) as f64 / 10.0],
+                "sparse":{"fugu":0.123456789 + id as f64 / 100.0,"sea":0.3333333}
             })
         })
         .collect::<Vec<_>>();
@@ -153,7 +156,8 @@ fn scenario(seed: u64) -> (Value, Vec<Value>) {
             "id":"uint","title":{"type":"string","full_text_search":{"k1":1.8,"b":0.3}},
             "group":"string","score":"int","weight":"float",
             "tags":{"type":"[]string","glob":true,"filterable":true},
-            "vector":{"type":"[2]f32","ann":true}
+            "vector":{"type":"[2]f32","ann":true},
+            "sparse":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}}
         },
         "upsert_rows":rows
     });
@@ -190,6 +194,7 @@ fn scenario(seed: u64) -> (Value, Vec<Value>) {
         json!({"rank_by":["id","asc"],"limit":12,"compute_attributes":{"fugu_score":["title","BM25","fugu"]}}),
         json!({"aggregate_by":{"count":["Count"]},"group_by":[{"tag":["ForEachUnique","tags"]},"group"]}),
         json!({"rank_by":["vector","kNN",[0.2,0.7]],"filters":["id","Gte",1],"limit":5,"include_attributes":["vector"]}),
+        json!({"rank_by":["sparse","SparseKNN",{"fugu":1.0}],"limit":8,"include_attributes":["sparse"]}),
     ];
     (write, queries)
 }
@@ -237,6 +242,29 @@ async fn generated_queries_match_live() {
                     failures.push(format!(
                         "seed {seed} query {index} {query}: local {} {local_value}, live {} {live_value}",
                         local.0, live.0
+                    ));
+                }
+            }
+            let subqueries = json!([
+                {"rank_by":["title","BM25","fugu"],"limit":8},
+                {"rank_by":["vector","ANN",[0.2,0.7]],"limit":8}
+            ]);
+            for (index, query) in [
+                json!({"queries":subqueries}),
+                json!({"queries":subqueries,"rerank_by":["RRF",{"weights":[2,1],"rank_constant":10}],"limit":8}),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let local = call(&client, "local", &format!("{local_url}/query"), query).await;
+                let live = call(&client, &live_token, &format!("{live_url}/query"), query).await;
+                if local.0 != live.0 || !same_value(&comparable(&local.1), &comparable(&live.1)) {
+                    failures.push(format!(
+                        "seed {seed} multiquery {index}: local {} {}, live {} {}",
+                        local.0,
+                        comparable(&local.1),
+                        live.0,
+                        comparable(&live.1)
                     ));
                 }
             }

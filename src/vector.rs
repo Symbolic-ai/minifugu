@@ -161,6 +161,29 @@ fn normalize_array_value(value: &Value, definition: &Value) -> Result<Option<Val
             Ok(float_value(number))
         }
     };
+    if kind == "{}f16" {
+        return value
+            .as_object()
+            .map(|weights| {
+                weights
+                    .iter()
+                    .map(|(token, weight)| {
+                        let number = weight
+                            .as_f64()
+                            .ok_or("sparse vector weights must be numbers")?
+                            as f32;
+                        let rounded = f16::from_f32(number).to_f32();
+                        if !rounded.is_finite() {
+                            return Err("sparse vector weight is out of range".into());
+                        }
+                        Ok((token.clone(), float_value(rounded)))
+                    })
+                    .collect::<Result<Map<_, _>, String>>()
+                    .map(|weights| Some(Value::Object(weights)))
+            })
+            .transpose()
+            .map(Option::flatten);
+    }
     if dimensions(definition).is_some() {
         return value
             .as_array()

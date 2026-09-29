@@ -615,7 +615,7 @@ async fn dense_vectors_cannot_be_patched_but_sparse_vectors_can() {
     assert_eq!(post(&client, &url, json!({
         "distance_metric":"cosine_distance",
         "schema":{"id":"uint","vector":{"type":"[2]f32","ann":true},"s":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}}},
-        "upsert_rows":[{"id":1,"vector":[1,0],"s":{"a":1}}]
+        "upsert_rows":[{"id":1,"vector":[1,0],"s":{"a":0.123456789}}]
     })).await.0, StatusCode::OK);
     assert_eq!(
         post(&client, &url, json!({"upsert_rows":[{"id":2,"s":{"a":1}}]}))
@@ -634,6 +634,13 @@ async fn dense_vectors_cannot_be_patched_but_sparse_vectors_can() {
         .await
         .unwrap();
     assert!(schema["vector"]["filterable"].is_null());
+    let (_, initial) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["id","asc"],"limit":1,"include_attributes":true}),
+    )
+    .await;
+    assert_eq!(initial["rows"][0]["s"]["a"], json!(0.12347412));
     assert_eq!(
         post(
             &client,
@@ -655,9 +662,13 @@ async fn dense_vectors_cannot_be_patched_but_sparse_vectors_can() {
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        post(&client, &url, json!({"patch_rows":[{"id":1,"s":{"a":2}}]}))
-            .await
-            .0,
+        post(
+            &client,
+            &url,
+            json!({"patch_rows":[{"id":1,"s":{"a":0.654321}}]})
+        )
+        .await
+        .0,
         StatusCode::OK
     );
     let (_, result) = post(
@@ -667,7 +678,7 @@ async fn dense_vectors_cannot_be_patched_but_sparse_vectors_can() {
     )
     .await;
     assert_eq!(result["rows"][0]["vector"], json!([1.0, 0.0]));
-    assert_eq!(result["rows"][0]["s"]["a"], 2.0);
+    assert_eq!(result["rows"][0]["s"]["a"], json!(0.6542969));
 }
 
 #[tokio::test]
