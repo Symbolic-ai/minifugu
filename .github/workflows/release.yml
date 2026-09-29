@@ -18,6 +18,8 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     environment: release
+    # Release Please writes with the minted App token, not GITHUB_TOKEN.
+    # A new step that writes with GITHUB_TOKEN must widen this block.
     permissions:
       contents: read
     outputs:
