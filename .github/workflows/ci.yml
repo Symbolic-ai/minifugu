@@ -20,6 +20,19 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --locked
       - run: cargo doc --no-deps --locked
+  release-targets:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.98.0'
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
   live-parity:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: rust
