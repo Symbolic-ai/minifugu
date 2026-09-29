@@ -14,23 +14,30 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
     outputs:
       released: ${{ steps.resolve.outputs.released }}
       tag: ${{ steps.resolve.outputs.tag }}
     steps:
-      - name: Require release-management token
-        if: github.event_name == 'push' || inputs.tag == ''
-        env:
-          RELEASE_PLEASE_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-        run: test -n "$RELEASE_PLEASE_TOKEN"
       - uses: googleapis/release-please-action@v5
         if: github.event_name == 'push' || inputs.tag == ''
         id: release
         with:
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+      # PRs created with GITHUB_TOKEN do not trigger pull_request workflows.
+      - name: Run CI on the release PR
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRS: ${{ steps.release.outputs.prs }}
+        run: |
+          jq -r '.[].headBranchName' <<< "$PRS" | while IFS= read -r branch; do
+            gh workflow run ci.yml --ref "$branch"
+          done
       - name: Resolve release tag
         id: resolve
         env:
