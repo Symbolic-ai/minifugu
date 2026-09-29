@@ -69,12 +69,13 @@ impl Namespace {
             let kind = field_type(definition);
             let mut attribute = Map::new();
             attribute.insert("type".into(), json!(kind));
-            let filterable = (field != "id").then(|| {
-                definition
-                    .get("filterable")
-                    .and_then(Value::as_bool)
-                    .unwrap_or_else(|| default_filterable(definition))
-            });
+            let filterable = (field != "id" && !(field == "vector" && is_fixed_vector(definition)))
+                .then(|| {
+                    definition
+                        .get("filterable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or_else(|| default_filterable(definition))
+                });
             let full_text_search = definition
                 .get("full_text_search")
                 .filter(|config| config.is_object() || **config == json!(true))
@@ -311,6 +312,7 @@ impl Namespace {
         let object = normalized
             .as_object()
             .ok_or("write body must be an object")?;
+        validate_distinct_document_ids(object)?;
         for (flag, operation) in [
             ("delete_by_filter_allow_partial", "delete_by_filter"),
             ("patch_by_filter_allow_partial", "patch_by_filter"),
@@ -477,6 +479,11 @@ impl Namespace {
                 ) {
                     continue;
                 }
+                for (field, definition) in &self.schema {
+                    if is_fixed_vector(definition) && !row.contains_key(field) {
+                        return Err(format!("upsert row requires vector attribute {field}").into());
+                    }
+                }
                 for (field, value) in &row {
                     validate_attribute_name(field)?;
                     // `[]unknown` comes from an empty array; the first non-empty array
@@ -554,10 +561,44 @@ impl Namespace {
             if has_embed(definition) {
                 return Err(format!("patching embedded attribute {field} is unsupported").into());
             }
+            if vector::dimensions(definition).is_some()
+                || vector::multi_dimensions(definition).is_some()
+            {
+                return Err("💔 patching vectors is currently unsupported".into());
+            }
             validate_value(field, value, definition)?;
         }
         Ok(())
     }
+}
+
+fn validate_distinct_document_ids(object: &Map<String, Value>) -> Result<(), WriteError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut duplicates = 0;
+    if let Some(deletes) = object.get("deletes") {
+        for id in deletes.as_array().ok_or("deletes must be an array")? {
+            if !seen.insert(id_key(id)?) {
+                duplicates += 1;
+            }
+        }
+    }
+    for (rows, columns) in [
+        ("patch_rows", "patch_columns"),
+        ("upsert_rows", "upsert_columns"),
+    ] {
+        if let Some(documents) = write_rows(object, rows, columns)? {
+            for document in documents {
+                let id = document.get("id").ok_or("write row requires id")?;
+                if !seen.insert(id_key(id)?) {
+                    duplicates += 1;
+                }
+            }
+        }
+    }
+    if duplicates > 0 {
+        return Err(format!("💔 This upsert contains {duplicates} duplicate document IDs and was not written. You should ensure that individual upserts do not include duplicate documents.").into());
+    }
+    Ok(())
 }
 
 fn condition_matches(

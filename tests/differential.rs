@@ -139,7 +139,8 @@ fn scenario(seed: u64) -> (Value, Vec<Value>) {
                 "group":groups[generator.next(groups.len())],
                 "score":generator.next(20) as i64,
                 "weight":generator.next(20) as f64 / 2.0,
-                "tags":tags
+                "tags":tags,
+                "vector":[(1 + generator.next(9)) as f64 / 10.0,(1 + generator.next(9)) as f64 / 10.0]
             })
         })
         .collect::<Vec<_>>();
@@ -147,10 +148,12 @@ fn scenario(seed: u64) -> (Value, Vec<Value>) {
     let group = groups[generator.next(groups.len())];
     let term = ["fugu", "whale", "sea"][generator.next(3)];
     let write = json!({
+        "distance_metric":"cosine_distance",
         "schema":{
             "id":"uint","title":{"type":"string","full_text_search":{"k1":1.8,"b":0.3}},
             "group":"string","score":"int","weight":"float",
-            "tags":{"type":"[]string","glob":true,"filterable":true}
+            "tags":{"type":"[]string","glob":true,"filterable":true},
+            "vector":{"type":"[2]f32","ann":true}
         },
         "upsert_rows":rows
     });
@@ -186,6 +189,7 @@ fn scenario(seed: u64) -> (Value, Vec<Value>) {
         json!({"rank_by":["id","asc"],"limit":5,"offset":2}),
         json!({"rank_by":["id","asc"],"limit":12,"compute_attributes":{"fugu_score":["title","BM25","fugu"]}}),
         json!({"aggregate_by":{"count":["Count"]},"group_by":[{"tag":["ForEachUnique","tags"]},"group"]}),
+        json!({"rank_by":["vector","kNN",[0.2,0.7]],"filters":["id","Gte",1],"limit":5,"include_attributes":["vector"]}),
     ];
     (write, queries)
 }
@@ -247,6 +251,7 @@ async fn generated_queries_match_live() {
                 json!({"patch_by_filter":{"filters":["group","Eq","z"],"patch":{"tags":null}},"return_affected_ids":true}),
                 json!({"patch_columns":{"id":[1,2],"group":["col-1","col-2"]},"return_affected_ids":true}),
                 json!({"upsert_columns":{"id":[14,15],"title":["column fugu","column whale"],"group":["c","d"],"score":[1,2],"weight":[1.0,2.0],"tags":[[],["fish"]]},"return_affected_ids":true}),
+                json!({"upsert_rows":[{"id":16,"title":"first"},{"id":16,"title":"duplicate"}]}),
             ];
             let snapshot = json!({"rank_by":["id","asc"],"limit":20,"include_attributes":true});
             for (index, change) in changes.iter().enumerate() {

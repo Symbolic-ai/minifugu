@@ -565,6 +565,140 @@ async fn schema_object_updates_merge_options_and_shorthand_resets_them() {
 }
 
 #[tokio::test]
+async fn duplicate_explicit_ids_reject_the_entire_write() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/duplicate-ids");
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"upsert_rows":[{"id":1,"n":1},{"id":2,"n":2}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for body in [
+        json!({"upsert_rows":[{"id":3,"n":3},{"id":3,"n":4}]}),
+        json!({"patch_rows":[{"id":1,"n":3},{"id":1,"n":4}]}),
+        json!({"deletes":[1,1]}),
+        json!({"deletes":[1],"upsert_rows":[{"id":1,"n":5}]}),
+        json!({"patch_rows":[{"id":1,"n":5}],"upsert_rows":[{"id":1,"n":6}]}),
+    ] {
+        assert_eq!(post(&client, &url, body).await.0, StatusCode::BAD_REQUEST);
+    }
+    let (_, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["id","asc"],"limit":10,"include_attributes":true}),
+    )
+    .await;
+    assert_eq!(result["rows"], json!([{"id":1,"n":1},{"id":2,"n":2}]));
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"delete_by_filter":["id","Eq",1],"upsert_rows":[{"id":1,"n":9}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn dense_vectors_cannot_be_patched_but_sparse_vectors_can() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/vector-patches");
+    assert_eq!(post(&client, &url, json!({
+        "distance_metric":"cosine_distance",
+        "schema":{"id":"uint","vector":{"type":"[2]f32","ann":true},"s":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}}},
+        "upsert_rows":[{"id":1,"vector":[1,0],"s":{"a":1}}]
+    })).await.0, StatusCode::OK);
+    assert_eq!(
+        post(&client, &url, json!({"upsert_rows":[{"id":2,"s":{"a":1}}]}))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let origin = base.trim_end_matches("/v2/namespaces");
+    let schema: Value = client
+        .get(format!("{origin}/v1/namespaces/vector-patches/schema"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(schema["vector"]["filterable"].is_null());
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"patch_rows":[{"id":1,"vector":[0,1]}]})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"patch_by_filter":{"filters":["id","Eq",1],"patch":{"vector":[0,1]}}})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post(&client, &url, json!({"patch_rows":[{"id":1,"s":{"a":2}}]}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (_, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["id","asc"],"limit":10,"include_attributes":true}),
+    )
+    .await;
+    assert_eq!(result["rows"][0]["vector"], json!([1.0, 0.0]));
+    assert_eq!(result["rows"][0]["s"]["a"], 2.0);
+}
+
+#[tokio::test]
+async fn vector_arrays_round_to_their_stored_element_width() {
+    let base = server().await;
+    let client = Client::new();
+    for (kind, input, expected) in [
+        ("f32", json!([1, 0.123456789]), json!([1.0, 0.12345679])),
+        ("f16", json!([1, 0.123456789]), json!([1.0, 0.12347412])),
+        ("i8", json!([1.0, 2.0]), json!([1, 2])),
+    ] {
+        let url = format!("{base}/vector-width-{kind}");
+        let mut body = json!({"distance_metric":"cosine_distance","schema":{"id":"uint","vector":{"type":format!("[2]{kind}"),"ann":true}}});
+        if kind == "f16" {
+            body["upsert_columns"] = json!({"id":[1],"vector":[input]});
+        } else {
+            body["upsert_rows"] = json!([{"id":1,"vector":input}]);
+        }
+        assert_eq!(post(&client, &url, body).await.0, StatusCode::OK);
+        let (status, result) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({"rank_by":["id","asc"],"limit":1,"include_attributes":["vector"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result["rows"][0]["vector"], expected, "{kind}");
+    }
+}
+
+#[tokio::test]
 async fn aggregates_match_live_grouping_edges() {
     let base = server().await;
     let client = Client::new();
