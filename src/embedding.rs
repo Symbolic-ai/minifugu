@@ -283,11 +283,13 @@ fn collect_query_embeddings(
                     embedding_target(field, config),
                     config.get("dims").and_then(Value::as_u64).unwrap_or(1536) as usize,
                 )
-            } else if let Some(base) = field.strip_prefix("embed_") {
-                let config = schema
-                    .get(base)
-                    .and_then(|definition| definition.get("embed"))
-                    .ok_or_else(|| format!("attribute {field} is not a vector"))?;
+            } else if let Some(config) = field
+                .strip_prefix("embed_")
+                .and_then(|base| Some((base, schema.get(base)?.get("embed")?)))
+                // A source with a named target does not write embed_<source>.
+                .filter(|(base, config)| embedding_target(base, config) == field)
+                .map(|(_, config)| config)
+            {
                 (
                     field.to_owned(),
                     config.get("dims").and_then(Value::as_u64).unwrap_or(1536) as usize,

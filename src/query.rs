@@ -1775,7 +1775,9 @@ pub(crate) fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result
             }
             if operator == "ANN"
                 && !field.starts_with("embed_")
-                && schema[field].get("ann") != Some(&Value::Bool(true))
+                && !schema[field]
+                    .get("ann")
+                    .is_some_and(|ann| ann == &Value::Bool(true) || ann.is_object())
             {
                 return Err(format!("attribute {field} does not enable ANN"));
             }
