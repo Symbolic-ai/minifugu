@@ -1,7 +1,14 @@
 <p align="center"><img src="assets/logo.svg" alt="MiniFugu pixel-art fish logo" width="160"></p>
 <h1 align="center">MiniFugu</h1>
 <p align="center">A small, persistent, keyless Turbopuffer API emulator in Rust.</p>
-<p align="center"><a href="https://github.com/Symbolic-ai/minifugu/actions/workflows/ci.yml"><img src="https://github.com/Symbolic-ai/minifugu/actions/workflows/ci.yml/badge.svg" alt="CI"></a> <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a> <img src="https://img.shields.io/badge/Rust-1.98%2B-orange.svg" alt="Rust 1.98 or newer"></p>
+<p align="center">
+  <a href="https://crates.io/crates/minifugu"><img src="https://img.shields.io/crates/v/minifugu.svg" alt="crates.io version"></a>
+  <a href="https://docs.rs/minifugu"><img src="https://docs.rs/minifugu/badge.svg" alt="docs.rs documentation"></a>
+  <a href="https://github.com/Symbolic-ai/minifugu/releases"><img src="https://img.shields.io/github/v/release/Symbolic-ai/minifugu" alt="GitHub release"></a>
+  <a href="https://github.com/Symbolic-ai/minifugu/actions/workflows/ci.yml"><img src="https://github.com/Symbolic-ai/minifugu/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/Rust-1.98%2B-orange.svg" alt="Rust 1.98 or newer">
+</p>
 
 MiniFugu lets local apps and CI exercise real HTTP writes, schema validation, filters, vector search, and text search without a Turbopuffer account. It ranks small collections with **exact dense and sparse vector search**, **late-interaction multi-vector search**, and **BM25**. It accepts any nonempty bearer token; no network service or API key is needed in its default mode.
 
@@ -9,7 +16,7 @@ MiniFugu is an independent open source project and is not affiliated with Turbop
 
 ## Install
 
-After the first release, install from [crates.io](https://crates.io/crates/minifugu) with `cargo install minifugu --locked`, or download a binary from [GitHub Releases](https://github.com/Symbolic-ai/minifugu/releases). The crate's library documentation appears on [docs.rs](https://docs.rs/minifugu). Maintainers: see the [release process](docs/releases.md).
+Install from [crates.io](https://crates.io/crates/minifugu) with `cargo install minifugu --locked`, or download a binary from [GitHub Releases](https://github.com/Symbolic-ai/minifugu/releases). The crate's library documentation is on [docs.rs](https://docs.rs/minifugu). Maintainers: see the [release process](docs/releases.md).
 
 ## Quick start
 
