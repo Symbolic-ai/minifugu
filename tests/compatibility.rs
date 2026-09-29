@@ -765,6 +765,7 @@ async fn local_contract() {
     inferred_vector_contract(&format!("http://{address}"), "dummy").await;
     embedded_write_contract(&format!("http://{address}"), "dummy").await;
     vector_lifecycle_contract(&format!("http://{address}"), "dummy").await;
+    embedding_target_contract(&format!("http://{address}"), "dummy").await;
     embed_schema_contract(&format!("http://{address}"), "dummy").await;
     sort_validation_contract(&format!("http://{address}"), "dummy").await;
     query_embed_contract(&format!("http://{address}"), "dummy").await;
@@ -792,6 +793,7 @@ async fn optional_real_turbopuffer_contract() {
     inferred_vector_contract(base.trim_end_matches('/'), &token).await;
     embedded_write_contract(base.trim_end_matches('/'), &token).await;
     vector_lifecycle_contract(base.trim_end_matches('/'), &token).await;
+    embedding_target_contract(base.trim_end_matches('/'), &token).await;
     embed_schema_contract(base.trim_end_matches('/'), &token).await;
     sort_validation_contract(base.trim_end_matches('/'), &token).await;
     query_embed_contract(base.trim_end_matches('/'), &token).await;
@@ -1167,6 +1169,247 @@ async fn embed_schema_contract(base: &str, token: &str) {
         assert_eq!(update.0, StatusCode::OK, "embed update: {}", update.1);
         assert_eq!(schema["embed_narrow"]["type"], "[256]f16");
     }
+}
+
+async fn embedding_target_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-embed-target-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let schema_url = format!("{base}/v1/namespaces/{name}/schema");
+    let metadata_url = format!("{base}/v1/namespaces/{name}/metadata");
+    let setup = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","text":{"type":"string","embed":{
+                "model":"openai/text-embedding-3-small","dims":256,"attribute":"vector"
+            }}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"text":"pufferfish"},{"id":2,"text":"blue whale"}]
+        }),
+    )
+    .await;
+    let schema: Value = client
+        .get(&schema_url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let metadata: Value = client
+        .get(&metadata_url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let query = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["text","ANN",["Embed","pufferfish"]],"limit":2
+        }),
+    )
+    .await;
+    let mut vector = vec![0.0; 256];
+    vector[0] = 1.0;
+    let explicit = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "upsert_rows":[{"id":3,"vector":vector}]
+        }),
+    )
+    .await;
+    let projection = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["id","asc"],"limit":3,"include_attributes":["id","text","vector"]
+        }),
+    )
+    .await;
+    let null_target = response(
+        &client,
+        token,
+        &url,
+        json!({"upsert_rows":[{"id":4,"text":"sea urchin","vector":null}]}),
+    )
+    .await;
+    let null_projection = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "filters":["id","Eq",4],"rank_by":["id","asc"],"limit":1,
+            "include_attributes":["vector"]
+        }),
+    )
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    // Reusing declared vectors: object-form `ann`, f16, the wrong dimensions, and an
+    // eighth vector column that the named target reuses rather than adds.
+    let target = |attribute: &str| {
+        json!({"type":"string","embed":{
+            "model":"openai/text-embedding-3-small","dims":256,"attribute":attribute
+        }})
+    };
+    let mut seven = serde_json::Map::new();
+    let mut seven_values = serde_json::Map::new();
+    for index in 0..7 {
+        seven.insert(format!("v{index}"), json!({"type":"[2]f32","ann":true}));
+        seven_values.insert(format!("v{index}"), json!([1.0, 0.0]));
+    }
+    let mut eight = seven.clone();
+    eight.insert("vector".into(), json!({"type":"[256]f16","ann":true}));
+    eight.insert("id".into(), json!("uint"));
+    eight.insert("t".into(), target("vector"));
+    let mut eight_row = seven_values.clone();
+    eight_row.insert("id".into(), json!(1));
+    eight_row.insert("t".into(), json!("sea urchin"));
+    let mut reuse = Vec::new();
+    for (schema, row, query) in [
+        (
+            json!({"id":"uint","vector":{"type":"[256]f32","ann":{"distance_metric":"cosine_distance"}},"t":target("vector")}),
+            json!({"id":1,"t":"sea urchin"}),
+            Some(json!({"rank_by":["t","ANN",["Embed","sea urchin"]],"limit":1})),
+        ),
+        (
+            json!({"id":"uint","vector":{"type":"[256]f16","ann":true},"t":target("vector")}),
+            json!({"id":1,"t":"sea urchin"}),
+            None,
+        ),
+        (
+            json!({"id":"uint","vector":{"type":"[128]f32","ann":true},"t":target("vector")}),
+            json!({"id":1,"t":"sea urchin"}),
+            None,
+        ),
+        (Value::Object(eight), Value::Object(eight_row), None),
+    ] {
+        let reuse_url = format!(
+            "{base}/v2/namespaces/minifugu-embed-target-reuse-{}",
+            Uuid::new_v4().simple()
+        );
+        let write = response(
+            &client,
+            token,
+            &reuse_url,
+            json!({"schema":schema,"distance_metric":"cosine_distance","upsert_rows":[row]}),
+        )
+        .await;
+        let queried = match query {
+            Some(query) => {
+                Some(response(&client, token, &format!("{reuse_url}/query"), query).await)
+            }
+            None => None,
+        };
+        let _ = client.delete(&reuse_url).bearer_auth(token).send().await;
+        reuse.push((write, queried));
+    }
+    assert_eq!(reuse[0].0 .0, StatusCode::OK, "{reuse:?}");
+    assert_eq!(
+        reuse[0]
+            .1
+            .as_ref()
+            .map(|(status, body)| (*status, body["rows"][0]["id"].clone())),
+        Some((StatusCode::OK, json!(1))),
+        "{reuse:?}"
+    );
+    assert_eq!(reuse[1].0 .0, StatusCode::OK, "{reuse:?}");
+    assert_eq!(
+        reuse[2].0,
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"status":"error","error":"💔 embedded field's dims don't match the target vector"})
+        )
+    );
+    assert_eq!(reuse[3].0 .0, StatusCode::OK, "{reuse:?}");
+    let embed = |attribute: Value| {
+        json!({"type":"string","embed":{
+            "model":"openai/text-embedding-3-small","dims":256,"attribute":attribute
+        }})
+    };
+    let mut rejected = Vec::new();
+    for (label, schema) in [
+        (
+            "shared target",
+            json!({"id":"uint","a":embed(json!("vector")),"b":embed(json!("vector"))}),
+        ),
+        (
+            "named target collides with default",
+            json!({"id":"uint","a":embed(json!("embed_b")),"b":{"type":"string","embed":{
+                "model":"openai/text-embedding-3-small","dims":256
+            }}}),
+        ),
+        (
+            "non-string target",
+            json!({"id":"uint","a":embed(json!(5))}),
+        ),
+    ] {
+        let rejected_url = format!(
+            "{base}/v2/namespaces/minifugu-embed-target-bad-{}",
+            Uuid::new_v4().simple()
+        );
+        let result = response(
+            &client,
+            token,
+            &rejected_url,
+            json!({
+                "schema":schema,"distance_metric":"cosine_distance",
+                "upsert_rows":[{"id":1,"a":"x","b":"y"}]
+            }),
+        )
+        .await;
+        let _ = client.delete(&rejected_url).bearer_auth(token).send().await;
+        rejected.push((label, result));
+    }
+    assert_eq!(rejected[0].1 .0, StatusCode::BAD_REQUEST, "{rejected:?}");
+    assert_eq!(rejected[1].1 .0, StatusCode::BAD_REQUEST, "{rejected:?}");
+    assert_eq!(
+        rejected[2].1 .0,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{rejected:?}"
+    );
+    assert!(
+        rejected[..2].iter().all(|(_, (_, body))| body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("multiple embedded attributes targeting"))),
+        "{rejected:?}"
+    );
+    assert_eq!(null_target.0, StatusCode::OK, "{null_target:?}");
+    assert_eq!(null_projection.0, StatusCode::OK, "{null_projection:?}");
+    assert_eq!(
+        null_projection.1["rows"][0]["vector"]
+            .as_array()
+            .map(Vec::len),
+        Some(256),
+        "{null_projection:?}"
+    );
+    assert_eq!(setup.0, StatusCode::OK, "{setup:?}");
+    assert_eq!(schema["vector"]["type"], "[256]f16");
+    assert!(schema.get("embed_text").is_none());
+    assert_eq!(metadata["schema"]["text"]["embed"]["attribute"], "vector");
+    assert_eq!(query.0, StatusCode::OK, "{query:?}");
+    assert_eq!(query.1["rows"][0]["id"], 1);
+    assert_eq!(explicit.0, StatusCode::OK, "{explicit:?}");
+    assert_eq!(projection.0, StatusCode::OK, "{projection:?}");
+    assert_eq!(ids(&projection.1), vec![1, 2, 3]);
+    assert_eq!(
+        projection.1["rows"][2]["vector"].as_array().unwrap().len(),
+        256
+    );
+    // The explicit vector is stored, not replaced by a generated one.
+    assert!((projection.1["rows"][2]["vector"][0].as_f64().unwrap() - 1.0).abs() < 1e-2);
+    assert!(projection.1["rows"][2]["vector"][1].as_f64().unwrap().abs() < 1e-2);
+    assert_eq!(cleanup.status(), StatusCode::OK);
 }
 
 async fn embedded_write_contract(base: &str, token: &str) {

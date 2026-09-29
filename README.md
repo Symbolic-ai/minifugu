@@ -67,6 +67,8 @@ The default provider hashes tokens deterministically. This keeps CI reproducible
 
 Each upsert must provide nonempty text for an embedded field, or supply its generated `embed_<field>` vector explicitly. Both provider-generated and explicit vectors are stored at f16 precision. An explicit generated vector skips the embedding call, including when the row also has source text. The source field must be declared as `string`.
 
+Set `embed.attribute` to store the generated vector in a named field instead of `embed_<field>`, for example `"attribute":"vector"`. MiniFugu creates that field as an ANN-indexed `[dims]f16` vector, or uses an existing f16 or f32 vector field of the same dimensions. The named field appears in `GET /schema`. A row can supply that vector directly. A row that sends `null` for the vector gets a generated vector from its text. Two embedded fields cannot target the same attribute.
+
 For semantic embeddings, opt in to OpenAI:
 
 ```sh
