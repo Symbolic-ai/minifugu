@@ -871,6 +871,22 @@ async fn query_embed_contract(base: &str, token: &str) {
             json!(["vector", "ANN", ["Embed", "pufferfish"]]),
             StatusCode::BAD_REQUEST,
         ),
+        (
+            json!(["vector", "ANN", ["Embed", "pufferfish", {"model":null}]]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!(["vector", "ANN", ["Embed", "pufferfish", {"model":"openai/text-embedding-3-small","extra":true}]]),
+            StatusCode::OK,
+        ),
+        (
+            json!(["vector", "ANN", ["Embed"]]),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!(["vector", "ANN", ["Embed", 12]]),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
     ];
     let results: Result<Vec<_>, reqwest::Error> = async {
         let mut results = Vec::new();

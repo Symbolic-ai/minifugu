@@ -95,22 +95,28 @@ fn collect_query_embeddings(
         {
             let field = parts[0]
                 .as_str()
-                .ok_or("Embed target must be an attribute")?;
+                .ok_or_else(|| crate::shape_error("Embed target must be an attribute"))?;
             let operand = parts[2].as_array().unwrap();
             if !(2..=3).contains(&operand.len()) {
-                return Err("Embed requires text and optional model parameters".into());
+                return Err(crate::shape_error(
+                    "Embed requires text and optional model parameters",
+                ));
             }
-            let text = operand[1].as_str().ok_or("Embed text must be a string")?;
+            let text = operand[1]
+                .as_str()
+                .ok_or_else(|| crate::shape_error("Embed text must be a string"))?;
             let explicit_model = if operand.len() == 3 {
                 let options = operand[2]
                     .as_object()
-                    .ok_or("Embed parameters must be an object")?;
-                if options.keys().any(|key| key != "model") {
-                    return Err("unsupported Embed parameter".into());
-                }
+                    .ok_or_else(|| crate::shape_error("Embed parameters must be an object"))?;
                 options
                     .get("model")
-                    .map(|model| model.as_str().ok_or("Embed model must be a string"))
+                    .filter(|model| !model.is_null())
+                    .map(|model| {
+                        model
+                            .as_str()
+                            .ok_or_else(|| crate::shape_error("Embed model must be a string"))
+                    })
                     .transpose()?
             } else {
                 None
