@@ -768,6 +768,7 @@ async fn local_contract() {
     embed_schema_contract(&format!("http://{address}"), "dummy").await;
     sort_validation_contract(&format!("http://{address}"), "dummy").await;
     query_embed_contract(&format!("http://{address}"), "dummy").await;
+    array_shape_contract(&format!("http://{address}"), "dummy").await;
 }
 
 #[tokio::test]
@@ -793,6 +794,35 @@ async fn optional_real_turbopuffer_contract() {
     embed_schema_contract(base.trim_end_matches('/'), &token).await;
     sort_validation_contract(base.trim_end_matches('/'), &token).await;
     query_embed_contract(base.trim_end_matches('/'), &token).await;
+    array_shape_contract(base.trim_end_matches('/'), &token).await;
+}
+
+async fn array_shape_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-array-shapes-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let (status, body) = response(
+        &client,
+        token,
+        &url,
+        json!({"schema":{"id":"uint","tags":"[]string"},"upsert_rows":[{"id":1,"tags":["base"]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "array shape setup: {body}");
+    for write in [
+        json!({"upsert_rows":[{"id":2,"tags":["a",1]}]}),
+        json!({"upsert_rows":[{"id":2,"tags":["a",null]}]}),
+        json!({"upsert_rows":[{"id":2,"nested":[[1],["a"]]}]}),
+        json!({"upsert_columns":{"id":[2],"tags":[["a",1]]}}),
+        json!({"patch_rows":[{"id":1,"tags":["a",null]}]}),
+        json!({"patch_columns":{"id":[1],"tags":[["a",1]]}}),
+        json!({"patch_by_filter":{"filters":["id","Eq",1],"patch":{"tags":["a",1]}}}),
+    ] {
+        let (status, body) = response(&client, token, &url, write.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{write}: {body}");
+    }
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(cleanup.status(), StatusCode::OK);
 }
 
 async fn sort_validation_contract(base: &str, token: &str) {

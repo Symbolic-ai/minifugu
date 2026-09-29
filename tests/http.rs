@@ -1774,6 +1774,55 @@ async fn unsupported_fields_fail_loudly() {
 }
 
 #[tokio::test]
+async fn array_cells_reject_mixed_types_and_null_as_shape_errors() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/array-cell-shapes");
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"schema":{"id":"uint","tags":"[]string"},"upsert_rows":[{"id":1,"tags":["base"]}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for write in [
+        json!({"upsert_rows":[{"id":2,"tags":["a",1]}]}),
+        json!({"upsert_rows":[{"id":2,"tags":["a",null]}]}),
+        json!({"upsert_rows":[{"id":2,"nested":[[1],["a"]]}]}),
+        json!({"upsert_columns":{"id":[2],"tags":[["a",1]]}}),
+        json!({"patch_rows":[{"id":1,"tags":["a",null]}]}),
+        json!({"patch_columns":{"id":[1],"tags":[["a",1]]}}),
+        json!({"patch_by_filter":{"filters":["id","Eq",1],"patch":{"tags":["a",1]}}}),
+    ] {
+        let (status, body) = post(&client, &url, write.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{write}: {body}");
+    }
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"upsert_rows":[{"id":2,"tags":["a","b"]}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"upsert_rows":[{"id":2,"tags":[1,2]}]})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
 async fn column_writes_array_filters_and_group_limits_work() {
     let base = server().await;
     let client = Client::new();
