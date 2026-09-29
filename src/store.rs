@@ -23,6 +23,10 @@ pub struct Namespace {
     pub(crate) approx_logical_bytes: Option<usize>,
     #[serde(default)]
     pub(crate) read_only: bool,
+    /// The customer-managed key named at creation. MiniFugu records it but does not
+    /// encrypt local snapshots or check the key with a cloud KMS.
+    #[serde(default)]
+    pub(crate) cmek_key_name: Option<String>,
 }
 
 impl Namespace {
@@ -119,7 +123,11 @@ impl Namespace {
                     );
                 }
                 if !self.schema.contains_key(&generated) {
-                    let kind = format!("[{}]f16", embed["dims"].as_u64().unwrap());
+                    let kind = format!(
+                        "[{}]{}",
+                        embed["dims"].as_u64().unwrap(),
+                        embedding_dtype(embed)
+                    );
                     let generated_attribute = match view {
                         SchemaView::Schema => json!({
                             "type":kind,"filterable":false,"full_text_search":null,"ann":true
@@ -147,7 +155,10 @@ impl Namespace {
             "created_at": created_at,
             "updated_at": updated_at,
             "last_write_at": self.last_write_at.unwrap_or(updated_at).format("%Y-%m-%dT%H:%M:%S.000000000Z").to_string(),
-            "encryption": {"sse": true},
+            "encryption": match &self.cmek_key_name {
+                Some(key_name) => json!({"cmek":{"key_name":key_name}}),
+                None => json!({"sse": true}),
+            },
             "index": {"status": "up-to-date"}
         });
         if self.read_only {
@@ -348,6 +359,14 @@ impl Namespace {
             }
             let dimensions = config.get("dims").and_then(Value::as_u64).unwrap_or(1536) as usize;
             if let Some(existing) = self.schema.get(&target) {
+                // An explicit dtype must match an existing target; without one, live
+                // writes into either an f16 or an f32 target.
+                if config.get("dtype").is_some_and(|dtype| !dtype.is_null())
+                    && !field_type(existing).ends_with(&format!("]{}", embedding_dtype(&config)))
+                    && vector::dimensions(existing).is_some()
+                {
+                    return Err("💔 embedded field's dtype doesn't match the target vector".into());
+                }
                 if vector::dimensions(existing) != Some(dimensions)
                     || !matches!(
                         field_type(existing).rsplit_once(']').map(|(_, t)| t),
@@ -359,7 +378,7 @@ impl Namespace {
             } else {
                 self.schema.insert(
                     target,
-                    json!({"type":format!("[{dimensions}]f16"),"ann":true}),
+                    json!({"type":format!("[{dimensions}]{}", embedding_dtype(&config)),"ann":true}),
                 );
             }
         }
@@ -387,21 +406,20 @@ impl Namespace {
                 }
             }
         }
-        let generated_vectors = self
-            .schema
-            .iter()
-            .filter_map(|(field, definition)| {
-                let embed = definition.get("embed")?;
-                let dims = embed.get("dims").and_then(Value::as_u64).unwrap_or(1536);
-                let target = embedding_target(field, embed);
-                let definition = self
-                    .schema
-                    .get(&target)
-                    .cloned()
-                    .unwrap_or_else(|| json!(format!("[{dims}]f16")));
-                Some((target, definition))
-            })
-            .collect::<Map<_, _>>();
+        let generated_vectors =
+            self.schema
+                .iter()
+                .filter_map(|(field, definition)| {
+                    let embed = definition.get("embed")?;
+                    let dims = embed.get("dims").and_then(Value::as_u64).unwrap_or(1536);
+                    let target = embedding_target(field, embed);
+                    let definition =
+                        self.schema.get(&target).cloned().unwrap_or_else(|| {
+                            json!(format!("[{dims}]{}", embedding_dtype(embed)))
+                        });
+                    Some((target, definition))
+                })
+                .collect::<Map<_, _>>();
         let mut normalized = body.clone();
         vector::normalize_write(&mut normalized, &self.schema, &generated_vectors)?;
         let object = normalized
@@ -840,6 +858,7 @@ fn condition_matches(
 }
 
 const WRITE_FIELDS: &[&str] = &[
+    "encryption",
     "schema",
     "distance_metric",
     "delete_by_filter",
@@ -879,6 +898,9 @@ pub(crate) fn normalize_write_body(body: &mut Value) -> Result<(), String> {
             return Err(crate::shape_error(format!("{key}: expected a sequence")));
         }
     }
+    if let Some(encryption) = object.get("encryption") {
+        cmek_key_name(encryption)?;
+    }
     for key in ["upsert_columns", "patch_columns"] {
         if let Some(columns) = object.get(key) {
             let columns = columns
@@ -914,6 +936,25 @@ pub(crate) fn validate_write_conditions(object: &Map<String, Value>) -> Result<(
         }
     }
     Ok(())
+}
+
+/// The customer-managed key in a write's `encryption` field, or `None` for default
+/// encryption. Live accepts `{"mode":"default"}`, `{"cmek":{"key_name":...}}` and
+/// `{"mode":"customer-managed","key_name":...}`; any other shape is a request-shape error.
+pub(crate) fn cmek_key_name(encryption: &Value) -> Result<Option<String>, String> {
+    let key_name = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .map(|key| Some(key.to_owned()))
+            .ok_or_else(|| {
+                crate::shape_error("encryption: data did not match any variant of Encryption")
+            })
+    };
+    match encryption.get("mode").and_then(Value::as_str) {
+        Some("default") => Ok(None),
+        Some("customer-managed") => key_name(encryption.get("key_name")),
+        _ => key_name(encryption.get("cmek").and_then(|cmek| cmek.get("key_name"))),
+    }
 }
 
 /// Whether a normalized write body asks for any change. Live answers a body without one
@@ -1197,6 +1238,15 @@ pub(crate) fn has_embed(definition: &Value) -> bool {
     definition.get("embed").is_some()
 }
 
+/// The element type of a generated embedding vector: `embed.dtype`, or f16 by default.
+pub(crate) fn embedding_dtype(config: &Value) -> &str {
+    config.get("dtype").and_then(Value::as_str).unwrap_or("f16")
+}
+
+fn unsupported_model(model: &str) -> String {
+    format!("💔 `{model}` is not supported in this region, please reach out to us")
+}
+
 pub(crate) fn embedding_target(field: &str, config: &Value) -> String {
     config
         .get("attribute")
@@ -1253,10 +1303,9 @@ fn normalize_embed_definition<'a>(
     {
         dims
     } else {
-        match model {
-            "openai/text-embedding-3-small" => 1536,
-            "openai/text-embedding-3-large" => 3072,
-            _ => return Err(format!("embed dims required for model {model}")),
+        match crate::embedding::model_dimensions(model) {
+            Some((default, _)) => default as u64,
+            None => return Err(unsupported_model(model)),
         }
     };
     let mut normalized = options.clone();
@@ -1369,12 +1418,14 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
                     ));
                 }
                 "embed" => {
-                    if value.as_object().is_some_and(|embed| {
-                        embed
-                            .keys()
-                            .any(|key| !matches!(key.as_str(), "model" | "dims" | "attribute"))
+                    if let Some(key) = value.as_object().and_then(|embed| {
+                        embed.keys().find(|key| {
+                            !matches!(key.as_str(), "model" | "dims" | "attribute" | "dtype")
+                        })
                     }) {
-                        return Err(format!("unsupported embed option for attribute {field}"));
+                        return Err(crate::shape_error(format!(
+                            "schema.{field}: unknown embed option `{key}`"
+                        )));
                     }
                 }
                 "type" | "filterable" | "ann" | "regex" | "glob" | "full_text_search" | "fuzzy" => {
@@ -1388,14 +1439,36 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
         }
     }
     if let Some(embed) = definition.get("embed") {
-        if field_type(definition) != "string"
-            || !embed.get("model").is_some_and(Value::is_string)
-            || !embed
-                .get("dims")
-                .and_then(Value::as_u64)
-                .is_some_and(|dims| dims > 0 && dims <= 3072)
-        {
+        if field_type(definition) != "string" || !embed.get("model").is_some_and(Value::is_string) {
             return Err(format!("invalid embed configuration for attribute {field}"));
+        }
+        let model = embed["model"].as_str().unwrap_or_default();
+        let (_, allowed) =
+            crate::embedding::model_dimensions(model).ok_or_else(|| unsupported_model(model))?;
+        let dims = embed
+            .get("dims")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("invalid embed configuration for attribute {field}"))?;
+        if !allowed.contains(&(dims as usize)) {
+            let valid = allowed.iter().map(usize::to_string).collect::<Vec<_>>();
+            return Err(format!(
+                "💔 target vector's dimensions ({dims}) aren't supported by `{model}`, valid dims are [{}]",
+                valid.join(",")
+            ));
+        }
+        match embed.get("dtype") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(dtype)) if matches!(dtype.as_str(), "f16" | "f32") => {}
+            Some(Value::String(dtype)) if dtype == "i8" => {
+                return Err(format!(
+                    "💔 target vector's type (i8) isn't supported by `{model}`, valid types are [f16,f32]"
+                ));
+            }
+            Some(_) => {
+                return Err(crate::shape_error(format!(
+                    "schema.{field}: embed.dtype must be f16 or f32"
+                )));
+            }
         }
         if embed
             .get("attribute")

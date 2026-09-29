@@ -711,11 +711,11 @@ async fn deterministic_native_vectors_can_be_queried_with_the_same_embedder() {
     let client = Client::new();
     let url = format!("{base}/v2/namespaces/native-rank");
     post(&client, &url, json!({
-        "schema":{"id":"uint","content":{"type":"string","full_text_search":true,"embed":{"model":"openai/text-embedding-3-small","dims":64}}},
+        "schema":{"id":"uint","content":{"type":"string","full_text_search":true,"embed":{"model":"openai/text-embedding-3-small","dims":256}}},
         "distance_metric":"cosine_distance",
         "upsert_rows":[{"id":1,"content":"red fugu"},{"id":2,"content":"blue whale"}]
     })).await;
-    let query_vector = deterministic_embedding("red fugu", 64);
+    let query_vector = deterministic_embedding("red fugu", 256);
     let (status, result) = post(
         &client,
         &format!("{url}/query"),
@@ -800,12 +800,9 @@ async fn deterministic_native_vectors_can_be_queried_with_the_same_embedder() {
 async fn openai_mode_embeds_native_text_and_queries_it() {
     async fn embed(Json(body): Json<Value>) -> Json<Value> {
         assert_eq!(body["model"], "text-embedding-3-small");
-        assert_eq!(body["dimensions"], 4);
-        let vector = if body["input"] == "fugu" {
-            vec![1.0, 0.0, 0.0, 0.0]
-        } else {
-            vec![0.0, 1.0, 0.0, 0.0]
-        };
+        assert_eq!(body["dimensions"], 256);
+        let mut vector = vec![0.0; 256];
+        vector[usize::from(body["input"] != "fugu")] = 1.0;
         Json(json!({"data":[{"embedding":vector}]}))
     }
     let provider = serve(Router::new().route("/v1/embeddings", axum_post(embed))).await;
@@ -815,9 +812,14 @@ async fn openai_mode_embeds_native_text_and_queries_it() {
     }))
     .await;
     let client = Client::new();
+    let unit = |index: usize| {
+        let mut vector = vec![0.0_f32; 256];
+        vector[index] = 1.0;
+        vector
+    };
     let url = format!("{base}/v2/namespaces/openai");
     let (status, _) = post(&client, &url, json!({
-        "schema":{"id":"uint","content":{"type":"string","full_text_search":true,"embed":{"model":"openai/text-embedding-3-small","dims":4}}},
+        "schema":{"id":"uint","content":{"type":"string","full_text_search":true,"embed":{"model":"openai/text-embedding-3-small","dims":256}}},
         "distance_metric":"cosine_distance",
         "upsert_rows":[{"id":1,"content":"fugu"},{"id":2,"content":"whale"}]
     })).await;
@@ -826,7 +828,7 @@ async fn openai_mode_embeds_native_text_and_queries_it() {
         &client,
         &format!("{url}/query"),
         json!({
-            "rank_by":["embed_content","ANN",[1.0,0.0,0.0,0.0]],"limit":2
+            "rank_by":["embed_content","ANN",unit(0)],"limit":2
         }),
     )
     .await;

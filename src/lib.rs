@@ -45,6 +45,28 @@ impl axum::response::IntoResponse for ApiError {
     }
 }
 
+/// Regions the live service accepts as a `copy_from_namespace` `source_region`.
+const COPY_REGIONS: &[&str] = &[
+    "aws-ap-south-1",
+    "aws-ap-southeast-2",
+    "aws-ca-central-1",
+    "aws-eu-central-1",
+    "aws-eu-west-1",
+    "aws-eu-west-2",
+    "aws-us-east-1",
+    "aws-us-east-2",
+    "aws-us-west-2",
+    "gcp-asia-northeast3",
+    "gcp-asia-southeast1",
+    "gcp-europe-west1",
+    "gcp-europe-west3",
+    "gcp-northamerica-northeast2",
+    "gcp-us-central1",
+    "gcp-us-east1",
+    "gcp-us-east4",
+    "gcp-us-west1",
+];
+
 /// Marks a validation message as a JSON shape error. The live service reports those as HTTP
 /// 422 from its request deserializer, and semantic errors as HTTP 400.
 const SHAPE_ERROR: &str = "\u{1}shape:";
@@ -436,22 +458,56 @@ async fn write(
         .get("branch_from_namespace")
         .or_else(|| object.get("copy_from_namespace"))
     {
-        if object.len() != 1 {
+        // Live lets a copy carry only a destination `encryption` setting.
+        if object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "branch_from_namespace" | "copy_from_namespace" | "encryption"
+            )
+        }) {
             return Err(bad(
-                "namespace copy cannot be combined with other write fields",
+                "💔 copy_from_namespace cannot be used with other write request fields",
             ));
         }
+        // MiniFugu is one keyless region, so a source in any live region and with any
+        // source API key resolves locally. Other config keys are ignored, as they are live.
+        if let Some(region) = source.get("source_region") {
+            let region = region.as_str().ok_or_else(|| {
+                bad(shape_error(
+                    "copy_from_namespace.source_region must be a string",
+                ))
+            })?;
+            if !COPY_REGIONS.contains(&region) {
+                return Err(bad(format!(
+                    "💔 region '{region}' is not available for cross-region copy_from_namespace. available regions: {}",
+                    COPY_REGIONS.join(", ")
+                )));
+            }
+        }
         if source
-            .as_object()
-            .is_some_and(|config| config.len() != 1 || !config.contains_key("source_namespace"))
+            .get("source_api_key")
+            .is_some_and(|key| !key.is_string())
         {
-            return Err(bad("only local source_namespace copies are supported"));
+            return Err(bad(shape_error(
+                "copy_from_namespace.source_api_key must be a string",
+            )));
         }
         let source = source
             .as_str()
             .or_else(|| source.get("source_namespace").and_then(Value::as_str))
-            .ok_or_else(|| bad("copy source_namespace is required"))?;
+            .ok_or_else(|| {
+                bad(shape_error(
+                    "copy_from_namespace: data did not match any variant of CopyFromNamespaceParams",
+                ))
+            })?;
         namespace_name(source)?;
+        // A destination `encryption` replaces the key; without one the copy keeps the
+        // source's key.
+        let encryption = object
+            .get("encryption")
+            .map(store::cmek_key_name)
+            .transpose()
+            .map_err(bad)?;
         if guard.contains_key(&name) {
             return Err(ApiError(
                 StatusCode::CONFLICT,
@@ -461,10 +517,13 @@ async fn write(
         let mut namespace = guard.get(source).cloned().ok_or_else(|| {
             ApiError(
                 StatusCode::NOT_FOUND,
-                "source namespace does not exist".into(),
+                format!("🤷 namespace '{source}' was not found"),
             )
         })?;
         namespace.touch_clone();
+        if let Some(cmek_key_name) = encryption {
+            namespace.cmek_key_name = cmek_key_name;
+        }
         let rows = namespace.rows.len();
         persist_namespace(&state, &mut guard, name, namespace)?;
         return Ok(Json(
@@ -484,6 +543,12 @@ async fn write(
         ));
     }
     let mut namespace = guard.get(&name).cloned().unwrap_or_default();
+    // A new namespace takes its customer-managed key from the creating write.
+    if !guard.contains_key(&name) {
+        if let Some(encryption) = object.get("encryption") {
+            namespace.cmek_key_name = store::cmek_key_name(encryption).map_err(bad)?;
+        }
+    }
     if namespace.read_only {
         return Err(bad("💔 Writes not permitted. This namespace is read-only."));
     }

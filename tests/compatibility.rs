@@ -763,6 +763,8 @@ async fn local_contract() {
     null_sort_contract(&format!("http://{address}"), "dummy").await;
     regex_array_contract(&format!("http://{address}"), "dummy").await;
     write_response_contract(&format!("http://{address}"), "dummy").await;
+    hosted_model_contract(&format!("http://{address}"), "dummy").await;
+    encryption_and_copy_contract(&format!("http://{address}"), "dummy").await;
     inferred_vector_contract(&format!("http://{address}"), "dummy").await;
     embedded_write_contract(&format!("http://{address}"), "dummy").await;
     vector_lifecycle_contract(&format!("http://{address}"), "dummy").await;
@@ -792,6 +794,8 @@ async fn optional_real_turbopuffer_contract() {
     null_sort_contract(base.trim_end_matches('/'), &token).await;
     regex_array_contract(base.trim_end_matches('/'), &token).await;
     write_response_contract(base.trim_end_matches('/'), &token).await;
+    hosted_model_contract(base.trim_end_matches('/'), &token).await;
+    encryption_and_copy_contract(base.trim_end_matches('/'), &token).await;
     inferred_vector_contract(base.trim_end_matches('/'), &token).await;
     embedded_write_contract(base.trim_end_matches('/'), &token).await;
     vector_lifecycle_contract(base.trim_end_matches('/'), &token).await;
@@ -1540,6 +1544,189 @@ async fn null_sort_contract(base: &str, token: &str) {
         assert_eq!(status, StatusCode::OK, "rank {rank}: {reply}");
         assert_eq!(ids(&reply), expected, "rank {rank}");
     }
+}
+
+async fn hosted_model_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let embedded = |embed: Value| json!({"type":"string","embed":embed});
+    let mut cases = [
+        ("baai/bge-m3", 1024),
+        ("cohere/embed-v4.0", 1536),
+        ("google/gemini-embedding-2", 1536),
+        ("nvidia/nemotron-3-embed-1b", 2048),
+        ("nvidia/nemotron-3-embed-8b", 4096),
+        ("openai/text-embedding-3-large", 3072),
+        ("openai/text-embedding-3-small", 1536),
+        ("openai/text-embedding-ada-002", 1536),
+        ("qwen/qwen3-embedding-0p6b", 1024),
+        ("qwen/qwen3-embedding-4b", 1024),
+        ("qwen/qwen3-embedding-8b", 1024),
+        ("voyage/voyage-4", 1024),
+        ("voyage/voyage-4-large", 1024),
+        ("voyage/voyage-4-lite", 1024),
+        ("voyage/voyage-4-nano", 1024),
+        ("voyage/voyage-code-3", 1024),
+        ("voyage/voyage-code-4", 1024),
+        ("zeroentropy/zembed-1", 1280),
+    ]
+    .into_iter()
+    .map(|(model, dims)| (embedded(json!(model)), Some(format!("[{dims}]f16"))))
+    .collect::<Vec<_>>();
+    cases.extend([
+        (
+            embedded(json!({"model":"nvidia/nemotron-3-embed-8b","dims":512,"dtype":"f32"})),
+            Some("[512]f32".to_owned()),
+        ),
+        (embedded(json!({"model":"voyage/voyage-4","dims":7})), None),
+        (
+            embedded(json!({"model":"openai/text-embedding-3-small","dims":256,"dtype":"i8"})),
+            None,
+        ),
+        (
+            embedded(json!({"model":"openai/text-embedding-3-small","dims":256,"dtype":"bogus"})),
+            None,
+        ),
+        (
+            embedded(json!({"model":"openai/text-embedding-3-small","dims":256,"zzz":1})),
+            None,
+        ),
+        (embedded(json!("acme/not-a-model")), None),
+    ]);
+    let mut results = Vec::new();
+    for (definition, _) in &cases {
+        let name = format!("minifugu-hosted-model-{}", Uuid::new_v4().simple());
+        let url = format!("{base}/v2/namespaces/{name}");
+        let write = response(
+            &client,
+            token,
+            &url,
+            json!({
+                "schema":{"id":"uint","t":definition},"distance_metric":"cosine_distance",
+                "upsert_rows":[{"id":1,"t":"pufferfish"}]
+            }),
+        )
+        .await;
+        let schema: Value = client
+            .get(format!("{base}/v1/namespaces/{name}/schema"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let _ = client.delete(&url).bearer_auth(token).send().await;
+        results.push((write, schema["embed_t"]["type"].clone()));
+    }
+    for ((definition, expected), ((status, body), kind)) in cases.iter().zip(&results) {
+        match expected {
+            Some(expected) => {
+                assert_eq!(*status, StatusCode::OK, "{definition}: {body}");
+                assert_eq!(kind, &json!(expected), "{definition}");
+            }
+            None => assert_ne!(*status, StatusCode::OK, "{definition}: {body}"),
+        }
+    }
+    let error = |index: usize| {
+        let (status, body) = &results[results.len() - 6 + index].0;
+        (
+            *status,
+            body["error"].as_str().unwrap_or_default().to_owned(),
+        )
+    };
+    assert_eq!(
+        error(1),
+        (
+            StatusCode::BAD_REQUEST,
+            "💔 target vector's dimensions (7) aren't supported by `voyage/voyage-4`, valid dims are [256,512,1024,2048]".into()
+        )
+    );
+    assert_eq!(
+        error(2),
+        (
+            StatusCode::BAD_REQUEST,
+            "💔 target vector's type (i8) isn't supported by `openai/text-embedding-3-small`, valid types are [f16,f32]".into()
+        )
+    );
+    assert_eq!(error(3).0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error(4).0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        error(5),
+        (
+            StatusCode::BAD_REQUEST,
+            "💔 `acme/not-a-model` is not supported in this region, please reach out to us".into()
+        )
+    );
+}
+
+async fn encryption_and_copy_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let source = format!("minifugu-copy-source-{}", Uuid::new_v4().simple());
+    let source_url = format!("{base}/v2/namespaces/{source}");
+    let setup = response(
+        &client,
+        token,
+        &source_url,
+        json!({"upsert_rows":[{"id":1}]}),
+    )
+    .await;
+    let mut results = Vec::new();
+    for body in [
+        json!({"upsert_rows":[{"id":1}],"encryption":{"mode":"default"}}),
+        json!({"upsert_rows":[{"id":1}],"encryption":{"sse":true}}),
+        json!({"upsert_rows":[{"id":1}],"encryption":{"mode":"customer-managed"}}),
+        json!({"encryption":{"mode":"default"}}),
+        json!({"copy_from_namespace":{"source_namespace":source,"source_region":"gcp-us-central1"}}),
+        json!({"copy_from_namespace":{"source_namespace":source,"source_region":"nowhere-1"}}),
+        json!({"copy_from_namespace":{"source_namespace":source,"unknown":1,"encryption":5}}),
+        json!({"copy_from_namespace":source,"encryption":{"mode":"default"}}),
+        json!({"copy_from_namespace":source,"upsert_rows":[{"id":2}]}),
+        json!({"copy_from_namespace":{"source_region":"gcp-us-central1"}}),
+    ] {
+        let url = format!(
+            "{base}/v2/namespaces/minifugu-copy-dest-{}",
+            Uuid::new_v4().simple()
+        );
+        let result = response(&client, token, &url, body).await;
+        let _ = client.delete(&url).bearer_auth(token).send().await;
+        results.push(result);
+    }
+    let cleanup = client
+        .delete(&source_url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(setup.0, StatusCode::OK, "{setup:?}");
+    let statuses = results
+        .iter()
+        .map(|(status, _)| *status)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        [
+            StatusCode::OK,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::BAD_REQUEST,
+            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ],
+        "{results:?}"
+    );
+    assert_eq!(results[4].1["message"], "namespace cloned successfully");
+    assert!(results[5].1["error"].as_str().is_some_and(|error| error.starts_with(
+        "💔 region 'nowhere-1' is not available for cross-region copy_from_namespace. available regions: aws-ap-south-1,"
+    )));
+    assert_eq!(
+        results[8].1["error"],
+        "💔 copy_from_namespace cannot be used with other write request fields"
+    );
+    assert_eq!(cleanup.status(), StatusCode::OK);
 }
 
 async fn write_response_contract(base: &str, token: &str) {

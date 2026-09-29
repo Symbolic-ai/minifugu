@@ -60,7 +60,7 @@ Explicit vector fields work offline. A schema can also ask MiniFugu to generate 
 {"content":{"type":"string","full_text_search":true,"embed":{"model":"openai/text-embedding-3-small","dims":1536}}}
 ```
 
-For `openai/text-embedding-3-small`, `embed` may also be the model string, or an object with only `model`; MiniFugu infers its 1536 dimensions. It infers 3072 dimensions for `openai/text-embedding-3-large`. Other models need explicit `dims`. On an existing embedded field, an omitted or null `dims` keeps the stored dimension.
+MiniFugu accepts the same 18 hosted models as live Turbopuffer, from `baai/bge-m3` to `zeroentropy/zembed-1`, with each model's default and supported dimensions. `embed` may be the model string, or an object with only `model`; MiniFugu then uses the model's default dimension, for example 1536 for `openai/text-embedding-3-small` and 1024 for `voyage/voyage-4`. An unsupported model or dimension returns the live HTTP 400 error. `embed.dtype` may be `f16` (the default) or `f32`. On an existing embedded field, an omitted or null `dims` keeps the stored dimension.
 
 The default provider hashes tokens deterministically. This keeps CI reproducible and keyless; these vectors are **not semantic embeddings**. Query with `"rank_by":["content","ANN",["Embed","red fugu"]]`, or pass a vector from `minifugu::deterministic_embedding(query, dims)`.
 
@@ -68,6 +68,8 @@ The default provider hashes tokens deterministically. This keeps CI reproducible
 Each upsert must provide nonempty text for an embedded field, or supply its generated `embed_<field>` vector explicitly. Both provider-generated and explicit vectors are stored at f16 precision. An explicit generated vector skips the embedding call, including when the row also has source text. The source field must be declared as `string`.
 
 Set `embed.attribute` to store the generated vector in a named field instead of `embed_<field>`, for example `"attribute":"vector"`. MiniFugu creates that field as an ANN-indexed `[dims]f16` vector, or uses an existing f16 or f32 vector field of the same dimensions. The named field appears in `GET /schema`. A row can supply that vector directly. A row that sends `null` for the vector gets a generated vector from its text. Two embedded fields cannot target the same attribute.
+
+The deterministic provider serves every hosted model offline. OpenAI mode calls OpenAI only for `openai/*` models; a write or query that needs another hosted model returns HTTP 502 in that mode.
 
 For semantic embeddings, opt in to OpenAI:
 

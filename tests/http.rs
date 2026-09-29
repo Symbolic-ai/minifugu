@@ -10,6 +10,13 @@ async fn server() -> String {
     format!("http://{address}/v2/namespaces")
 }
 
+/// A dense vector with 1.0 in its first dimension and zeros elsewhere.
+fn unit_vector(dimensions: usize) -> Vec<f32> {
+    let mut vector = vec![0.0; dimensions];
+    vector[0] = 1.0;
+    vector
+}
+
 async fn post(client: &Client, url: &str, body: Value) -> (StatusCode, Value) {
     let response = client
         .post(url)
@@ -1183,10 +1190,10 @@ async fn native_embedding_is_deterministic_and_filters_include_date_bounds() {
     let ns = format!("{base}/native");
     let id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     let (status, _) = post(&client, &ns, json!({"schema":{
-        "id":"uuid", "published_at":"datetime", "content":{"type":"string","full_text_search":true,"embed":{"model":"test","dims":4}}
+        "id":"uuid", "published_at":"datetime", "content":{"type":"string","full_text_search":true,"embed":{"model":"openai/text-embedding-3-small","dims":256}}
     },"distance_metric":"cosine_distance","upsert_rows":[{"id":id,"content":"red fugu","published_at":"2026-01-01T01:00:00+01:00"}]})).await;
     assert_eq!(status, StatusCode::OK);
-    let query = json!({"rank_by":["embed_content","ANN",[1.0,0.0,0.0,0.0]],"filters":["And",[
+    let query = json!({"rank_by":["embed_content","ANN",unit_vector(256)],"filters":["And",[
         ["published_at","NotEq",null], ["published_at","Gte","2026-01-01T00:00:00Z"]
     ]],"limit":1});
     let (_, first) = post(&client, &format!("{ns}/query"), query.clone()).await;
@@ -1422,7 +1429,7 @@ async fn recall_selects_an_ann_index_or_native_embedding() {
         &client,
         &ns,
         json!({
-            "schema":{"id":"uint","content":{"type":"string","embed":{"model":"test","dims":4}}},
+            "schema":{"id":"uint","content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":256}}},
             "distance_metric":"cosine_distance",
             "upsert_rows":[{"id":1,"content":"small fugu"}]
         }),
@@ -2193,7 +2200,7 @@ async fn embedded_upserts_require_text_or_accept_an_explicit_generated_vector() 
         &client,
         &url,
         json!({
-            "schema":{"id":"uint","content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":4}}},
+            "schema":{"id":"uint","content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":256}}},
             "distance_metric":"cosine_distance",
             "upsert_rows":[{"id":1,"content":"pufferfish"}]
         }),
@@ -2222,8 +2229,8 @@ async fn embedded_upserts_require_text_or_accept_an_explicit_generated_vector() 
         assert!(body["error"].as_str().unwrap().contains("non-empty string"));
     }
     for row in [
-        json!({"id":6,"embed_content":[1.0,0.0,0.0,0.0]}),
-        json!({"id":7,"content":"pufferfish","embed_content":[1.0,0.0,0.0,0.0]}),
+        json!({"id":6,"embed_content":unit_vector(256)}),
+        json!({"id":7,"content":"pufferfish","embed_content":unit_vector(256)}),
     ] {
         let (status, body) = post(&client, &url, json!({"upsert_rows":[row]})).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -2249,17 +2256,12 @@ async fn embedded_upserts_require_text_or_accept_an_explicit_generated_vector() 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["rows"][0]["id"], 6);
     assert!(body["rows"][0].get("content").is_none());
-    assert_eq!(
-        body["rows"][0]["embed_content"],
-        json!([1.0, 0.0, 0.0, 0.0])
-    );
+    assert_eq!(body["rows"][0]["embed_content"], json!(unit_vector(256)));
     assert_eq!(body["rows"][1]["id"], 7);
     assert_eq!(body["rows"][1]["content"], "pufferfish");
-    assert_eq!(
-        body["rows"][1]["embed_content"],
-        json!([1.0, 0.0, 0.0, 0.0])
-    );
-    let explicit = [0.1234567_f32, 0.0, 0.0, 0.0];
+    assert_eq!(body["rows"][1]["embed_content"], json!(unit_vector(256)));
+    let mut explicit = unit_vector(256);
+    explicit[0] = 0.1234567;
     let (status, body) = post(
         &client,
         &url,
@@ -2281,14 +2283,14 @@ async fn embedded_upserts_require_text_or_accept_an_explicit_generated_vector() 
     let (status, body) = post(
         &client,
         &url,
-        json!({"upsert_rows":[{"id":10,"embed_content":[1e6,0.0,0.0,0.0]}]}),
+        json!({"upsert_rows":[{"id":10,"embed_content":unit_vector(256).into_iter().map(|value| value * 1e6).collect::<Vec<_>>()}]}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let (status, body) = post(
         &client,
         &url,
-        json!({"schema":{"wrong":{"type":"int","embed":{"model":"openai/text-embedding-3-small","dims":4}}}}),
+        json!({"schema":{"wrong":{"type":"int","embed":{"model":"openai/text-embedding-3-small","dims":256}}}}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -2317,9 +2319,9 @@ async fn embedding_can_target_an_existing_float32_vector() {
             "schema":{
                 "id":"uint",
                 "text":{"type":"string","embed":{
-                    "model":"openai/text-embedding-3-small","dims":4,"attribute":"vector"
+                    "model":"openai/text-embedding-3-small","dims":256,"attribute":"vector"
                 }},
-                "vector":{"type":"[4]f32","ann":true}
+                "vector":{"type":"[256]f32","ann":true}
             },
             "distance_metric":"cosine_distance",
             "upsert_rows":[{"id":1,"text":"fugu"}]
@@ -2336,12 +2338,12 @@ async fn embedding_can_target_an_existing_float32_vector() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["rows"][0]["vector"].as_array().unwrap().len(), 4);
+    assert_eq!(body["rows"][0]["vector"].as_array().unwrap().len(), 256);
     let (status, body) = post(
         &client,
         &url,
         json!({
-            "upsert_rows":[{"id":2,"vector":[0.1234567,0.0,0.0,0.0]}]
+            "upsert_rows":[{"id":2,"vector":std::iter::once(0.1234567_f32).chain(std::iter::repeat_n(0.0, 255)).collect::<Vec<_>>()}]
         }),
     )
     .await;
@@ -2361,7 +2363,7 @@ async fn embedding_can_target_an_existing_float32_vector() {
         &format!("{base}/embedding-bad-target"),
         json!({
             "schema":{"id":"uint","text":{"type":"string","embed":{
-                "model":"openai/text-embedding-3-small","dims":4,"attribute":"text"
+                "model":"openai/text-embedding-3-small","dims":256,"attribute":"text"
             }}},
             "distance_metric":"cosine_distance",
             "upsert_rows":[{"id":1,"text":"fugu"}]
@@ -2701,7 +2703,7 @@ async fn vector_columns_are_fixed_at_namespace_creation_and_capped_at_eight() {
     let (status, body) = post(
         &client,
         &url,
-        json!({"schema":{"content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":2}}},"distance_metric":"cosine_distance"}),
+        json!({"schema":{"content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":256}}},"distance_metric":"cosine_distance"}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "embedded vector: {body}");
@@ -2724,7 +2726,7 @@ async fn vector_columns_are_fixed_at_namespace_creation_and_capped_at_eight() {
     let (status, body) = post(
         &client,
         &format!("{base}/embed-name-collision"),
-        json!({"schema":{"content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":2}},"embed_content":{"type":"[2]f16","ann":true}},"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"content":"hi","embed_content":[0,0]}]}),
+        json!({"schema":{"content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":256}},"embed_content":{"type":"[2]f16","ann":true}},"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"content":"hi","embed_content":[0,0]}]}),
     )
     .await;
     assert_eq!(
@@ -2771,4 +2773,50 @@ async fn vector_columns_are_fixed_at_namespace_creation_and_capped_at_eight() {
             "{count}: {body}"
         );
     }
+}
+
+#[tokio::test]
+async fn customer_managed_keys_and_copy_regions_resolve_locally() {
+    let base = server().await;
+    let client = Client::new();
+    let key = "projects/p/locations/us-central1/keyRings/r/cryptoKeys/k";
+    let (status, body) = post(
+        &client,
+        &format!("{base}/cmek-source"),
+        json!({"upsert_rows":[{"id":1}],"encryption":{"cmek":{"key_name":key}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let metadata: Value = client
+        .get(format!("{base}/cmek-source").replace("/v2/", "/v1/") + "/metadata")
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(metadata["encryption"], json!({"cmek":{"key_name":key}}));
+    // MiniFugu is one region, so a source in any live region resolves locally.
+    let (status, body) = post(
+        &client,
+        &format!("{base}/cmek-copy"),
+        json!({
+            "copy_from_namespace":{"source_namespace":"cmek-source","source_region":"aws-eu-west-1","source_api_key":"other-org"},
+            "encryption":{"mode":"default"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows_affected"], 1);
+    let metadata: Value = client
+        .get(format!("{base}/cmek-copy").replace("/v2/", "/v1/") + "/metadata")
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(metadata["encryption"], json!({"sse":true}));
 }
