@@ -877,6 +877,71 @@ async fn ann_contract(base: &str, token: &str) {
             );
         }
     }
+    let name = format!("minifugu-ann-update-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let create = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","vector":{"type":"[2]f32","ann":true}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"vector":[1.0,0.0]}]
+        }),
+    )
+    .await;
+    assert_eq!(create.0, StatusCode::OK, "ANN update setup: {}", create.1);
+    let schema_url = format!("{base}/v1/namespaces/{name}/schema");
+    let matching = response(
+        &client,
+        token,
+        &schema_url,
+        json!({"vector":{"type":"[2]f32","ann":{"distance_metric":"cosine_distance"}}}),
+    )
+    .await;
+    assert_eq!(
+        matching.0,
+        StatusCode::OK,
+        "matching ANN update: {}",
+        matching.1
+    );
+    assert_eq!(matching.1["vector"]["ann"], true);
+    let mismatch = response(
+        &client,
+        token,
+        &schema_url,
+        json!({"vector":{"type":"[2]f32","ann":{"distance_metric":"euclidean_squared"}}}),
+    )
+    .await;
+    assert_eq!(
+        mismatch.0,
+        StatusCode::BAD_REQUEST,
+        "ANN update: {}",
+        mismatch.1
+    );
+    let changed_metric = response(
+        &client,
+        token,
+        &url,
+        json!({"distance_metric":"euclidean_squared","upsert_rows":[{"id":2,"vector":[2.0,0.0]}]}),
+    )
+    .await;
+    assert_eq!(
+        changed_metric.0,
+        StatusCode::BAD_REQUEST,
+        "namespace metric change: {}",
+        changed_metric.1
+    );
+    assert_eq!(
+        client
+            .delete(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
 }
 
 fn ids(result: &Value) -> Vec<u64> {

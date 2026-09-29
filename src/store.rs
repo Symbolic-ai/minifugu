@@ -348,6 +348,14 @@ impl Namespace {
                     "distance_metric must be cosine_distance or euclidean_squared".into(),
                 ));
             }
+            if let Some(existing) = self.distance_metric.as_deref() {
+                if metric != existing {
+                    return Err(format!(
+                        "distance metric mismatch, expected {existing}, got {metric}"
+                    )
+                    .into());
+                }
+            }
             if !self.schema.values().any(|v| {
                 vector::dimensions(v).is_some()
                     || vector::multi_dimensions(v).is_some()
@@ -365,12 +373,12 @@ impl Namespace {
                     if metric.is_null() {
                         continue;
                     }
-                    let Some(top_level) = object.get("distance_metric") else {
+                    let Some(namespace_metric) = self.distance_metric.as_deref() else {
                         return Err("distance_metric must be specified at the top level of the write request, not in ann".into());
                     };
-                    if metric != top_level {
+                    if metric.as_str() != Some(namespace_metric) {
                         return Err(format!(
-                            "distance metric mismatch, expected {top_level}, got {metric}"
+                            "distance metric mismatch, expected {namespace_metric}, got {metric}"
                         )
                         .into());
                     }
