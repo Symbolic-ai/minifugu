@@ -141,6 +141,40 @@ async fn score_precision_matches_captured_live_float32_values() {
 }
 
 #[tokio::test]
+async fn float32_numeric_score_ties_use_id_order() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/numeric-float32-ties");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","x":"float"},
+            "upsert_rows":[
+                {"id":1,"x":0.1234567891234},
+                {"id":2,"x":0.1234567891235}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for rank in [
+        json!(["Saturate",["Attribute","x"],{"midpoint":0.5}]),
+        json!(["Decay",["Dist",["Attribute","x"],0.5],{"midpoint":0.5}]),
+    ] {
+        let (status, result) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({"rank_by":rank,"limit":2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ids(&result), [1, 2]);
+        assert_eq!(result["rows"][0]["$dist"], result["rows"][1]["$dist"]);
+    }
+}
+
+#[tokio::test]
 async fn attribute_and_rrf_ties_order_numeric_ids_numerically() {
     let base = serve(minifugu::router()).await;
     let client = Client::new();

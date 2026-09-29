@@ -290,6 +290,11 @@ impl Namespace {
                 let score = rank.map_or(0.0, |rank| {
                     score_rank(rank, row, &self.rows, &self.schema, metric)
                 });
+                let score = if score.is_finite() {
+                    serialized_score(score)
+                } else {
+                    score
+                };
                 if !score.is_finite()
                     || rank.is_some_and(|rank| {
                         !is_ann(rank)
