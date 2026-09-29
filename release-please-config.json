@@ -1,0 +1,11 @@
+{
+  "bootstrap-sha": "06bf801ba46a19e4faddd11819fd689a8b0fddc3",
+  "release-type": "rust",
+  "include-v-in-tag": true,
+  "include-component-in-tag": false,
+  "packages": {
+    ".": {
+      "package-name": "minifugu"
+    }
+  }
+}

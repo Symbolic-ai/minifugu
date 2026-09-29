@@ -7,6 +7,10 @@ MiniFugu lets local apps and CI exercise real HTTP writes, schema validation, fi
 
 MiniFugu is an independent open source project and is not affiliated with Turbopuffer. See [API coverage](docs/api-coverage.md) for precise compatibility and known differences.
 
+## Install
+
+After the first release, install from [crates.io](https://crates.io/crates/minifugu) with `cargo install minifugu --locked`, or download a binary from [GitHub Releases](https://github.com/Symbolic-ai/minifugu/releases). The crate's library documentation appears on [docs.rs](https://docs.rs/minifugu). Maintainers: see the [release process](docs/releases.md).
+
 ## Quick start
 
 Requires Rust 1.98 or newer.
