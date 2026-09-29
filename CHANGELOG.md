@@ -2,6 +2,19 @@
 
 Release Please maintains this file from conventional commits when a release pull request is merged.
 
+## [0.2.0](https://github.com/Symbolic-ai/minifugu/compare/v0.1.1...v0.2.0) (2026-09-29)
+
+
+### Features
+
+* store generated embeddings in a named vector attribute ([#25](https://github.com/Symbolic-ai/minifugu/issues/25)) ([09a106b](https://github.com/Symbolic-ai/minifugu/commit/09a106b24afc58fca73e9703ebb1c25faee35381))
+* support all hosted embedding models, embed dtype, encryption, and copy options ([#27](https://github.com/Symbolic-ai/minifugu/issues/27)) ([f402435](https://github.com/Symbolic-ai/minifugu/commit/f4024353ab215eb94e829d31cd487178d49fa08c))
+
+
+### Bug Fixes
+
+* match live no-op write errors and write response bodies ([#26](https://github.com/Symbolic-ai/minifugu/issues/26)) ([06d6ef0](https://github.com/Symbolic-ai/minifugu/commit/06d6ef0567e83a34ded21cf9833de396ea781025))
+
 ## [0.1.1](https://github.com/Symbolic-ai/minifugu/compare/v0.1.0...v0.1.1) (2026-09-29)
 
 
