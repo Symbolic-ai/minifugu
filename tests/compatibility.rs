@@ -1541,6 +1541,13 @@ async fn vector_lifecycle_contract(base: &str, token: &str) {
         json!({"schema":{"v2":{"type":"[2]f32","ann":true}},"upsert_rows":[{"id":1,"v1":[1,0],"v2":[0,1]}]}),
     )
     .await;
+    let add_sparse = response(
+        &client,
+        token,
+        &url,
+        json!({"schema":{"s":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}}},"upsert_rows":[{"id":2,"v1":[1,0],"s":{"1":1.0}}]}),
+    )
+    .await;
     let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
     assert_eq!(
         create.0,
@@ -1554,38 +1561,132 @@ async fn vector_lifecycle_contract(base: &str, token: &str) {
         "vector lifecycle add: {}",
         add.1
     );
+    assert_eq!(add_sparse.0, StatusCode::OK, "sparse add: {}", add_sparse.1);
     assert_eq!(cleanup.status(), StatusCode::OK);
 
-    let name = format!("minifugu-vector-limit-{}", Uuid::new_v4().simple());
+    let name = format!("minifugu-scalar-lifecycle-{}", Uuid::new_v4().simple());
     let url = format!("{base}/v2/namespaces/{name}");
-    let schema = (0..9)
-        .map(|index| {
+    let scalar = response(
+        &client,
+        token,
+        &url,
+        json!({"upsert_rows":[{"id":1,"title":"a"}]}),
+    )
+    .await;
+    let inferred_vector = response(
+        &client,
+        token,
+        &url,
+        json!({"upsert_rows":[{"id":2,"vector":[1,0]}]}),
+    )
+    .await;
+    let inferred_multi = response(
+        &client,
+        token,
+        &url,
+        json!({"upsert_rows":[{"id":2,"mv":[[1,0],[0,1]]}]}),
+    )
+    .await;
+    let added_embed = response(
+        &client,
+        token,
+        &url,
+        json!({"schema":{"content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":1536}}}}),
+    )
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(scalar.0, StatusCode::OK, "scalar create: {}", scalar.1);
+    assert_eq!(
+        inferred_vector.0,
+        StatusCode::BAD_REQUEST,
+        "inferred vector: {}",
+        inferred_vector.1
+    );
+    assert_eq!(
+        inferred_multi.0,
+        StatusCode::OK,
+        "inferred non-indexed multi-vector: {}",
+        inferred_multi.1
+    );
+    assert_eq!(
+        added_embed.0,
+        StatusCode::BAD_REQUEST,
+        "embedded vector add: {}",
+        added_embed.1
+    );
+    assert_eq!(cleanup.status(), StatusCode::OK);
+
+    for (count, expected) in [(8, StatusCode::OK), (9, StatusCode::BAD_REQUEST)] {
+        let name = format!("minifugu-vector-limit-{}", Uuid::new_v4().simple());
+        let url = format!("{base}/v2/namespaces/{name}");
+        let mut schema = (0..count)
+            .map(|index| {
+                let field = if index == 0 {
+                    "vector".to_owned()
+                } else {
+                    format!("v{index}")
+                };
+                (field, json!({"type":"[2]f32","ann":true}))
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let mut row = serde_json::Map::from_iter([("id".into(), json!(1))]);
+        for field in schema.keys() {
+            row.insert(field.clone(), json!([1, 0]));
+        }
+        if count == 8 {
+            schema.insert(
+                "s".into(),
+                json!({"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}}),
+            );
+            row.insert("s".into(), json!({"1":1.0}));
+        }
+        let result = response(
+            &client,
+            token,
+            &url,
+            json!({"schema":schema,"distance_metric":"cosine_distance","upsert_rows":[row]}),
+        )
+        .await;
+        let _ = client.delete(&url).bearer_auth(token).send().await;
+        assert_eq!(result.0, expected, "{count} vectors: {}", result.1);
+    }
+
+    for (fixed_count, expected) in [(7, StatusCode::OK), (8, StatusCode::BAD_REQUEST)] {
+        let name = format!("minifugu-embedded-limit-{}", Uuid::new_v4().simple());
+        let url = format!("{base}/v2/namespaces/{name}");
+        let mut schema = serde_json::Map::new();
+        let mut row = serde_json::Map::from_iter([
+            ("id".into(), json!(1)),
+            ("content".into(), json!("hello")),
+            ("embed_content".into(), json!(vec![0.0; 1536])),
+        ]);
+        for index in 0..fixed_count {
             let field = if index == 0 {
                 "vector".to_owned()
             } else {
                 format!("v{index}")
             };
-            (field, json!({"type":"[2]f32","ann":true}))
-        })
-        .collect::<serde_json::Map<_, _>>();
-    let mut row = serde_json::Map::from_iter([("id".into(), json!(1))]);
-    for field in schema.keys() {
-        row.insert(field.clone(), json!([1, 0]));
+            schema.insert(field.clone(), json!({"type":"[2]f32","ann":true}));
+            row.insert(field, json!([1, 0]));
+        }
+        schema.insert(
+            "content".into(),
+            json!({"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":1536}}),
+        );
+        let result = response(
+            &client,
+            token,
+            &url,
+            json!({"schema":schema,"distance_metric":"cosine_distance","upsert_rows":[row]}),
+        )
+        .await;
+        let _ = client.delete(&url).bearer_auth(token).send().await;
+        assert_eq!(
+            result.0, expected,
+            "{fixed_count} fixed plus embedding: {}",
+            result.1
+        );
     }
-    let ninth = response(
-        &client,
-        token,
-        &url,
-        json!({"schema":schema,"distance_metric":"cosine_distance","upsert_rows":[row]}),
-    )
-    .await;
-    let _ = client.delete(&url).bearer_auth(token).send().await;
-    assert_eq!(
-        ninth.0,
-        StatusCode::BAD_REQUEST,
-        "nine vectors: {}",
-        ninth.1
-    );
 }
 
 fn ids(result: &Value) -> Vec<u64> {

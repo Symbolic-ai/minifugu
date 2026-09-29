@@ -235,6 +235,7 @@ impl Namespace {
     }
 }
 
+#[derive(Debug)]
 pub enum WriteError {
     Invalid(String),
     EmbeddingUnavailable,
@@ -316,12 +317,23 @@ impl Namespace {
         if self
             .schema
             .get("vector")
-            .is_none_or(|definition| definition == "[]unknown")
+            .is_none_or(|definition| field_type(definition) == "[]unknown")
         {
             if let Some(dimensions) = inferred_vector_dimensions(object)? {
                 let definition = json!({"type": format!("[{dimensions}]f32"), "ann": true});
                 validate_definition("vector", &definition)?;
                 self.schema.insert("vector".into(), definition);
+            }
+        }
+        for (field, definition) in &self.schema {
+            if has_embed(definition) {
+                let generated = format!("embed_{field}");
+                if self.schema.contains_key(&generated) {
+                    return Err(format!(
+                        "automatic embedded attribute for `{field}` conflicts with existing attribute `{generated}`"
+                    )
+                    .into());
+                }
             }
         }
         let generated_vectors = self
@@ -411,18 +423,7 @@ impl Namespace {
                 }
             }
         }
-        let current_vectors = vector_attributes(&self.schema);
-        if existing_namespace {
-            if let Some(field) = current_vectors.difference(&previous_vectors).next() {
-                return Err(format!(
-                    "cannot add new vector attribute '{field}' to an existing namespace"
-                )
-                .into());
-            }
-        }
-        if current_vectors.len() > 8 {
-            return Err("a namespace supports at most 8 vector attributes".into());
-        }
+        validate_vector_lifecycle(&self.schema, &previous_vectors, existing_namespace)?;
         if self.distance_metric.is_none()
             && self.schema.values().any(|definition| {
                 (vector::dimensions(definition).is_some()
@@ -567,7 +568,10 @@ impl Namespace {
                     }
                     // `[]unknown` comes from an empty array; the first non-empty array
                     // settles the element type.
-                    let unknown = self.schema.get(field) == Some(&json!("[]unknown"))
+                    let unknown = self
+                        .schema
+                        .get(field)
+                        .is_some_and(|definition| field_type(definition) == "[]unknown")
                         && value.as_array().is_some_and(|values| !values.is_empty());
                     if !self.schema.contains_key(field) || unknown {
                         match infer_type(field, value)? {
@@ -615,6 +619,9 @@ impl Namespace {
                 upserted_ids.push(id);
             }
         }
+        // Row-level schema inference can add indexed vector fields after the
+        // schema block above. Check again before committing the cloned namespace.
+        validate_vector_lifecycle(&self.schema, &previous_vectors, existing_namespace)?;
         let mut result = json!({
             "status":"OK", "message":"success",
             "rows_affected": upserted_ids.len() + patched_ids.len() + deleted_ids.len(),
@@ -665,8 +672,11 @@ fn vector_attributes(schema: &Map<String, Value>) -> BTreeSet<String> {
     let mut fields = BTreeSet::new();
     for (field, definition) in schema {
         if is_fixed_vector(definition)
-            || vector::multi_dimensions(definition).is_some()
-            || (field == "vector" && definition == "[]unknown")
+            || (vector::multi_dimensions(definition).is_some()
+                && definition
+                    .get("ann")
+                    .is_some_and(|ann| ann == &Value::Bool(true) || ann.is_object()))
+            || (field == "vector" && field_type(definition) == "[]unknown")
         {
             fields.insert(field.clone());
         }
@@ -675,6 +685,27 @@ fn vector_attributes(schema: &Map<String, Value>) -> BTreeSet<String> {
         }
     }
     fields
+}
+
+fn validate_vector_lifecycle(
+    schema: &Map<String, Value>,
+    previous: &BTreeSet<String>,
+    existing_namespace: bool,
+) -> Result<(), WriteError> {
+    let current = vector_attributes(schema);
+    if existing_namespace {
+        let added = current.difference(previous).cloned().collect::<Vec<_>>();
+        if !added.is_empty() {
+            return Err(format!(
+                "cannot add new vector attributes to an existing namespace: {}",
+                added.join(", ")
+            )
+            .into());
+        }
+    } else if current.len() > 8 {
+        return Err("a namespace supports at most 8 vector attributes".into());
+    }
+    Ok(())
 }
 
 fn validate_distinct_document_ids(object: &Map<String, Value>) -> Result<(), WriteError> {
@@ -1284,4 +1315,55 @@ fn uuid_like(value: &str) -> bool {
                 b.is_ascii_hexdigit()
             }
         })
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_vector_placeholder_upgrades_in_both_schema_forms() {
+        for placeholder in [json!("[]unknown"), json!({"type":"[]unknown"})] {
+            let mut namespace = Namespace {
+                schema: Map::from_iter([
+                    ("id".into(), json!("uint")),
+                    ("vector".into(), placeholder),
+                ]),
+                distance_metric: Some("cosine_distance".into()),
+                created_at: Some(Utc::now()),
+                ..Namespace::default()
+            };
+            namespace
+                .write(
+                    &json!({"upsert_rows":[{"id":1,"vector":[1.0,0.0]}]}),
+                    &EmbeddingMode::Deterministic,
+                )
+                .await
+                .unwrap();
+            assert_eq!(field_type(&namespace.schema["vector"]), "[2]f32");
+            assert_eq!(namespace.schema["vector"]["ann"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_namespace_over_the_new_cap_can_still_write() {
+        let mut schema = Map::from_iter([("id".into(), json!("uint"))]);
+        let mut row = Map::from_iter([("id".into(), json!(1))]);
+        for index in 0..9 {
+            let field = format!("v{index}");
+            schema.insert(field.clone(), json!({"type":"[2]f32","ann":true}));
+            row.insert(field, json!([1.0, 0.0]));
+        }
+        let mut namespace = Namespace {
+            schema,
+            distance_metric: Some("cosine_distance".into()),
+            created_at: Some(Utc::now()),
+            ..Namespace::default()
+        };
+        let result = namespace
+            .write(&json!({"upsert_rows":[row]}), &EmbeddingMode::Deterministic)
+            .await
+            .unwrap();
+        assert_eq!(result["rows_upserted"], 1);
+    }
 }

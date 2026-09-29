@@ -2539,6 +2539,18 @@ async fn vector_columns_are_fixed_at_namespace_creation_and_capped_at_eight() {
         .unwrap()
         .contains("cannot add new vector attribute"));
 
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"schema":{"s":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}}},"upsert_rows":[{"id":2,"v1":[1,0],"s":{"1":1.0}}]}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "sparse fields can be added later: {body}"
+    );
+
     let url = format!("{base}/scalar-to-vector");
     let (status, body) = post(&client, &url, json!({"upsert_rows":[{"id":1,"title":"a"}]})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -2553,6 +2565,56 @@ async fn vector_columns_are_fixed_at_namespace_creation_and_capped_at_eight() {
         .as_str()
         .unwrap()
         .contains("cannot add new vector attribute"));
+
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"distance_metric":"cosine_distance","upsert_rows":[{"id":2,"vector":[1,0]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "inferred vector: {body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("cannot add new vector attribute"));
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"schema":{"content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":2}}},"distance_metric":"cosine_distance"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "embedded vector: {body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("cannot add new vector attribute"));
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({"upsert_rows":[{"id":2,"mv":[[1,0],[0,1]]}]}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unindexed inferred multi-vector: {body}"
+    );
+
+    let (status, body) = post(
+        &client,
+        &format!("{base}/embed-name-collision"),
+        json!({"schema":{"content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":2}},"embed_content":{"type":"[2]f16","ann":true}},"distance_metric":"cosine_distance","upsert_rows":[{"id":1,"content":"hi","embed_content":[0,0]}]}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "embed name collision: {body}"
+    );
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("conflicts with existing attribute"));
 
     for count in [8, 9] {
         let names = (0..count)
