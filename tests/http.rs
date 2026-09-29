@@ -2300,6 +2300,72 @@ async fn embedded_upserts_require_text_or_accept_an_explicit_generated_vector() 
 }
 
 #[tokio::test]
+async fn embedding_can_target_an_existing_float32_vector() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/embedding-existing-vector");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{
+                "id":"uint",
+                "text":{"type":"string","embed":{
+                    "model":"openai/text-embedding-3-small","dims":4,"attribute":"vector"
+                }},
+                "vector":{"type":"[4]f32","ann":true}
+            },
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"text":"fugu"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["id","asc"],"limit":1,"include_attributes":["id","text","vector"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["vector"].as_array().unwrap().len(), 4);
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({
+            "upsert_rows":[{"id":2,"vector":[0.1234567,0.0,0.0,0.0]}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["id","asc"],"limit":2,"include_attributes":["id","vector"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!((body["rows"][1]["vector"][0].as_f64().unwrap() - 0.1234567).abs() < 1e-7);
+    let (status, body) = post(
+        &client,
+        &format!("{base}/embedding-bad-target"),
+        json!({
+            "schema":{"id":"uint","text":{"type":"string","embed":{
+                "model":"openai/text-embedding-3-small","dims":4,"attribute":"text"
+            }}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"text":"fugu"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
 async fn embedding_schema_shorthand_infers_supported_model_dimensions() {
     let base = server().await;
     let client = Client::new();

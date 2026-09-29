@@ -1,3 +1,4 @@
+use crate::store::embedding_target;
 use crate::vector;
 use serde_json::{json, Map, Value};
 
@@ -224,7 +225,7 @@ fn collect_query_embeddings(
                 .and_then(|definition| definition.get("embed"));
             let (target, dims) = if let Some(config) = source {
                 (
-                    format!("embed_{field}"),
+                    embedding_target(field, config),
                     config.get("dims").and_then(Value::as_u64).unwrap_or(1536) as usize,
                 )
             } else if let Some(base) = field.strip_prefix("embed_") {

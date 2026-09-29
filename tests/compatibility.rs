@@ -765,6 +765,7 @@ async fn local_contract() {
     inferred_vector_contract(&format!("http://{address}"), "dummy").await;
     embedded_write_contract(&format!("http://{address}"), "dummy").await;
     vector_lifecycle_contract(&format!("http://{address}"), "dummy").await;
+    embedding_target_contract(&format!("http://{address}"), "dummy").await;
     embed_schema_contract(&format!("http://{address}"), "dummy").await;
     sort_validation_contract(&format!("http://{address}"), "dummy").await;
     query_embed_contract(&format!("http://{address}"), "dummy").await;
@@ -792,6 +793,7 @@ async fn optional_real_turbopuffer_contract() {
     inferred_vector_contract(base.trim_end_matches('/'), &token).await;
     embedded_write_contract(base.trim_end_matches('/'), &token).await;
     vector_lifecycle_contract(base.trim_end_matches('/'), &token).await;
+    embedding_target_contract(base.trim_end_matches('/'), &token).await;
     embed_schema_contract(base.trim_end_matches('/'), &token).await;
     sort_validation_contract(base.trim_end_matches('/'), &token).await;
     query_embed_contract(base.trim_end_matches('/'), &token).await;
@@ -1167,6 +1169,89 @@ async fn embed_schema_contract(base: &str, token: &str) {
         assert_eq!(update.0, StatusCode::OK, "embed update: {}", update.1);
         assert_eq!(schema["embed_narrow"]["type"], "[256]f16");
     }
+}
+
+async fn embedding_target_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-embed-target-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let schema_url = format!("{base}/v1/namespaces/{name}/schema");
+    let metadata_url = format!("{base}/v1/namespaces/{name}/metadata");
+    let setup = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","text":{"type":"string","embed":{
+                "model":"openai/text-embedding-3-small","dims":256,"attribute":"vector"
+            }}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"text":"pufferfish"},{"id":2,"text":"blue whale"}]
+        }),
+    )
+    .await;
+    let schema: Value = client
+        .get(&schema_url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let metadata: Value = client
+        .get(&metadata_url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let query = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["text","ANN",["Embed","pufferfish"]],"limit":2
+        }),
+    )
+    .await;
+    let mut vector = vec![0.0; 256];
+    vector[0] = 1.0;
+    let explicit = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "upsert_rows":[{"id":3,"vector":vector}]
+        }),
+    )
+    .await;
+    let projection = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["id","asc"],"limit":3,"include_attributes":["id","text","vector"]
+        }),
+    )
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(setup.0, StatusCode::OK, "{setup:?}");
+    assert_eq!(schema["vector"]["type"], "[256]f16");
+    assert!(schema.get("embed_text").is_none());
+    assert_eq!(metadata["schema"]["text"]["embed"]["attribute"], "vector");
+    assert_eq!(query.0, StatusCode::OK, "{query:?}");
+    assert_eq!(query.1["rows"][0]["id"], 1);
+    assert_eq!(explicit.0, StatusCode::OK, "{explicit:?}");
+    assert_eq!(projection.0, StatusCode::OK, "{projection:?}");
+    assert_eq!(ids(&projection.1), vec![1, 2, 3]);
+    assert_eq!(
+        projection.1["rows"][2]["vector"].as_array().unwrap().len(),
+        256
+    );
+    assert_eq!(cleanup.status(), StatusCode::OK);
 }
 
 async fn embedded_write_contract(base: &str, token: &str) {
