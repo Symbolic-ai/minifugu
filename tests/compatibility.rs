@@ -865,6 +865,33 @@ async fn ann_contract(base: &str, token: &str) {
         .await;
         assert_eq!(status, expected, "scalar ANN write: {reply}");
         if status == StatusCode::OK {
+            let query_url = format!("{url}/query");
+            let scalar_metric = response(
+                &client,
+                token,
+                &query_url,
+                json!({"rank_by":["id","asc"],"limit":1,"distance_metric":"cosine_distance"}),
+            )
+            .await;
+            assert_eq!(
+                scalar_metric.0,
+                StatusCode::BAD_REQUEST,
+                "scalar metric: {}",
+                scalar_metric.1
+            );
+            let aggregate_metric = response(
+                &client,
+                token,
+                &query_url,
+                json!({"aggregate_by":{"total":["Count"]},"distance_metric":"cosine_distance"}),
+            )
+            .await;
+            assert_eq!(
+                aggregate_metric.0,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "aggregate metric: {}",
+                aggregate_metric.1
+            );
             assert_eq!(
                 client
                     .delete(&url)
