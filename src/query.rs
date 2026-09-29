@@ -653,19 +653,24 @@ fn validate_query_options(object: &Map<String, Value>) -> Result<(), String> {
         .get("vector_encoding")
         .is_some_and(|encoding| !matches!(encoding.as_str(), Some("float" | "base64")))
     {
+        if object["vector_encoding"].is_string() {
+            return Err(crate::shape_error(
+                "vector_encoding must be float or base64",
+            ));
+        }
         return Err("vector_encoding must be float or base64".into());
     }
     if let Some(consistency) = object.get("consistency") {
         let consistency = consistency
             .as_object()
-            .ok_or("consistency must be an object")?;
-        if consistency.len() != 1
-            || !matches!(
-                consistency.get("level").and_then(Value::as_str),
-                Some("strong" | "eventual")
-            )
-        {
-            return Err("consistency.level must be strong or eventual".into());
+            .ok_or_else(|| crate::shape_error("consistency must be an object"))?;
+        if !matches!(
+            consistency.get("level").and_then(Value::as_str),
+            Some("strong" | "eventual")
+        ) {
+            return Err(crate::shape_error(
+                "consistency.level must be strong or eventual",
+            ));
         }
     }
     if object.get("distance_metric").is_some_and(|value| {
@@ -674,7 +679,9 @@ fn validate_query_options(object: &Map<String, Value>) -> Result<(), String> {
             Some("cosine_distance" | "euclidean_squared")
         )
     }) {
-        return Err("distance_metric must be cosine_distance or euclidean_squared".into());
+        return Err(crate::shape_error(
+            "distance_metric must be cosine_distance or euclidean_squared",
+        ));
     }
     Ok(())
 }

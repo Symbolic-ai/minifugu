@@ -803,6 +803,11 @@ async fn query_shape_errors_use_live_status_codes() {
         json!({"rank_by":["id","asc"],"limit":1,"compute_attributes":[]}),
         json!({"rank_by":["id","asc"],"limit":1,"compute_attributes":{"x":["id","VectorDist"]}}),
         json!({"aggregate_by":{"count":["Count"]},"group_by":"id"}),
+        json!({"rank_by":["id","asc"],"limit":1,"consistency":"strong"}),
+        json!({"rank_by":["id","asc"],"limit":1,"consistency":{"level":"invalid"}}),
+        json!({"rank_by":["id","asc"],"limit":1,"vector_encoding":"invalid"}),
+        json!({"rank_by":["id","asc"],"limit":1,"distance_metric":"invalid"}),
+        json!({"rank_by":["id","asc"],"limit":1,"distance_metric":1}),
     ] {
         let (status, body) = post(&client, &query_url, query.clone()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{query}: {body}");
@@ -821,6 +826,16 @@ async fn query_shape_errors_use_live_status_codes() {
     let (status, result) = post(&client, &query_url, json!({"queries":vec![subquery; 16]})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["results"].as_array().unwrap().len(), 16);
+    assert_eq!(
+        post(
+            &client,
+            &query_url,
+            json!({"rank_by":["id","asc"],"limit":1,"consistency":{"level":"strong","extra":1}})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
     for query in [
         json!({"rank_by":["id","asc"],"limit":10000,"offset":1}),
         json!({"rank_by":["id","asc"],"top_k":1,"offset":10000}),
