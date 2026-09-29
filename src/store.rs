@@ -315,17 +315,18 @@ impl Namespace {
                 self.schema.insert(field.clone(), definition);
             }
         }
-        // Live Turbopuffer infers an undeclared `vector` attribute as an ANN-indexed
-        // `[N]f32` from the upserted values, so the metric checks below must see it.
-        if self
-            .schema
-            .get("vector")
-            .is_none_or(|definition| field_type(definition) == "[]unknown")
-        {
-            if let Some(dimensions) = inferred_vector_dimensions(object)? {
-                let definition = json!({"type": format!("[{dimensions}]f32"), "ann": true});
-                validate_definition("vector", &definition)?;
-                self.schema.insert("vector".into(), definition);
+        // Every embedded source writes one vector attribute: its named target or
+        // the default embed_<source>. Live rejects two sources that share one.
+        let mut targets = std::collections::BTreeSet::new();
+        for (field, definition) in &self.schema {
+            if let Some(config) = definition.get("embed") {
+                let target = embedding_target(field, config);
+                if !targets.insert(target.clone()) {
+                    return Err(format!(
+                        "cannot have multiple embedded attributes targeting the attribute `{target}`"
+                    )
+                    .into());
+                }
             }
         }
         // Named embedding targets become ordinary vector attributes in the schema.
@@ -361,6 +362,19 @@ impl Namespace {
                     target,
                     json!({"type":format!("[{dimensions}]f16"),"ann":true}),
                 );
+            }
+        }
+        // Live Turbopuffer infers an undeclared `vector` attribute as an ANN-indexed
+        // `[N]f32` from the upserted values, so the metric checks below must see it.
+        if self
+            .schema
+            .get("vector")
+            .is_none_or(|definition| field_type(definition) == "[]unknown")
+        {
+            if let Some(dimensions) = inferred_vector_dimensions(object)? {
+                let definition = json!({"type": format!("[{dimensions}]f32"), "ann": true});
+                validate_definition("vector", &definition)?;
+                self.schema.insert("vector".into(), definition);
             }
         }
         for (field, definition) in &self.schema {
@@ -1276,7 +1290,9 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
             .get("attribute")
             .is_some_and(|value| !value.is_string())
         {
-            return Err(format!("invalid embed target for attribute {field}"));
+            return Err(crate::shape_error(format!(
+                "schema.{field}: embed.attribute must be a string"
+            )));
         }
     }
     if vector::dimensions(definition).is_some()

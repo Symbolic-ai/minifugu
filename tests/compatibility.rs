@@ -1237,7 +1237,85 @@ async fn embedding_target_contract(base: &str, token: &str) {
         }),
     )
     .await;
+    let null_target = response(
+        &client,
+        token,
+        &url,
+        json!({"upsert_rows":[{"id":4,"text":"sea urchin","vector":null}]}),
+    )
+    .await;
+    let null_projection = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "filters":["id","Eq",4],"rank_by":["id","asc"],"limit":1,
+            "include_attributes":["vector"]
+        }),
+    )
+    .await;
     let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    let embed = |attribute: Value| {
+        json!({"type":"string","embed":{
+            "model":"openai/text-embedding-3-small","dims":256,"attribute":attribute
+        }})
+    };
+    let mut rejected = Vec::new();
+    for (label, schema) in [
+        (
+            "shared target",
+            json!({"id":"uint","a":embed(json!("vector")),"b":embed(json!("vector"))}),
+        ),
+        (
+            "named target collides with default",
+            json!({"id":"uint","a":embed(json!("embed_b")),"b":{"type":"string","embed":{
+                "model":"openai/text-embedding-3-small","dims":256
+            }}}),
+        ),
+        (
+            "non-string target",
+            json!({"id":"uint","a":embed(json!(5))}),
+        ),
+    ] {
+        let rejected_url = format!(
+            "{base}/v2/namespaces/minifugu-embed-target-bad-{}",
+            Uuid::new_v4().simple()
+        );
+        let result = response(
+            &client,
+            token,
+            &rejected_url,
+            json!({
+                "schema":schema,"distance_metric":"cosine_distance",
+                "upsert_rows":[{"id":1,"a":"x","b":"y"}]
+            }),
+        )
+        .await;
+        let _ = client.delete(&rejected_url).bearer_auth(token).send().await;
+        rejected.push((label, result));
+    }
+    assert_eq!(rejected[0].1 .0, StatusCode::BAD_REQUEST, "{rejected:?}");
+    assert_eq!(rejected[1].1 .0, StatusCode::BAD_REQUEST, "{rejected:?}");
+    assert_eq!(
+        rejected[2].1 .0,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{rejected:?}"
+    );
+    assert!(
+        rejected[..2].iter().all(|(_, (_, body))| body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("multiple embedded attributes targeting"))),
+        "{rejected:?}"
+    );
+    assert_eq!(null_target.0, StatusCode::OK, "{null_target:?}");
+    assert_eq!(null_projection.0, StatusCode::OK, "{null_projection:?}");
+    assert_eq!(
+        null_projection.1["rows"][0]["vector"]
+            .as_array()
+            .map(Vec::len),
+        Some(256),
+        "{null_projection:?}"
+    );
     assert_eq!(setup.0, StatusCode::OK, "{setup:?}");
     assert_eq!(schema["vector"]["type"], "[256]f16");
     assert!(schema.get("embed_text").is_none());
