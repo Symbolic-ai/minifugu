@@ -1953,6 +1953,12 @@ async fn namespaces_can_be_copied_and_then_diverge() {
         .unwrap();
     assert_eq!(first["namespaces"].as_array().unwrap().len(), 2);
     assert!(first["next_cursor"].is_string());
+    let decoded = STANDARD
+        .decode(first["next_cursor"].as_str().unwrap())
+        .unwrap();
+    let cursor: Value = serde_json::from_slice(&decoded).unwrap();
+    assert_eq!(cursor["continuation_token"], Value::Null);
+    assert_eq!(cursor["start_after"], "copy-table/");
     let second: Value = client
         .get(format!(
             "{origin}/v1/namespaces?page_size=2&cursor={}",
@@ -1966,6 +1972,42 @@ async fn namespaces_can_be_copied_and_then_diverge() {
         .await
         .unwrap();
     assert_eq!(second["namespaces"].as_array().unwrap().len(), 1);
+    assert!(second["next_cursor"].is_null());
+    // Live returns a cursor for a full page even when it was the final page.
+    let exact: Value = client
+        .get(format!("{origin}/v1/namespaces?page_size=3"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(exact["namespaces"].as_array().unwrap().len(), 3);
+    assert!(exact["next_cursor"].is_string());
+    let after_exact: Value = client
+        .get(format!(
+            "{origin}/v1/namespaces?page_size=3&cursor={}",
+            exact["next_cursor"].as_str().unwrap()
+        ))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after_exact["namespaces"], json!([]));
+    assert!(after_exact["next_cursor"].is_null());
+    for cursor in ["source", "e30=", "!!", ""] {
+        let response = client
+            .get(format!("{origin}/v1/namespaces?cursor={cursor}"))
+            .bearer_auth("dummy")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
     let prefix: Value = client
         .get(format!("{origin}/v1/namespaces?prefix=bra"))
         .bearer_auth("dummy")
