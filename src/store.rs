@@ -307,6 +307,16 @@ impl Namespace {
                 self.schema.insert(field.clone(), definition);
             }
         }
+        // Live Turbopuffer infers an undeclared `vector` attribute as an ANN-indexed
+        // `[N]f32` from the upserted values, so the metric checks below must see it.
+        if !self.schema.contains_key("vector") {
+            if let Some(dimensions) = inferred_vector_dimensions(object)? {
+                self.schema.insert(
+                    "vector".into(),
+                    json!({"type": format!("[{dimensions}]f32"), "ann": true}),
+                );
+            }
+        }
         let mut normalized = body.clone();
         vector::normalize_write(&mut normalized, &self.schema)?;
         let object = normalized
@@ -362,7 +372,7 @@ impl Namespace {
                     || has_embed(v)
             }) {
                 return Err(WriteError::Invalid(
-                    "distance_metric requires a vector attribute".into(),
+                    "the `distance_metric` field cannot be provided, namespace configured without vector indexing".into(),
                 ));
             }
             self.distance_metric = Some(metric.into());
@@ -693,6 +703,44 @@ fn write_rows(
         (None, Some(columns)) => Ok(Some(rows_from_columns(columns)?)),
         (None, None) => Ok(None),
     }
+}
+
+/// Dimensions of the numeric `vector` values an upsert carries, or `None` when it
+/// carries none. Mismatched lengths fail as they do on the live service.
+fn inferred_vector_dimensions(object: &Map<String, Value>) -> Result<Option<usize>, WriteError> {
+    let values: Vec<&Value> =
+        if let Some(rows) = object.get("upsert_rows").and_then(Value::as_array) {
+            rows.iter().filter_map(|row| row.get("vector")).collect()
+        } else if let Some(column) = object
+            .get("upsert_columns")
+            .and_then(|columns| columns.get("vector"))
+            .and_then(Value::as_array)
+        {
+            column.iter().collect()
+        } else {
+            return Ok(None);
+        };
+    let mut dimensions = None;
+    for value in values {
+        let Some(vector) = value.as_array() else {
+            continue;
+        };
+        if vector.is_empty() || !vector.iter().all(Value::is_number) {
+            continue;
+        }
+        match dimensions {
+            None => dimensions = Some(vector.len()),
+            Some(expected) if expected != vector.len() => {
+                return Err(format!(
+                    "All nested vectors must have the same number of dimensions, got: {expected} and {}",
+                    vector.len()
+                )
+                .into());
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(dimensions)
 }
 
 fn rows_from_columns(columns: &Value) -> Result<Vec<Value>, WriteError> {
