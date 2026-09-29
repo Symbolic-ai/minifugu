@@ -264,12 +264,31 @@ impl Namespace {
             let schema = schema.as_object().ok_or("schema must be an object")?;
             for (field, definition) in schema {
                 validate_definition(field, definition)?;
-                if let Some(previous) = self.schema.get(field) {
+                let definition = if let Some(previous) = self.schema.get(field) {
                     if field_type(previous) != field_type(definition) {
                         return Err(format!("cannot change the type of attribute {field}").into());
                     }
-                }
-                self.schema.insert(field.clone(), definition.clone());
+                    if field == "id" {
+                        definition.clone()
+                    } else if let Some(update) = definition.as_object() {
+                        let mut merged = previous.as_object().cloned().unwrap_or_else(|| {
+                            Map::from_iter([("type".into(), json!(field_type(previous)))])
+                        });
+                        merged
+                            .entry("filterable")
+                            .or_insert_with(|| json!(effective_filterable(previous)));
+                        merged.extend(update.clone());
+                        Value::Object(merged)
+                    } else {
+                        // Shorthand replaces search/index options but leaves the
+                        // current filterability of an existing field in place.
+                        json!({"type":definition,"filterable":effective_filterable(previous)})
+                    }
+                } else {
+                    definition.clone()
+                };
+                validate_definition(field, &definition)?;
+                self.schema.insert(field.clone(), definition);
             }
         }
         let mut normalized = body.clone();
@@ -626,6 +645,13 @@ fn default_filterable(definition: &Value) -> bool {
         || matches!(field_type(definition), "{}f16" | "bytes"))
 }
 
+fn effective_filterable(definition: &Value) -> bool {
+    definition
+        .get("filterable")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| default_filterable(definition))
+}
+
 fn is_fixed_vector(definition: &Value) -> bool {
     vector::dimensions(definition).is_some() && vector::multi_dimensions(definition).is_none()
 }
@@ -663,6 +689,14 @@ fn validate_attribute_name(field: &str) -> Result<(), String> {
 
 fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
     validate_attribute_name(field)?;
+    if definition
+        .as_object()
+        .is_some_and(|config| !config.contains_key("type"))
+    {
+        return Err(crate::shape_error(format!(
+            "schema.{field} requires a type"
+        )));
+    }
     if let Some(config) = definition.as_object() {
         for (option, value) in config {
             match option.as_str() {

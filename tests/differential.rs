@@ -276,7 +276,7 @@ async fn generated_queries_match_live() {
                     ));
                 }
             }
-            let schema = json!({"title":{"type":"string","full_text_search":true,"regex":true}});
+            let schema = json!({"title":{"type":"string","regex":true}});
             let local_schema_url =
                 local_url.replace("/v2/namespaces/", "/v1/namespaces/") + "/schema";
             let live_schema_url =

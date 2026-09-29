@@ -501,6 +501,51 @@ async fn computed_bm25_uses_live_per_row_statistics() {
 }
 
 #[tokio::test]
+async fn schema_object_updates_merge_options_and_shorthand_resets_them() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/schema-merge");
+    let schema_url = url.replace("/v2/namespaces/", "/v1/namespaces/") + "/schema";
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"schema":{
+        "id":"uint", "name":{"type":"string","full_text_search":true,"glob":true},
+        "label":"string"
+    },"upsert_rows":[{"id":1,"name":"fugu","label":"fish"}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (status, schema) = post(
+        &client,
+        &schema_url,
+        json!({"name":{"type":"string","regex":true},"label":{"type":"string","regex":true}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(schema["name"]["glob"], true);
+    assert_eq!(schema["name"]["regex"], true);
+    assert_eq!(schema["name"]["filterable"], false);
+    assert!(schema["name"]["full_text_search"].is_object());
+    assert_eq!(schema["label"]["filterable"], true);
+    let (status, schema) = post(&client, &schema_url, json!({"name":"string"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(schema["name"]["filterable"], false);
+    assert_eq!(schema["name"]["full_text_search"], Value::Null);
+    assert!(schema["name"].get("glob").is_none());
+    assert!(schema["name"].get("regex").is_none());
+    assert_eq!(
+        post(&client, &schema_url, json!({"name":{"regex":true}}))
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+#[tokio::test]
 async fn aggregates_match_live_grouping_edges() {
     let base = server().await;
     let client = Client::new();
