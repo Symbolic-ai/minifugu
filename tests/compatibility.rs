@@ -632,6 +632,122 @@ async fn conditional_contract(base: &str, token: &str) {
     assert_eq!(cleanup.status(), StatusCode::OK);
 }
 
+async fn gap_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-gaps-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let write = response(&client, token, &url, json!({
+        "schema":{
+            "id":"uint",
+            "sparse":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}},
+            "name":{"type":"string","fuzzy":true},
+            "blob":"bytes",
+            "clicks":"uint",
+            "delta":"int",
+            "code":{"type":"string","regex":true},
+            "title":{"type":"string","full_text_search":{"k1":2.0,"b":0.0,"k3":8.0}}
+        },
+        "upsert_rows":[
+            {"id":1,"sparse":{"fish":1.0},"name":"Small Pufferfish","blob":"AP8=","clicks":100,"delta":-2,"code":"a-1","title":"orange orange fugu"},
+            {"id":2,"sparse":{"fish":0.5},"name":"Blue whale","blob":"AAE=","clicks":10,"delta":5,"code":"b-2","title":"blue whale"},
+            {"id":3,"name":"pufferfish are cute","clicks":0,"delta":0,"code":"c-3","title":"deep sea"}
+        ]
+    })).await;
+    let sparse = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["sparse","SparseKNN",{"fish":1.0}],"limit":2
+        }),
+    )
+    .await;
+    let fuzzy = response(&client, token, &format!("{url}/query"), json!({
+        "rank_by":["id","asc"],
+        "filters":["name","Fuzzy","pufferfsh",{"max_edit_distance":[{"min_query_chars":6,"distance":1}],"case_sensitive":false}],
+        "limit":10,"include_attributes":["blob"]
+    })).await;
+    let numeric = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["Saturate",["Attribute","clicks"],{"midpoint":100}],"limit":10
+        }),
+    )
+    .await;
+    let floor = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({"rank_by":["Max",[0.25,["title","BM25","fugu"]]],"limit":10}),
+    )
+    .await;
+    let signed = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({"rank_by":["Attribute","delta"],"limit":10}),
+    )
+    .await;
+    let clamped = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({"rank_by":["Max",[0,["Attribute","delta"]]],"limit":10}),
+    )
+    .await;
+    let regex_eq = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({"filters":["code","Eq","a-1"],"limit":10}),
+    )
+    .await;
+    let prefix = response(
+        &client,
+        token,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["title","BM25","ora",{"last_as_prefix":true}],"limit":2
+        }),
+    )
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(write.0, StatusCode::OK, "gap write: {:?}", write.1);
+    assert_eq!(sparse.0, StatusCode::OK, "sparse response: {:?}", sparse.1);
+    assert_eq!(sparse.1["rows"][0]["id"], 1);
+    assert_eq!(fuzzy.0, StatusCode::OK, "fuzzy response: {:?}", fuzzy.1);
+    // The match may end before the end of the value; the whale row stays excluded.
+    assert_eq!(ids(&fuzzy.1), [1, 3]);
+    assert_eq!(fuzzy.1["rows"][0]["blob"], "AP8=");
+    assert_eq!(
+        numeric.0,
+        StatusCode::OK,
+        "numeric response: {:?}",
+        numeric.1
+    );
+    // Attribute-derived scores keep rows that score zero.
+    assert_eq!(ids(&numeric.1), [1, 2, 3]);
+    assert_eq!(numeric.1["rows"][2]["$dist"], 0.0);
+    assert_eq!(floor.0, StatusCode::OK, "floor response: {:?}", floor.1);
+    // A scalar floor raises the score but does not add rows the text clause misses.
+    assert_eq!(ids(&floor.1), [1]);
+    assert_eq!(signed.0, StatusCode::BAD_REQUEST, "signed: {:?}", signed.1);
+    assert_eq!(clamped.0, StatusCode::OK, "clamped: {:?}", clamped.1);
+    assert_eq!(ids(&clamped.1), [2, 1, 3]);
+    // regex makes filterable=false the default, as full_text_search does.
+    assert_eq!(
+        regex_eq.0,
+        StatusCode::BAD_REQUEST,
+        "regex Eq: {:?}",
+        regex_eq.1
+    );
+    assert_eq!(prefix.0, StatusCode::OK, "prefix response: {:?}", prefix.1);
+    assert_eq!(prefix.1["rows"][0]["id"], 1);
+    assert_eq!(cleanup.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn local_contract() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -642,6 +758,7 @@ async fn local_contract() {
     grouping_contract(&format!("http://{address}"), "dummy").await;
     null_filter_contract(&format!("http://{address}"), "dummy").await;
     conditional_contract(&format!("http://{address}"), "dummy").await;
+    gap_contract(&format!("http://{address}"), "dummy").await;
 }
 
 #[tokio::test]
@@ -657,4 +774,14 @@ async fn optional_real_turbopuffer_contract() {
     grouping_contract(base.trim_end_matches('/'), &token).await;
     null_filter_contract(base.trim_end_matches('/'), &token).await;
     conditional_contract(base.trim_end_matches('/'), &token).await;
+    gap_contract(base.trim_end_matches('/'), &token).await;
+}
+
+fn ids(result: &Value) -> Vec<u64> {
+    result["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_u64().unwrap())
+        .collect()
 }

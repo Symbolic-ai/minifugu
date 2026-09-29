@@ -650,14 +650,85 @@ async fn unsupported_fields_fail_loudly() {
     let (status, body) = post(
         &client,
         &ns,
-        json!({"schema":{"title":{"type":"string","fuzzy":true}}}),
+        json!({"schema":{"title":{"type":"string","geo":true}}}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"]
         .as_str()
         .unwrap()
-        .contains("unsupported schema option fuzzy"));
+        .contains("unsupported schema option geo"));
+    for (index, schema) in [
+        json!({"terms":{"type":"{}f16","sparse_knn":{"distance_metric":"cosine_distance"}}}),
+        json!({"terms":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"},"filterable":true}}),
+        json!({"blob":{"type":"bytes","filterable":true}}),
+        json!({"vector":{"type":"[2]f32","ann":{"late_interaction":true}}}),
+        json!({"tokens":{"type":"[][2]f32","ann":{"late_interaction":false}}}),
+        json!({"tokens":{"type":"[][3073]f32"}}),
+        json!({"title":{"type":"string","full_text_search":{"b":1.5}}}),
+        json!({"title":{"type":"string","full_text_search":{"k1":0.0}}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, body) = post(
+            &client,
+            &format!("{base}/invalid-schema-{index}"),
+            json!({"schema":schema,"upsert_rows":[{"id":1}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "schema {schema}: {body}");
+    }
+    let sparse = format!("{base}/sparse-limits");
+    let (status, _) = post(
+        &client,
+        &sparse,
+        json!({
+            "schema":{"terms":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}},"blob":"bytes"},
+            "upsert_rows":[{"id":1,"terms":{"a":1.0}}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let oversized_query: serde_json::Map<String, Value> =
+        (0..1025).map(|key| (key.to_string(), json!(1.0))).collect();
+    let (status, _) = post(
+        &client,
+        &format!("{sparse}/query"),
+        json!({"rank_by":["terms","SparseKNN",oversized_query],"limit":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for rank in [json!(["terms", "asc"]), json!(["blob", "desc"])] {
+        let (status, _) = post(
+            &client,
+            &format!("{sparse}/query"),
+            json!({"rank_by":rank,"limit":1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "rank {rank}");
+    }
+    // 8 MiB of float32 values in one multi-vector attribute is the documented ceiling.
+    let tokens = format!("{base}/multivector-limits");
+    let too_many_tokens = vec![vec![0.0_f32; 2]; 8 * 1024 * 1024 / 8 + 1];
+    let (status, _) = post(
+        &client,
+        &tokens,
+        json!({
+            "schema":{"tokens":{"type":"[][2]f32"}},
+            "upsert_rows":[{"id":1,"tokens":too_many_tokens}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let oversized_blob = STANDARD.encode(vec![0_u8; 8 * 1024 * 1024 + 1]);
+    let (status, _) = post(
+        &client,
+        &sparse,
+        json!({"upsert_rows":[{"id":2,"blob":oversized_blob}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, body) = post(
         &client,
         &format!("{ns}/query"),
