@@ -1255,6 +1255,83 @@ async fn embedding_target_contract(base: &str, token: &str) {
     )
     .await;
     let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    // Reusing declared vectors: object-form `ann`, f16, the wrong dimensions, and an
+    // eighth vector column that the named target reuses rather than adds.
+    let target = |attribute: &str| {
+        json!({"type":"string","embed":{
+            "model":"openai/text-embedding-3-small","dims":256,"attribute":attribute
+        }})
+    };
+    let mut seven = serde_json::Map::new();
+    let mut seven_values = serde_json::Map::new();
+    for index in 0..7 {
+        seven.insert(format!("v{index}"), json!({"type":"[2]f32","ann":true}));
+        seven_values.insert(format!("v{index}"), json!([1.0, 0.0]));
+    }
+    let mut eight = seven.clone();
+    eight.insert("vector".into(), json!({"type":"[256]f16","ann":true}));
+    eight.insert("id".into(), json!("uint"));
+    eight.insert("t".into(), target("vector"));
+    let mut eight_row = seven_values.clone();
+    eight_row.insert("id".into(), json!(1));
+    eight_row.insert("t".into(), json!("sea urchin"));
+    let mut reuse = Vec::new();
+    for (schema, row, query) in [
+        (
+            json!({"id":"uint","vector":{"type":"[256]f32","ann":{"distance_metric":"cosine_distance"}},"t":target("vector")}),
+            json!({"id":1,"t":"sea urchin"}),
+            Some(json!({"rank_by":["t","ANN",["Embed","sea urchin"]],"limit":1})),
+        ),
+        (
+            json!({"id":"uint","vector":{"type":"[256]f16","ann":true},"t":target("vector")}),
+            json!({"id":1,"t":"sea urchin"}),
+            None,
+        ),
+        (
+            json!({"id":"uint","vector":{"type":"[128]f32","ann":true},"t":target("vector")}),
+            json!({"id":1,"t":"sea urchin"}),
+            None,
+        ),
+        (Value::Object(eight), Value::Object(eight_row), None),
+    ] {
+        let reuse_url = format!(
+            "{base}/v2/namespaces/minifugu-embed-target-reuse-{}",
+            Uuid::new_v4().simple()
+        );
+        let write = response(
+            &client,
+            token,
+            &reuse_url,
+            json!({"schema":schema,"distance_metric":"cosine_distance","upsert_rows":[row]}),
+        )
+        .await;
+        let queried = match query {
+            Some(query) => {
+                Some(response(&client, token, &format!("{reuse_url}/query"), query).await)
+            }
+            None => None,
+        };
+        let _ = client.delete(&reuse_url).bearer_auth(token).send().await;
+        reuse.push((write, queried));
+    }
+    assert_eq!(reuse[0].0 .0, StatusCode::OK, "{reuse:?}");
+    assert_eq!(
+        reuse[0]
+            .1
+            .as_ref()
+            .map(|(status, body)| (*status, body["rows"][0]["id"].clone())),
+        Some((StatusCode::OK, json!(1))),
+        "{reuse:?}"
+    );
+    assert_eq!(reuse[1].0 .0, StatusCode::OK, "{reuse:?}");
+    assert_eq!(
+        reuse[2].0,
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"status":"error","error":"💔 embedded field's dims don't match the target vector"})
+        )
+    );
+    assert_eq!(reuse[3].0 .0, StatusCode::OK, "{reuse:?}");
     let embed = |attribute: Value| {
         json!({"type":"string","embed":{
             "model":"openai/text-embedding-3-small","dims":256,"attribute":attribute
@@ -1329,6 +1406,9 @@ async fn embedding_target_contract(base: &str, token: &str) {
         projection.1["rows"][2]["vector"].as_array().unwrap().len(),
         256
     );
+    // The explicit vector is stored, not replaced by a generated one.
+    assert!((projection.1["rows"][2]["vector"][0].as_f64().unwrap() - 1.0).abs() < 1e-2);
+    assert!(projection.1["rows"][2]["vector"][1].as_f64().unwrap().abs() < 1e-2);
     assert_eq!(cleanup.status(), StatusCode::OK);
 }
 

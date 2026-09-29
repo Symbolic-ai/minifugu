@@ -349,6 +349,9 @@ impl Namespace {
             }
             let dimensions = config.get("dims").and_then(Value::as_u64).unwrap_or(1536) as usize;
             if let Some(existing) = self.schema.get(&target) {
+                if vector::dimensions(existing).is_some_and(|existing| existing != dimensions) {
+                    return Err("💔 embedded field's dims don't match the target vector".into());
+                }
                 if vector::dimensions(existing) != Some(dimensions)
                     || !matches!(
                         field_type(existing).rsplit_once(']').map(|(_, t)| t),
@@ -358,10 +361,9 @@ impl Namespace {
                     return Err(format!("embedding target {target} must be a {dimensions}-dimensional f16 or f32 vector").into());
                 }
             } else {
-                self.schema.insert(
-                    target,
-                    json!({"type":format!("[{dimensions}]f16"),"ann":true}),
-                );
+                let definition = json!({"type":format!("[{dimensions}]f16"),"ann":true});
+                validate_definition(&target, &definition)?;
+                self.schema.insert(target, definition);
             }
         }
         // Live Turbopuffer infers an undeclared `vector` attribute as an ANN-indexed
@@ -765,7 +767,8 @@ fn vector_attributes(schema: &Map<String, Value>) -> BTreeSet<String> {
             fields.insert(field.clone());
         }
         if has_embed(definition) {
-            fields.insert(format!("embed_{field}"));
+            // A named target is also a schema field, so the set counts it once.
+            fields.insert(embedding_target(field, &definition["embed"]));
         }
     }
     fields

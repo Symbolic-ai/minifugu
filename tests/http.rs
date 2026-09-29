@@ -2766,3 +2766,34 @@ async fn vector_columns_are_fixed_at_namespace_creation_and_capped_at_eight() {
         );
     }
 }
+
+#[tokio::test]
+async fn embedding_targets_reject_non_vector_and_reserved_names() {
+    // Live answers an `id` target with HTTP 500 and accepts a `$` target that then
+    // fails every query; MiniFugu rejects both, and scalar targets, with HTTP 400.
+    let base = server().await;
+    let client = Client::new();
+    for (index, (schema, expected)) in [
+        (json!({"id":"uint"}), "id"),
+        (json!({}), "$v"),
+        (json!({"other":"string"}), "other"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut schema = schema;
+        schema["t"] = json!({"type":"string","embed":{
+            "model":"openai/text-embedding-3-small","dims":256,"attribute":expected
+        }});
+        let (status, body) = post(
+            &client,
+            &format!("{base}/embedding-target-rejected-{index}"),
+            json!({
+                "schema":schema,"distance_metric":"cosine_distance",
+                "upsert_rows":[{"id":1,"t":"fugu","other":"x"}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{expected}: {body}");
+    }
+}
