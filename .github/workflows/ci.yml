@@ -26,15 +26,16 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-    env:
-      TURBOPUFFER_BASE_URL: https://gcp-us-central1.turbopuffer.com
-      TURBOPUFFER_API_KEY: ${{ secrets.TURBOPUFFER_DEV_API_KEY }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.98.0'
       - uses: Swatinem/rust-cache@v2
-      - name: Require live credentials
-        run: test -n "$TURBOPUFFER_API_KEY"
-      - run: cargo test --locked --test compatibility --test differential
+      - name: Compare with live Turbopuffer
+        env:
+          TURBOPUFFER_BASE_URL: https://gcp-us-central1.turbopuffer.com
+          TURBOPUFFER_API_KEY: ${{ secrets.TURBOPUFFER_DEV_API_KEY }}
+        run: |
+          test -n "$TURBOPUFFER_API_KEY"
+          cargo test --locked --test compatibility --test differential
