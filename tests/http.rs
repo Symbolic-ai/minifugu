@@ -2146,7 +2146,7 @@ async fn embedding_schema_shorthand_infers_supported_model_dimensions() {
                 "large":{"type":"string","embed":{"model":"openai/text-embedding-3-large"}}
             },
             "distance_metric":"cosine_distance",
-            "upsert_rows":[{"id":1,"short":"red fish","object":"blue whale"}]
+            "upsert_rows":[{"id":1,"short":"red fish","object":"blue whale","large":"green turtle"}]
         }),
     )
     .await;
