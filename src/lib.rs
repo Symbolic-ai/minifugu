@@ -14,6 +14,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -174,6 +175,10 @@ async fn list_namespaces(
     if !(1..=1000).contains(&page_size) {
         return Err(bad("page_size must be between 1 and 1000"));
     }
+    let cursor = params
+        .get("cursor")
+        .map(|cursor| decode_namespace_cursor(cursor))
+        .transpose()?;
     let guard = state.namespaces.read().await;
     let mut names = guard
         .keys()
@@ -182,15 +187,42 @@ async fn list_namespaces(
                 .get("prefix")
                 .is_none_or(|prefix| name.starts_with(prefix))
         })
-        .filter(|name| params.get("cursor").is_none_or(|cursor| *name > cursor))
+        .filter(|name| cursor.as_ref().is_none_or(|cursor| *name > cursor))
         .collect::<Vec<_>>();
     names.sort();
-    let next_cursor = (names.len() > page_size).then(|| (*names[page_size - 1]).clone());
+    let next_cursor = (names.len() >= page_size).then(|| {
+        let last = names[page_size - 1];
+        // Keep the live STANDARD encoding. Valid namespace names and the fixed JSON
+        // envelope are ASCII bytes that cannot produce '+' or '/' in base64.
+        STANDARD.encode(
+            serde_json::to_vec(&json!({
+                "continuation_token": null,
+                "start_after": format!("{last}-table/")
+            }))
+            .unwrap(),
+        )
+    });
     let mut response = json!({"namespaces": names.iter().take(page_size).map(|id| json!({"id":id})).collect::<Vec<_>>()});
-    if let Some(cursor) = next_cursor {
-        response["next_cursor"] = json!(cursor);
-    }
+    response["next_cursor"] = json!(next_cursor);
     Ok(Json(response))
+}
+
+fn decode_namespace_cursor(encoded: &str) -> Result<String, ApiError> {
+    let bytes = STANDARD
+        .decode(encoded)
+        .map_err(|_| bad("invalid cursor"))?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| bad("invalid cursor"))?;
+    let object = value.as_object().ok_or_else(|| bad("invalid cursor"))?;
+    if object.len() != 2 || object.get("continuation_token") != Some(&Value::Null) {
+        return Err(bad("invalid cursor"));
+    }
+    object
+        .get("start_after")
+        .and_then(Value::as_str)
+        .and_then(|start| start.strip_suffix("-table/"))
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| bad("invalid cursor"))
 }
 
 async fn get_schema(
