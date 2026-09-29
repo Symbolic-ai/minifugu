@@ -760,6 +760,7 @@ async fn local_contract() {
     conditional_contract(&format!("http://{address}"), "dummy").await;
     gap_contract(&format!("http://{address}"), "dummy").await;
     ann_contract(&format!("http://{address}"), "dummy").await;
+    null_sort_contract(&format!("http://{address}"), "dummy").await;
 }
 
 #[tokio::test]
@@ -777,6 +778,59 @@ async fn optional_real_turbopuffer_contract() {
     conditional_contract(base.trim_end_matches('/'), &token).await;
     gap_contract(base.trim_end_matches('/'), &token).await;
     ann_contract(base.trim_end_matches('/'), &token).await;
+    null_sort_contract(base.trim_end_matches('/'), &token).await;
+}
+
+async fn null_sort_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-null-sort-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let write = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","x":"int","y":"string"},
+            "upsert_rows":[
+                {"id":1,"x":3,"y":"b"},
+                {"id":2,"y":"d"},
+                {"id":3,"x":1,"y":"c"},
+                {"id":4,"x":null,"y":"a"},
+                {"id":5,"x":null,"y":null},
+                {"id":6,"x":3,"y":null}
+            ]
+        }),
+    )
+    .await;
+    let cases = [
+        (json!(["x", "asc"]), vec![2, 4, 5, 3, 1, 6]),
+        (json!(["x", "desc"]), vec![1, 6, 3, 2, 4, 5]),
+        (json!([["x", "asc"], ["y", "asc"]]), vec![5, 4, 2, 3, 6, 1]),
+        (json!([["x", "desc"], ["y", "asc"]]), vec![6, 1, 3, 5, 4, 2]),
+    ];
+    let results: Result<Vec<_>, reqwest::Error> = async {
+        let mut results = Vec::new();
+        for (rank, expected) in cases {
+            let response = client
+                .post(format!("{url}/query"))
+                .bearer_auth(token)
+                .json(&json!({"rank_by":rank,"limit":10}))
+                .send()
+                .await?;
+            let status = response.status();
+            let reply = response.json::<Value>().await?;
+            results.push((rank, expected, status, reply));
+        }
+        Ok(results)
+    }
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(write.0, StatusCode::OK, "null-sort write: {}", write.1);
+    assert_eq!(cleanup.status(), StatusCode::OK);
+    for (rank, expected, status, reply) in results.expect("null-sort query failed") {
+        assert_eq!(status, StatusCode::OK, "rank {rank}: {reply}");
+        assert_eq!(ids(&reply), expected, "rank {rank}");
+    }
 }
 
 async fn ann_contract(base: &str, token: &str) {

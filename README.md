@@ -88,7 +88,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked
 ```
 
-All ordinary tests are local and keyless. With `TURBOPUFFER_BASE_URL` and `TURBOPUFFER_API_KEY` set, `tests/compatibility.rs` runs its disposable synthetic contract against live Turbopuffer, and `tests/differential.rs` compares 258 generated queries with both dense metrics, 12 multiquery/RRF cases, nine write attempts per namespace, and schema and metadata updates. Run them with `cargo test --locked --test compatibility --test differential`. They delete their namespaces when finished. `tests/openai_live.rs` separately requires `MINIFUGU_LIVE_OPENAI=1` and `OPENAI_API_KEY`. The live tests do not run in CI.
+All ordinary tests are local and keyless. With `TURBOPUFFER_BASE_URL` and `TURBOPUFFER_API_KEY` set, `tests/compatibility.rs` runs its disposable synthetic contract against live Turbopuffer, and `tests/differential.rs` compares 258 generated queries with both dense metrics, 12 multiquery/RRF cases, nine write attempts per namespace, and schema and metadata updates. Run them with `cargo test --locked --test compatibility --test differential`. They delete their namespaces when finished. GitHub CI runs these live tests once on Ubuntu after a push to `main`, using the `TURBOPUFFER_DEV_API_KEY` repository secret. Pull request jobs remain keyless. `tests/openai_live.rs` separately requires `MINIFUGU_LIVE_OPENAI=1` and `OPENAI_API_KEY` and does not run in CI.
 
 Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Please report security issues privately as described in [SECURITY.md](SECURITY.md).
 
