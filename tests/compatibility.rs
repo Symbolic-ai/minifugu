@@ -763,6 +763,9 @@ async fn local_contract() {
     null_sort_contract(&format!("http://{address}"), "dummy").await;
     regex_array_contract(&format!("http://{address}"), "dummy").await;
     inferred_vector_contract(&format!("http://{address}"), "dummy").await;
+    embed_schema_contract(&format!("http://{address}"), "dummy").await;
+    sort_validation_contract(&format!("http://{address}"), "dummy").await;
+    query_embed_contract(&format!("http://{address}"), "dummy").await;
 }
 
 #[tokio::test]
@@ -783,6 +786,223 @@ async fn optional_real_turbopuffer_contract() {
     null_sort_contract(base.trim_end_matches('/'), &token).await;
     regex_array_contract(base.trim_end_matches('/'), &token).await;
     inferred_vector_contract(base.trim_end_matches('/'), &token).await;
+    embed_schema_contract(base.trim_end_matches('/'), &token).await;
+    sort_validation_contract(base.trim_end_matches('/'), &token).await;
+    query_embed_contract(base.trim_end_matches('/'), &token).await;
+}
+
+async fn sort_validation_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-sort-validation-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let write = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","tags":"[]string","a0":"int","a1":"int","a2":"int","a3":"int","a4":"int","a5":"int","a6":"int","a7":"int","a8":"int"},
+            "upsert_rows":[{"id":1,"tags":["fish"],"a0":0,"a1":1,"a2":2,"a3":3,"a4":4,"a5":5,"a6":6,"a7":7,"a8":8}]
+        }),
+    )
+    .await;
+    let order = |count| {
+        (0..count)
+            .map(|index| json!([format!("a{index}"), "asc"]))
+            .collect::<Vec<_>>()
+    };
+    let cases = [
+        (json!(["tags", "asc"]), StatusCode::BAD_REQUEST),
+        (json!(["a0", "asc"]), StatusCode::OK),
+        (json!(order(8)), StatusCode::OK),
+        (json!(order(9)), StatusCode::BAD_REQUEST),
+        (json!([]), StatusCode::BAD_REQUEST),
+    ];
+    let results: Result<Vec<_>, reqwest::Error> = async {
+        let mut results = Vec::new();
+        for (rank, expected) in cases {
+            let reply = client
+                .post(format!("{url}/query"))
+                .bearer_auth(token)
+                .json(&json!({"rank_by":rank,"limit":10}))
+                .send()
+                .await?;
+            let status = reply.status();
+            let body = reply.json::<Value>().await?;
+            results.push((rank, expected, status, body));
+        }
+        Ok(results)
+    }
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(write.0, StatusCode::OK, "sort write: {}", write.1);
+    assert_eq!(cleanup.status(), StatusCode::OK);
+    for (rank, expected, status, body) in results.expect("sort validation query failed") {
+        assert_eq!(status, expected, "rank {rank}: {body}");
+    }
+}
+
+async fn query_embed_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-query-embed-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let write = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{"id":"uint","content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":256}}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[
+                {"id":1,"content":"pufferfish swim"},
+                {"id":2,"content":"blue whale"}
+            ]
+        }),
+    )
+    .await;
+    let cases = [
+        (
+            json!(["content", "ANN", ["Embed", "pufferfish"]]),
+            StatusCode::OK,
+            Some(1_u64),
+        ),
+        (
+            json!(["embed_content", "ANN", ["Embed", "pufferfish", {"model":"openai/text-embedding-3-small"}]]),
+            StatusCode::OK,
+            Some(1),
+        ),
+        (
+            json!(["content", "kNN", ["Embed", "pufferfish"]]),
+            StatusCode::OK,
+            Some(1),
+        ),
+        (
+            json!(["content", "ANN", ["Embed", "pufferfish", {"model":"openai/text-embedding-3-large"}]]),
+            StatusCode::OK,
+            None,
+        ),
+        (
+            json!(["embed_content", "ANN", ["Embed", "pufferfish"]]),
+            StatusCode::BAD_REQUEST,
+            None,
+        ),
+        (
+            json!(["embed_content", "ANN", ["Embed", "pufferfish", {"model":null}]]),
+            StatusCode::BAD_REQUEST,
+            None,
+        ),
+        (
+            json!(["embed_content", "ANN", ["Embed", "pufferfish", {"model":"openai/text-embedding-3-small","extra":true}]]),
+            StatusCode::OK,
+            Some(1),
+        ),
+        (
+            json!(["embed_content", "ANN", ["Embed"]]),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+        ),
+        (
+            json!(["embed_content", "ANN", ["Embed", 12]]),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+        ),
+    ];
+    let results: Result<Vec<_>, reqwest::Error> = async {
+        let mut results = Vec::new();
+        for (rank, expected, winner) in cases {
+            let mut query = json!({"rank_by":rank,"limit":2});
+            if rank[1] == "kNN" {
+                query["filters"] = json!(["id", "In", [1, 2]]);
+            }
+            let reply = client
+                .post(format!("{url}/query"))
+                .bearer_auth(token)
+                .json(&query)
+                .send()
+                .await?;
+            let status = reply.status();
+            let body = reply.json::<Value>().await?;
+            results.push((rank, expected, winner, status, body));
+        }
+        Ok(results)
+    }
+    .await;
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(write.0, StatusCode::OK, "embed write: {}", write.1);
+    assert_eq!(cleanup.status(), StatusCode::OK);
+    for (rank, expected, winner, status, body) in results.expect("query embedding failed") {
+        assert_eq!(status, expected, "rank {rank}: {body}");
+        if let Some(winner) = winner {
+            assert_eq!(body["rows"][0]["id"], winner, "rank {rank}: {body}");
+        }
+    }
+}
+
+async fn embed_schema_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-embed-schema-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let schema_url = format!("{base}/v1/namespaces/{name}/schema");
+    let write = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{
+                "id":"uint",
+                "short":{"type":"string","embed":"openai/text-embedding-3-small"},
+                "object":{"type":"string","embed":{"model":"openai/text-embedding-3-small"}},
+                "large":{"type":"string","embed":{"model":"openai/text-embedding-3-large"}},
+                "narrow":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":256}}
+            },
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"short":"red fish","object":"blue whale","large":"green turtle","narrow":"yellow crab"}]
+        }),
+    )
+    .await;
+    let schema: Result<(StatusCode, Value), reqwest::Error> = async {
+        let response = client.get(&schema_url).bearer_auth(token).send().await?;
+        let status = response.status();
+        Ok((status, response.json().await?))
+    }
+    .await;
+    let mut updates = Vec::new();
+    for embed in [
+        json!({"model":"openai/text-embedding-3-small"}),
+        json!({"model":"openai/text-embedding-3-small","dims":null}),
+    ] {
+        let update = response(
+            &client,
+            token,
+            &url,
+            json!({
+                "schema":{"narrow":{"type":"string","embed":embed}}
+            }),
+        )
+        .await;
+        let current: Value = client
+            .get(&schema_url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        updates.push((update, current));
+    }
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(write.0, StatusCode::OK, "embed schema write: {}", write.1);
+    assert_eq!(cleanup.status(), StatusCode::OK);
+    let (status, schema) = schema.expect("embed schema request failed");
+    assert_eq!(status, StatusCode::OK, "embed schema: {schema}");
+    assert_eq!(schema["embed_short"]["type"], "[1536]f16");
+    assert_eq!(schema["embed_object"]["type"], "[1536]f16");
+    assert_eq!(schema["embed_large"]["type"], "[3072]f16");
+    assert_eq!(schema["embed_narrow"]["type"], "[256]f16");
+    for (update, schema) in updates {
+        assert_eq!(update.0, StatusCode::OK, "embed update: {}", update.1);
+        assert_eq!(schema["embed_narrow"]["type"], "[256]f16");
+    }
 }
 
 async fn inferred_vector_contract(base: &str, token: &str) {

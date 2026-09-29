@@ -2,6 +2,10 @@ use axum::{routing::post as axum_post, Json, Router};
 use minifugu::{deterministic_embedding, EmbeddingMode};
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tokio::net::TcpListener;
 
 async fn serve(router: Router) -> String {
@@ -723,6 +727,55 @@ async fn deterministic_native_vectors_can_be_queried_with_the_same_embedder() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["rows"][0]["id"], 1);
     assert!(result["rows"][0]["$dist"].as_f64().unwrap().abs() < 0.00001);
+    for rank in [
+        json!(["content", "ANN", ["Embed", "red fugu"]]),
+        json!(["embed_content", "ANN", ["Embed", "red fugu", {"model":"openai/text-embedding-3-small"}]]),
+        json!(["content", "kNN", ["Embed", "red fugu"]]),
+    ] {
+        let mut query = json!({"rank_by":rank,"limit":2});
+        if rank[1] == "kNN" {
+            query["filters"] = json!(["id", "In", [1, 2]]);
+        }
+        let (status, result) = post(&client, &format!("{url}/query"), query).await;
+        assert_eq!(status, StatusCode::OK, "rank {rank}: {result}");
+        assert_eq!(ids(&result), [1, 2], "rank {rank}: {result}");
+    }
+    let (status, _) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["embed_content","ANN",["Embed","red fugu"]],"limit":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for body in [
+        json!({"rank_by":["Attribute","embed_content"],"limit":2}),
+        json!({"rank_by":[["id","asc"],[["id","asc"]]],"limit":2}),
+    ] {
+        let (status, result) = post(&client, &format!("{url}/query"), body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+    }
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["id","asc"],"limit":2,
+            "compute_attributes":{"distance":["content","VectorDist",["Embed","red fugu"]]}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{result}");
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"queries":[
+            {"rank_by":["content","ANN",["Embed","red fugu"]],"limit":1},
+            {"rank_by":["content","ANN",["Embed","blue whale"]],"limit":1}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["results"][0]["rows"][0]["id"], 1);
+    assert_eq!(result["results"][1]["rows"][0]["id"], 2);
     let (status, _) = post(
         &client,
         &format!("{url}/query"),
@@ -779,6 +832,79 @@ async fn openai_mode_embeds_native_text_and_queries_it() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["rows"][0]["id"], 1);
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["content","ANN",["Embed","fugu"]],"limit":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"][0]["id"], 1);
+}
+
+#[tokio::test]
+async fn invalid_embed_queries_do_not_call_the_provider() {
+    async fn embed(
+        axum::extract::State(calls): axum::extract::State<Arc<AtomicUsize>>,
+    ) -> StatusCode {
+        calls.fetch_add(1, Ordering::SeqCst);
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = serve(
+        Router::new()
+            .route("/v1/embeddings", axum_post(embed))
+            .with_state(calls.clone()),
+    )
+    .await;
+    let base = serve(minifugu::router_with_mode(EmbeddingMode::OpenAI {
+        api_key: "test-key".into(),
+        base_url: provider,
+    }))
+    .await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/embed-validation");
+    let (status, result) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","vector":{"type":"[4]f32","ann":true}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"vector":[1.0,0.0,0.0,0.0]}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let operand =
+        json!(["vector","ANN",["Embed","fugu",{"model":"openai/text-embedding-3-small"}]]);
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":operand,"limit":0
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["Sum",vec![operand;17]],"limit":1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["vector","ANN",["Embed","fugu",{"model":"text-embedding-3-small"}]],"limit":1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 fn ids(result: &Value) -> Vec<u64> {
