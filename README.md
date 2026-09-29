@@ -49,7 +49,10 @@ Explicit vector fields work offline. A schema can also ask MiniFugu to generate 
 {"content":{"type":"string","full_text_search":true,"embed":{"model":"openai/text-embedding-3-small","dims":1536}}}
 ```
 
+For `openai/text-embedding-3-small`, `embed` may also be the model string, or an object with only `model`; MiniFugu infers its 1536 dimensions. It infers 3072 dimensions for `openai/text-embedding-3-large`. Other models need explicit `dims`. On an existing embedded field, an omitted or null `dims` keeps the stored dimension.
+
 The default provider hashes tokens deterministically. This keeps CI reproducible and keyless; these vectors are **not semantic embeddings**. Query with `"rank_by":["content","ANN",["Embed","red fugu"]]`, or pass a vector from `minifugu::deterministic_embedding(query, dims)`.
+
 
 For semantic embeddings, opt in to OpenAI:
 

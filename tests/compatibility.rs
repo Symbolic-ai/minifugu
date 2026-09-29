@@ -762,6 +762,7 @@ async fn local_contract() {
     ann_contract(&format!("http://{address}"), "dummy").await;
     null_sort_contract(&format!("http://{address}"), "dummy").await;
     regex_array_contract(&format!("http://{address}"), "dummy").await;
+    embed_schema_contract(&format!("http://{address}"), "dummy").await;
     sort_validation_contract(&format!("http://{address}"), "dummy").await;
     query_embed_contract(&format!("http://{address}"), "dummy").await;
 }
@@ -783,6 +784,7 @@ async fn optional_real_turbopuffer_contract() {
     ann_contract(base.trim_end_matches('/'), &token).await;
     null_sort_contract(base.trim_end_matches('/'), &token).await;
     regex_array_contract(base.trim_end_matches('/'), &token).await;
+    embed_schema_contract(base.trim_end_matches('/'), &token).await;
     sort_validation_contract(base.trim_end_matches('/'), &token).await;
     query_embed_contract(base.trim_end_matches('/'), &token).await;
 }
@@ -930,6 +932,74 @@ async fn query_embed_contract(base: &str, token: &str) {
         if let Some(winner) = winner {
             assert_eq!(body["rows"][0]["id"], winner, "rank {rank}: {body}");
         }
+    }
+}
+
+async fn embed_schema_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-embed-schema-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let schema_url = format!("{base}/v1/namespaces/{name}/schema");
+    let write = response(
+        &client,
+        token,
+        &url,
+        json!({
+            "schema":{
+                "id":"uint",
+                "short":{"type":"string","embed":"openai/text-embedding-3-small"},
+                "object":{"type":"string","embed":{"model":"openai/text-embedding-3-small"}},
+                "large":{"type":"string","embed":{"model":"openai/text-embedding-3-large"}},
+                "narrow":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":256}}
+            },
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"short":"red fish","object":"blue whale","large":"green turtle","narrow":"yellow crab"}]
+        }),
+    )
+    .await;
+    let schema: Result<(StatusCode, Value), reqwest::Error> = async {
+        let response = client.get(&schema_url).bearer_auth(token).send().await?;
+        let status = response.status();
+        Ok((status, response.json().await?))
+    }
+    .await;
+    let mut updates = Vec::new();
+    for embed in [
+        json!({"model":"openai/text-embedding-3-small"}),
+        json!({"model":"openai/text-embedding-3-small","dims":null}),
+    ] {
+        let update = response(
+            &client,
+            token,
+            &url,
+            json!({
+                "schema":{"narrow":{"type":"string","embed":embed}}
+            }),
+        )
+        .await;
+        let current: Value = client
+            .get(&schema_url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        updates.push((update, current));
+    }
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(write.0, StatusCode::OK, "embed schema write: {}", write.1);
+    assert_eq!(cleanup.status(), StatusCode::OK);
+    let (status, schema) = schema.expect("embed schema request failed");
+    assert_eq!(status, StatusCode::OK, "embed schema: {schema}");
+    assert_eq!(schema["embed_short"]["type"], "[1536]f16");
+    assert_eq!(schema["embed_object"]["type"], "[1536]f16");
+    assert_eq!(schema["embed_large"]["type"], "[3072]f16");
+    assert_eq!(schema["embed_narrow"]["type"], "[256]f16");
+    for (update, schema) in updates {
+        assert_eq!(update.0, StatusCode::OK, "embed update: {}", update.1);
+        assert_eq!(schema["embed_narrow"]["type"], "[256]f16");
     }
 }
 

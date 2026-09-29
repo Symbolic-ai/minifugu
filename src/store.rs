@@ -264,13 +264,14 @@ impl Namespace {
         if let Some(schema) = object.get("schema") {
             let schema = schema.as_object().ok_or("schema must be an object")?;
             for (field, definition) in schema {
-                validate_definition(field, definition)?;
+                let definition = normalize_embed_definition(definition, self.schema.get(field))?;
+                validate_definition(field, &definition)?;
                 let definition = if let Some(previous) = self.schema.get(field) {
-                    if field_type(previous) != field_type(definition) {
+                    if field_type(previous) != field_type(&definition) {
                         return Err(format!("cannot change the type of attribute {field}").into());
                     }
                     if field == "id" {
-                        definition.clone()
+                        definition.as_ref().clone()
                     } else if let Some(update) = definition.as_object() {
                         let mut merged = previous.as_object().cloned().unwrap_or_else(|| {
                             Map::from_iter([("type".into(), json!(field_type(previous)))])
@@ -301,7 +302,7 @@ impl Namespace {
                         json!({"type":definition,"filterable":effective_filterable(previous)})
                     }
                 } else {
-                    definition.clone()
+                    definition.into_owned()
                 };
                 validate_definition(field, &definition)?;
                 self.schema.insert(field.clone(), definition);
@@ -778,6 +779,48 @@ fn validate_attribute_name(field: &str) -> Result<(), String> {
         return Err(format!("cannot use reserved attribute name {field}"));
     }
     Ok(())
+}
+
+fn normalize_embed_definition<'a>(
+    definition: &'a Value,
+    previous: Option<&Value>,
+) -> Result<std::borrow::Cow<'a, Value>, String> {
+    let Some(options) = definition.as_object() else {
+        return Ok(std::borrow::Cow::Borrowed(definition));
+    };
+    let Some(embed) = options.get("embed") else {
+        return Ok(std::borrow::Cow::Borrowed(definition));
+    };
+    let model = embed
+        .as_str()
+        .or_else(|| embed.get("model").and_then(Value::as_str));
+    let Some(model) = model else {
+        return Ok(std::borrow::Cow::Borrowed(definition));
+    };
+    if embed.get("dims").is_some_and(|value| !value.is_null()) {
+        return Ok(std::borrow::Cow::Borrowed(definition));
+    }
+    let dims = if let Some(dims) = previous
+        .and_then(|value| value.get("embed"))
+        .and_then(|value| value.get("dims"))
+        .and_then(Value::as_u64)
+    {
+        dims
+    } else {
+        match model {
+            "openai/text-embedding-3-small" => 1536,
+            "openai/text-embedding-3-large" => 3072,
+            _ => return Err(format!("embed dims required for model {model}")),
+        }
+    };
+    let mut normalized = options.clone();
+    let mut config = embed
+        .as_object()
+        .cloned()
+        .unwrap_or_else(|| Map::from_iter([("model".into(), json!(model))]));
+    config.insert("dims".into(), json!(dims));
+    normalized.insert("embed".into(), Value::Object(config));
+    Ok(std::borrow::Cow::Owned(Value::Object(normalized)))
 }
 
 fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
