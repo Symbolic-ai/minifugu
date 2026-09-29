@@ -768,6 +768,8 @@ async fn local_contract() {
     embed_schema_contract(&format!("http://{address}"), "dummy").await;
     sort_validation_contract(&format!("http://{address}"), "dummy").await;
     query_embed_contract(&format!("http://{address}"), "dummy").await;
+    array_shape_contract(&format!("http://{address}"), "dummy").await;
+    multi_vector_upsert_contract(&format!("http://{address}"), "dummy").await;
 }
 
 #[tokio::test]
@@ -793,6 +795,164 @@ async fn optional_real_turbopuffer_contract() {
     embed_schema_contract(base.trim_end_matches('/'), &token).await;
     sort_validation_contract(base.trim_end_matches('/'), &token).await;
     query_embed_contract(base.trim_end_matches('/'), &token).await;
+    array_shape_contract(base.trim_end_matches('/'), &token).await;
+    multi_vector_upsert_contract(base.trim_end_matches('/'), &token).await;
+}
+
+async fn array_shape_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-array-shapes-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let setup = response(
+        &client,
+        token,
+        &url,
+        json!({"schema":{"id":"uint","tags":"[]string"},"upsert_rows":[{"id":1,"tags":["base"]}]}),
+    )
+    .await;
+    let mut results = Vec::new();
+    for (write, expected) in [
+        (
+            json!({"upsert_rows":[{"id":2,"tags":["a",1]}]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"upsert_rows":[{"id":2,"tags":["a",null]}]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"upsert_rows":[{"id":2,"nested":[[1],["a"]]}]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"upsert_columns":{"id":[2],"tags":[["a",1]]}}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"patch_rows":[{"id":1,"tags":["a",null]}]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"patch_columns":{"id":[1],"tags":[["a",1]]}}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"patch_by_filter":{"filters":["id","Eq",1],"patch":{"tags":["a",1]}}}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"upsert_rows":[{"id":2,"vector":[1,"x"]}]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"upsert_rows":[{"id":2,"vector":[1,null]}]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"schema":{"vector":{"type":"[2]f32","ann":true}},"distance_metric":"cosine_distance","upsert_rows":[{"id":2,"vector":[1,"x"]}]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"upsert_rows":[{"id":2,"item":[{"a":1},"x"]}]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"upsert_rows":[{"id":2,"item":[{"a":1},null]}]}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"upsert_rows":[{"id":2,"item":[{"a":1},{"a":2}]}]}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"upsert_rows":[{"id":2,"tags":["a",1]}],"upsert_columns":{"id":[3],"tags":[["ok"]]}}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"upsert_columns":{"id":[2],"tags":[["one","two"]]}}),
+            StatusCode::OK,
+        ),
+        (json!({"patch_rows":[{"id":1,"tags":[]}]}), StatusCode::OK),
+        (
+            json!({"patch_columns":{"id":[1],"tags":[["three","four"]]}}),
+            StatusCode::OK,
+        ),
+        (
+            json!({"patch_by_filter":{"filters":["id","Eq",1],"patch":{"tags":["five","six"]}}}),
+            StatusCode::OK,
+        ),
+        (json!({"upsert_rows":[{"id":3,"tags":[]}]}), StatusCode::OK),
+        (
+            json!({"schema":{"nums":"[]float"},"upsert_rows":[{"id":5,"nums":[1,2.5]}]}),
+            StatusCode::OK,
+        ),
+        (
+            json!({"upsert_rows":[{"id":4,"nested":[[1],[2]]}]}),
+            StatusCode::OK,
+        ),
+    ] {
+        let (status, body) = response(&client, token, &url, write.clone()).await;
+        results.push((write, expected, status, body));
+    }
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(setup.0, StatusCode::OK, "array shape setup: {}", setup.1);
+    for (write, expected, status, body) in results {
+        assert_eq!(status, expected, "{write}: {body}");
+    }
+    assert_eq!(cleanup.status(), StatusCode::OK);
+}
+
+async fn multi_vector_upsert_contract(base: &str, token: &str) {
+    let client = Client::new();
+    let name = format!("minifugu-multi-upserts-{}", Uuid::new_v4().simple());
+    let url = format!("{base}/v2/namespaces/{name}");
+    let setup = response(
+        &client,
+        token,
+        &url,
+        json!({"schema":{"title":"string"},"upsert_rows":[{"id":1,"title":"base","mv":[[1.0],[2.0]]}]}),
+    )
+    .await;
+    let mut results = Vec::new();
+    for (write, expected) in [
+        (
+            json!({"upsert_rows":[{"id":2,"title":"no mv"}]}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"upsert_rows":[{"id":2,"mv":[[3.0]]}]}),
+            StatusCode::OK,
+        ),
+        (
+            json!({"upsert_rows":[{"id":3,"mv":null}]}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"upsert_rows":[{"id":3,"mv":[]}]}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"upsert_columns":{"id":[4],"title":["no mv"]}}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"patch_rows":[{"id":1,"title":"patched"}]}),
+            StatusCode::OK,
+        ),
+        (
+            json!({"patch_columns":{"id":[1],"title":["patched again"]}}),
+            StatusCode::OK,
+        ),
+    ] {
+        let (status, body) = response(&client, token, &url, write.clone()).await;
+        results.push((write, expected, status, body));
+    }
+    let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
+    assert_eq!(setup.0, StatusCode::OK, "multi-vector setup: {}", setup.1);
+    for (write, expected, status, body) in results {
+        assert_eq!(status, expected, "{write}: {body}");
+    }
+    assert_eq!(cleanup.status(), StatusCode::OK);
 }
 
 async fn sort_validation_contract(base: &str, token: &str) {

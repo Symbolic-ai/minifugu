@@ -262,6 +262,7 @@ impl Namespace {
         crate::query::reset_text_caches();
         let object = body.as_object().ok_or("write body must be an object")?;
         validate_write_keys(object)?;
+        validate_write_array_shapes(object)?;
         let existing_namespace =
             self.created_at.is_some() || !self.schema.is_empty() || !self.rows.is_empty();
         let previous_vectors = vector_attributes(&self.schema);
@@ -559,6 +560,29 @@ impl Namespace {
                     if is_fixed_vector(definition) && row.get(field).is_none_or(Value::is_null) {
                         return Err(format!("upsert row requires vector attribute {field}").into());
                     }
+                    if vector::multi_dimensions(definition).is_some() {
+                        match row.get(field) {
+                            None => {
+                                return Err(format!(
+                                    "💔 missing writes for vector array attribute \"{field}\""
+                                )
+                                .into());
+                            }
+                            Some(Value::Null) => {
+                                return Err(format!(
+                                    "💔 vector array attribute \"{field}\" must not be null"
+                                )
+                                .into());
+                            }
+                            Some(Value::Array(vectors)) if vectors.is_empty() => {
+                                return Err(format!(
+                                    "💔 vector array attribute \"{field}\" must have at least one vector"
+                                )
+                                .into());
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 for (field, value) in &row {
                     validate_attribute_name(field)?;
@@ -772,6 +796,97 @@ pub(crate) fn validate_write_keys(object: &Map<String, Value>) -> Result<(), Str
                 | "disable_backpressure"
         ) {
             return Err(format!("unsupported write field {key}"));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum ArrayElement {
+    Bool,
+    Number,
+    String,
+    Object,
+    Array(Option<Box<Self>>),
+}
+
+fn merge_array_element(previous: &mut ArrayElement, next: ArrayElement) -> bool {
+    match next {
+        ArrayElement::Array(Some(shape)) => match previous {
+            ArrayElement::Array(None) => {
+                *previous = ArrayElement::Array(Some(shape));
+                true
+            }
+            ArrayElement::Array(Some(first)) => merge_array_element(first, *shape),
+            _ => false,
+        },
+        ArrayElement::Array(None) => matches!(previous, ArrayElement::Array(_)),
+        next => *previous == next,
+    }
+}
+
+fn array_element(value: &Value) -> Result<ArrayElement, &'static str> {
+    match value {
+        Value::Null => Err("cannot contain null"),
+        Value::Bool(_) => Ok(ArrayElement::Bool),
+        Value::Number(_) => Ok(ArrayElement::Number),
+        Value::String(_) => Ok(ArrayElement::String),
+        Value::Object(_) => Ok(ArrayElement::Object),
+        Value::Array(values) => Ok(ArrayElement::Array(array_shape(values)?.map(Box::new))),
+    }
+}
+
+fn array_shape(values: &[Value]) -> Result<Option<ArrayElement>, &'static str> {
+    let mut shape = None;
+    for value in values {
+        let next = array_element(value)?;
+        if let Some(previous) = shape.as_mut() {
+            if !merge_array_element(previous, next) {
+                return Err("must contain one element type");
+            }
+        } else {
+            shape = Some(next);
+        }
+    }
+    Ok(shape)
+}
+
+fn validate_array_cell(field: &str, value: &Value) -> Result<(), String> {
+    if let Value::Array(values) = value {
+        array_shape(values)
+            .map_err(|reason| crate::shape_error(format!("array attribute {field} {reason}")))?;
+    }
+    Ok(())
+}
+
+fn validate_write_array_shapes(object: &Map<String, Value>) -> Result<(), String> {
+    for key in ["upsert_rows", "patch_rows"] {
+        if let Some(rows) = object.get(key).and_then(Value::as_array) {
+            for row in rows.iter().filter_map(Value::as_object) {
+                for (field, value) in row {
+                    validate_array_cell(field, value)?;
+                }
+            }
+        }
+    }
+    for key in ["upsert_columns", "patch_columns"] {
+        if let Some(columns) = object.get(key).and_then(Value::as_object) {
+            for (field, values) in columns {
+                if let Some(values) = values.as_array() {
+                    for value in values {
+                        validate_array_cell(field, value)?;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(patch) = object
+        .get("patch_by_filter")
+        .and_then(|operation| operation.get("patch"))
+        .and_then(Value::as_object)
+    {
+        for (field, value) in patch {
+            validate_array_cell(field, value)?;
         }
     }
     Ok(())
