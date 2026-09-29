@@ -207,6 +207,53 @@ async fn late_interaction_vectors_sum_best_document_token_distances() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    for rank in [json!(["tokens", "asc"]), json!(["tokens", "desc"])] {
+        let (status, _) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({"rank_by":rank,"limit":2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "rank {rank}");
+    }
+    let (status, _) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"filters":["tokens","Eq",[[1.0,0.0]]],"limit":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // ANN needs the late-interaction index; exact kNN scans without one, as it does for
+    // single vectors.
+    let plain = format!("{base}/v2/namespaces/multivector-plain");
+    let (status, _) = post(
+        &client,
+        &plain,
+        json!({
+            "schema":{"id":"uint","tokens":{"type":"[][2]f32"}},
+            "distance_metric":"euclidean_squared",
+            "upsert_rows":[{"id":1,"tokens":[[1.0,0.0]]},{"id":2,"tokens":[[0.0,1.0]]}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = post(
+        &client,
+        &format!("{plain}/query"),
+        json!({"rank_by":["tokens","ANN",[[1.0,0.0]]],"limit":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, result) = post(
+        &client,
+        &format!("{plain}/query"),
+        json!({"rank_by":["tokens","kNN",[[1.0,0.0]]],"filters":["id","Gte",0],"limit":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&result), [1, 2]);
+    assert_eq!(result["rows"][0]["$dist"], 0.0);
 }
 
 #[tokio::test]
@@ -219,7 +266,11 @@ async fn fuzzy_filter_matches_edit_distance_with_case_option() {
         &url,
         json!({
             "schema":{"id":"uint","name":{"type":"string","fuzzy":true}},
-            "upsert_rows":[{"id":1,"name":"Small Pufferfish"},{"id":2,"name":"blue whale"}]
+            "upsert_rows":[
+                {"id":1,"name":"Small Pufferfish"},
+                {"id":2,"name":"blue whale"},
+                {"id":3,"name":"pufferfish are cute"}
+            ]
         }),
     )
     .await;
@@ -230,18 +281,34 @@ async fn fuzzy_filter_matches_edit_distance_with_case_option() {
         &client,
         &format!("{url}/query"),
         json!({
-            "filters":["name","Fuzzy","pufferfsh",options],"limit":10
+            "filters":["name","Fuzzy","pufferfsh",options],"rank_by":["id","asc"],"limit":10
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(result["rows"].as_array().unwrap().len(), 1);
-    assert_eq!(result["rows"][0]["id"], 1);
+    // The match may start and end anywhere in the value, as on the live service.
+    assert_eq!(ids(&result), [1, 3]);
+    for thresholds in [
+        json!([{"min_query_chars":12,"distance":3}]),
+        json!([{"min_query_chars":5,"distance":1}]),
+        json!([]),
+    ] {
+        let (status, _) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({
+                "filters":["name","Fuzzy","pufferfsh",{"max_edit_distance":thresholds}],"limit":10
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "thresholds {thresholds}");
+    }
     let (status, result) = post(&client, &format!("{url}/query"), json!({
         "filters":["name","Fuzzy","pufferfsh",{"max_edit_distance":[{"min_query_chars":6,"distance":1}],"case_sensitive":true}],"limit":10
     })).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(result["rows"].as_array().unwrap().is_empty());
+    // "Small Pufferfish" needs a second edit for the capital P when case matters.
+    assert_eq!(ids(&result), [3]);
 }
 
 #[tokio::test]
@@ -354,8 +421,11 @@ async fn full_text_object_config_tunes_bm25_and_rejects_unimplemented_options() 
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["rows"][0]["id"], 1);
-    assert!(
-        result["rows"][0]["$dist"].as_f64().unwrap() > result["rows"][1]["$dist"].as_f64().unwrap()
+    // idf ln(1.2) * tf 2*3/(2+2) with b=0 * query weight 2*9/(2+8). The default k1=1.2 and
+    // b=0.75 would give 0.412577 instead.
+    assert_close(
+        result["rows"][0]["$dist"].as_f64().unwrap(),
+        1.2_f64.ln() * 1.5 * 1.8,
     );
     let (status, _) = post(
         &client,
@@ -446,4 +516,182 @@ async fn openai_mode_embeds_native_text_and_queries_it() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["rows"][0]["id"], 1);
+}
+
+fn ids(result: &Value) -> Vec<u64> {
+    result["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_u64().unwrap())
+        .collect()
+}
+
+fn scores(result: &Value) -> Vec<f64> {
+    result["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["$dist"].as_f64().unwrap())
+        .collect()
+}
+
+fn assert_close(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < 1e-6,
+        "expected {expected}, got {actual}"
+    );
+}
+
+/// Expected scores and orders come from the same fixture on the live service.
+#[tokio::test]
+async fn bm25_weights_repeated_query_terms_like_the_live_service() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/bm25-repeat");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","text":{"type":"string","full_text_search":true}},
+            "upsert_rows":[
+                {"id":1,"text":"fish fish swim"},
+                {"id":2,"text":"fish tank water deep blue"},
+                {"id":3,"text":"swim swim fish"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for (query, expected_ids, expected) in [
+        ("fish", [1, 3, 2], [0.19350067, 0.14426166, 0.11623961]),
+        ("fish fish", [1, 3, 2], [0.34830117, 0.25967097, 0.20923129]),
+        (
+            "fish fish swim",
+            [3, 1, 2],
+            [0.9407541, 0.85607296, 0.20923129],
+        ),
+    ] {
+        let (status, result) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({"rank_by":["text","BM25",query],"limit":10}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ids(&result), expected_ids, "query {query}");
+        for (actual, expected) in scores(&result).into_iter().zip(expected) {
+            assert_close(actual, expected);
+        }
+    }
+}
+
+/// Expected rows come from the same fixture on the live service.
+#[tokio::test]
+async fn numeric_ranking_keeps_zero_scores_and_requires_nonnegative_clauses() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/numeric-edges");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{
+                "id":"uint","n":"int","u":"uint","t":"datetime",
+                "text":{"type":"string","full_text_search":true}
+            },
+            "upsert_rows":[
+                {"id":1,"n":0,"u":3,"t":"2026-01-01T00:00:00Z","text":"fish"},
+                {"id":2,"n":4,"u":0,"t":"2026-01-02T06:00:00Z","text":"whale"},
+                {"id":3,"n":10,"u":9,"t":"2026-01-05T00:00:00Z","text":"fish fish"},
+                {"id":4,"n":-3,"u":1,"t":"2026-01-02T00:00:00Z","text":"crab"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let signed = json!(["Attribute", "n"]);
+    let unsigned = json!(["Attribute", "u"]);
+    let text = json!(["text", "BM25", "fish"]);
+    for (rank, expected_ids, expected) in [
+        (
+            json!(["Max", [0, signed]]),
+            vec![3, 2, 1, 4],
+            vec![10.0, 4.0, 0.0, 0.0],
+        ),
+        (json!(["Max", [2, text]]), vec![1, 3], vec![2.0, 2.0]),
+        (
+            json!(["Saturate", signed, {"midpoint":5}]),
+            vec![3, 2, 1, 4],
+            vec![10.0 / 15.0, 4.0 / 9.0, 0.0, 0.0],
+        ),
+        (
+            json!(["Dist", signed, 5]),
+            vec![4, 1, 3, 2],
+            vec![8.0, 5.0, 5.0, 1.0],
+        ),
+        (
+            json!(["Dist", unsigned, 3]),
+            vec![3, 2, 4, 1],
+            vec![6.0, 3.0, 2.0, 0.0],
+        ),
+        (
+            json!(["Product", 2, unsigned]),
+            vec![3, 1, 4, 2],
+            vec![18.0, 6.0, 2.0, 0.0],
+        ),
+        (
+            json!(["Decay", ["Dist", ["Attribute", "t"], "2026-01-02T00:00:00Z"], {"midpoint":"12h"}]),
+            vec![4, 2, 1, 3],
+            vec![1.0, 2.0 / 3.0, 1.0 / 3.0, 1.0 / 7.0],
+        ),
+        (
+            json!(["Decay", ["Dist", ["Attribute", "t"], "2026-01-02T00:00:00Z"], {"midpoint":"500ms"}]),
+            vec![4, 2, 1, 3],
+            vec![
+                1.0,
+                500.0 / 21_600_500.0,
+                500.0 / 86_400_500.0,
+                500.0 / 259_200_500.0,
+            ],
+        ),
+    ] {
+        let (status, result) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({"rank_by":rank,"limit":10}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "rank {rank}: {result}");
+        assert_eq!(ids(&result), expected_ids, "rank {rank}");
+        for (actual, expected) in scores(&result).into_iter().zip(expected) {
+            assert_close(actual, expected);
+        }
+    }
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["Sum",[unsigned, text]],"limit":10}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&result), [3, 1, 4, 2]);
+    for rank in [
+        signed.clone(),
+        json!(["Product", 2, signed]),
+        json!(["Max", [signed]]),
+        json!(["Max", [signed, -1]]),
+        json!(["Max", 0, signed]),
+        json!(["Sum", [0.5, text]]),
+        json!(["Dist", signed, 5.5]),
+        json!(["Decay", ["Dist", unsigned, 3], {"midpoint":"2s"}]),
+    ] {
+        let (status, _) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({"rank_by":rank,"limit":10}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "rank {rank}");
+    }
 }

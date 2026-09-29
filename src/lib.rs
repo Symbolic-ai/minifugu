@@ -7,7 +7,7 @@ mod store;
 mod vector;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
@@ -22,6 +22,10 @@ use tokio::sync::RwLock;
 
 pub use embedding::{deterministic_embedding, EmbeddingMode};
 pub use store::Namespace;
+/// Turbopuffer's documented maximum upsert request size. Axum's 2 MB default would reject
+/// ordinary vector batches before validation.
+const MAX_REQUEST_BYTES: usize = 512 * 1024 * 1024;
+
 type Shared = Arc<AppState>;
 struct AppState {
     namespaces: RwLock<HashMap<String, Namespace>>,
@@ -116,6 +120,7 @@ fn router_with_state(
             "/v2/namespaces/{namespace}/explain_query",
             post(explain_query),
         )
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state)
 }
 

@@ -590,9 +590,13 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
             return Err(format!("invalid embed configuration for attribute {field}"));
         }
     }
-    if field_type(definition) == "bytes" && definition.get("filterable") == Some(&Value::Bool(true))
+    if matches!(field_type(definition), "bytes" | "{}f16")
+        && definition.get("filterable") == Some(&Value::Bool(true))
     {
-        return Err(format!("bytes attribute {field} cannot be filterable"));
+        return Err(format!(
+            "{} attribute {field} cannot be filterable",
+            field_type(definition)
+        ));
     }
     match field_type(definition) {
         "uuid" | "uint" | "int" | "float" | "string" | "bool" | "datetime" | "bytes" | "{}f16"
@@ -688,11 +692,13 @@ fn validate_value(field: &str, value: &Value, definition: &Value) -> Result<(), 
         _ if vector::multi_dimensions(definition).is_some() => vector::multi_dimensions(definition)
             .is_some_and(|dimensions| {
                 value.as_array().is_some_and(|vectors| {
-                    vectors.iter().all(|vector| {
-                        vector.as_array().is_some_and(|elements| {
-                            elements.len() == dimensions && elements.iter().all(Value::is_number)
+                    vector::multi_vector_within_limit(vectors.len(), dimensions)
+                        && vectors.iter().all(|vector| {
+                            vector.as_array().is_some_and(|elements| {
+                                elements.len() == dimensions
+                                    && elements.iter().all(Value::is_number)
+                            })
                         })
-                    })
                 })
             }),
         vector if vector::dimensions(definition).is_some() => {

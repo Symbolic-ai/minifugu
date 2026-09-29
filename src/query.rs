@@ -121,6 +121,7 @@ impl Namespace {
         }
         if let Some(rank) = object.get("rank_by") {
             validate_rank(rank, &self.schema)?;
+            validate_nonnegative_rank(rank, &self.schema, false)?;
             if contains_knn(rank) && !object.contains_key("filters") {
                 return Err("kNN requires filters".into());
             }
@@ -265,10 +266,14 @@ impl Namespace {
                 });
                 if !score.is_finite()
                     || rank.is_some_and(|rank| {
-                        !is_ascending(rank)
-                            && score <= 0.0
-                            && !is_ann(rank)
+                        !is_ann(rank)
                             && !is_attribute_order(rank)
+                            && !scores_every_row(rank)
+                            && if has_max_floor(rank) {
+                                !matches_rank(rank, row, &self.rows, &self.schema, metric)
+                            } else {
+                                score <= 0.0
+                            }
                     })
                 {
                     return None;
@@ -703,7 +708,9 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
     let definition = schema
         .get(field)
         .ok_or(format!("attribute {field} is not filterable"))?;
-    if matches!(field_type(definition), "bytes" | "{}f16") {
+    if matches!(field_type(definition), "bytes" | "{}f16")
+        || vector::multi_dimensions(definition).is_some()
+    {
         return Err(format!("attribute {field} is not filterable"));
     }
     let full_text_search = has_full_text_search(definition);
@@ -979,13 +986,18 @@ fn fuzzy_matches(value: &Value, query: &str, options: &Value) -> bool {
         } else {
             candidate.to_lowercase()
         };
-        fuzzy_substring_distance(&query, &candidate) <= max_distance as usize
+        // A match needs at least `query - distance` characters of text, so shorter
+        // values are skipped before the quadratic distance computation.
+        candidate.chars().count() + max_distance as usize >= query.chars().count()
+            && fuzzy_substring_distance(&query, &candidate) <= max_distance as usize
     })
 }
 
+/// Smallest edit distance between `query` and any substring of `text`.
 fn fuzzy_substring_distance(query: &str, text: &str) -> usize {
     let query: Vec<char> = query.chars().collect();
     let mut previous: Vec<usize> = (0..=query.len()).collect();
+    let mut best = query.len();
     for character in text.chars() {
         let mut current = vec![0; query.len() + 1];
         for (index, expected) in query.iter().enumerate() {
@@ -993,9 +1005,10 @@ fn fuzzy_substring_distance(query: &str, text: &str) -> usize {
                 .min(current[index] + 1)
                 .min(previous[index] + usize::from(*expected != character));
         }
+        best = best.min(current[query.len()]);
         previous = current;
     }
-    previous[query.len()]
+    best
 }
 
 fn token_filter_matches(parts: &[Value], left: &Value) -> bool {
@@ -1097,20 +1110,21 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
             return Err("Sum/Max requires at least one expression".into());
         }
         for child in children {
+            // Max accepts scalar floors such as ["Max", [0, expression]]; Sum does not.
+            if parts[0] == "Max" && child.is_number() {
+                if child
+                    .as_f64()
+                    .is_none_or(|number| !number.is_finite() || number < 0.0)
+                {
+                    return Err(format!(
+                        "Scalar values in rank_by must be non-negative, got {child}"
+                    ));
+                }
+                continue;
+            }
             validate_rank(child, schema)?;
         }
         return Ok(());
-    }
-    if parts.len() == 3 && parts[0] == "Max" {
-        let (floor, expression) = if parts[1].is_number() {
-            (&parts[1], &parts[2])
-        } else {
-            (&parts[2], &parts[1])
-        };
-        if floor.as_f64().is_none_or(|number| !number.is_finite()) {
-            return Err("Max requires a numeric floor".into());
-        }
-        return validate_rank(expression, schema);
     }
     if parts.len() == 3 && matches!(parts[0].as_str(), Some("Saturate" | "Decay")) {
         validate_rank(&parts[1], schema)?;
@@ -1129,7 +1143,8 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
         if midpoint
             .as_f64()
             .is_none_or(|number| !number.is_finite() || number <= 0.0)
-            && midpoint.as_str().and_then(parse_duration_ms).is_none()
+            && (midpoint.as_str().and_then(parse_duration_ms).is_none()
+                || !is_datetime_dist(&parts[1], schema))
         {
             return Err("Saturate/Decay midpoint must be positive".into());
         }
@@ -1152,7 +1167,9 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
         let field = attribute[1].as_str().ok_or("Dist requires a field name")?;
         let definition = schema.get(field).ok_or("Dist attribute does not exist")?;
         let valid = match field_type(definition) {
-            "uint" | "int" | "float" => parts[2].is_number(),
+            "uint" => parts[2].is_u64(),
+            "int" => parts[2].is_i64() || parts[2].is_u64(),
+            "float" => parts[2].is_number(),
             "datetime" => parts[2].as_str().and_then(parse_datetime_ms).is_some(),
             _ => false,
         };
@@ -1237,6 +1254,7 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
                 .as_array()
                 .ok_or("multi-vector query must be an array")?;
             if vectors.is_empty()
+                || !vector::multi_vector_within_limit(vectors.len(), dimensions)
                 || vectors.iter().any(|vector| {
                     vector.as_array().is_none_or(|elements| {
                         elements.len() != dimensions
@@ -1319,13 +1337,110 @@ fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result<(), String
         }
         "asc" | "desc"
             if parts.len() == 2
-                && schema
-                    .get(field)
-                    .is_some_and(|definition| field_type(definition) != "bytes") =>
+                && schema.get(field).is_some_and(|definition| {
+                    !matches!(field_type(definition), "bytes" | "{}f16")
+                        && vector::multi_dimensions(definition).is_none()
+                }) =>
         {
             Ok(())
         }
         _ => Err(format!("unsupported rank operator {operator}")),
+    }
+}
+
+/// Attribute-derived clauses score every row, including rows that score zero. Text,
+/// filter and sparse clauses only return rows that match.
+fn scores_every_row(rank: &Value) -> bool {
+    rank.as_array().is_some_and(|parts| {
+        (parts.len() >= 2 && matches!(parts[0].as_str(), Some("Attribute" | "Dist")))
+            || parts.iter().any(scores_every_row)
+    })
+}
+
+/// Whether a `Max` list somewhere in `rank` carries a scalar floor.
+fn has_max_floor(rank: &Value) -> bool {
+    rank.as_array().is_some_and(|parts| {
+        (parts.len() == 2
+            && parts[0] == "Max"
+            && parts[1]
+                .as_array()
+                .is_some_and(|children| children.iter().any(Value::is_number)))
+            || parts.iter().any(has_max_floor)
+    })
+}
+
+/// A scalar floor raises the score of every row, but only rows that match one of the
+/// expression's clauses are returned.
+fn matches_rank(
+    rank: &Value,
+    row: &Map<String, Value>,
+    corpus: &std::collections::BTreeMap<String, Map<String, Value>>,
+    schema: &Map<String, Value>,
+    metric: &str,
+) -> bool {
+    let parts = rank.as_array().unwrap();
+    match parts[0].as_str() {
+        Some("Sum" | "Max") if parts.len() == 2 => parts[1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|child| !child.is_number())
+            .any(|child| matches_rank(child, row, corpus, schema, metric)),
+        Some("Product") if parts.len() == 3 => {
+            let expression = if parts[1].is_number() {
+                &parts[2]
+            } else {
+                &parts[1]
+            };
+            matches_rank(expression, row, corpus, schema, metric)
+        }
+        Some("Saturate" | "Decay") => matches_rank(&parts[1], row, corpus, schema, metric),
+        _ => score_rank(rank, row, corpus, schema, metric) > 0.0,
+    }
+}
+
+/// Turbopuffer rejects a ranking score that can be negative. A signed attribute must
+/// sit under a `Max` with a scalar floor, or feed a clause that clamps it.
+fn validate_nonnegative_rank(
+    rank: &Value,
+    schema: &Map<String, Value>,
+    clamped: bool,
+) -> Result<(), String> {
+    let Some(parts) = rank.as_array() else {
+        return Ok(());
+    };
+    match parts.first().and_then(Value::as_str) {
+        Some("Attribute") if parts.len() == 2 => {
+            let field = parts[1].as_str().unwrap_or_default();
+            let signed = schema
+                .get(field)
+                .is_some_and(|definition| matches!(field_type(definition), "int" | "float"));
+            if signed && !clamped {
+                return Err(format!(
+                    "rank_by clauses must produce non-negative scores, but an attribute clause on signed numeric attribute '{field}' was used. Wrap this clause under a [\"Max\", [0, <clause>]] to fix this."
+                ));
+            }
+            Ok(())
+        }
+        Some("Sum" | "Max") if parts.len() == 2 => {
+            let children = parts[1].as_array().map(Vec::as_slice).unwrap_or_default();
+            let floored = clamped || (parts[0] == "Max" && children.iter().any(Value::is_number));
+            children
+                .iter()
+                .try_for_each(|child| validate_nonnegative_rank(child, schema, floored))
+        }
+        Some("Product") if parts.len() == 3 => {
+            let expression = if parts[1].is_number() {
+                &parts[2]
+            } else {
+                &parts[1]
+            };
+            validate_nonnegative_rank(expression, schema, clamped)
+        }
+        Some("Saturate" | "Decay") if parts.len() == 3 => {
+            validate_nonnegative_rank(&parts[1], schema, true)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1410,27 +1525,16 @@ fn score_rank(
         return 0.0;
     }
     if parts[0] == "Sum" || (parts[0] == "Max" && parts.len() == 2) {
-        let scores = parts[1]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|child| score_rank(child, row, corpus, schema, metric));
+        let scores = parts[1].as_array().unwrap().iter().map(|child| {
+            child
+                .as_f64()
+                .unwrap_or_else(|| score_rank(child, row, corpus, schema, metric))
+        });
         return if parts[0] == "Sum" {
             scores.sum()
         } else {
             scores.fold(f64::NEG_INFINITY, f64::max)
         };
-    }
-    if parts[0] == "Max" && parts.len() == 3 {
-        let (floor, expression) = if parts[1].is_number() {
-            (&parts[1], &parts[2])
-        } else {
-            (&parts[2], &parts[1])
-        };
-        return floor
-            .as_f64()
-            .unwrap()
-            .max(score_rank(expression, row, corpus, schema, metric));
     }
     if matches!(parts[0].as_str(), Some("Saturate" | "Decay")) {
         let value = score_rank(&parts[1], row, corpus, schema, metric).max(0.0);
@@ -1552,6 +1656,19 @@ fn parse_datetime_ms(value: &str) -> Option<f64> {
         })
 }
 
+/// Whether `expression` is `["Dist", ["Attribute", field], origin]` over a datetime field,
+/// the only input for which a duration string midpoint is meaningful.
+fn is_datetime_dist(expression: &Value, schema: &Map<String, Value>) -> bool {
+    expression.as_array().is_some_and(|parts| {
+        parts.len() == 3
+            && parts[0] == "Dist"
+            && parts[1][1]
+                .as_str()
+                .and_then(|field| schema.get(field))
+                .is_some_and(|definition| field_type(definition) == "datetime")
+    })
+}
+
 fn parse_duration_ms(value: &str) -> Option<f64> {
     let split = value.find(|character: char| character.is_ascii_alphabetic())?;
     let number = value[..split].parse::<f64>().ok()?;
@@ -1559,6 +1676,7 @@ fn parse_duration_ms(value: &str) -> Option<f64> {
         return None;
     }
     let factor = match &value[split..] {
+        "ms" => 1.0,
         "s" => 1_000.0,
         "m" => 60_000.0,
         "h" => 3_600_000.0,

@@ -19,6 +19,18 @@ pub(crate) fn multi_dimensions(definition: &Value) -> Option<usize> {
     kind.strip_prefix("[][")?.strip_suffix("]f32")?.parse().ok()
 }
 
+/// Turbopuffer's documented maximum attribute value size. It bounds an array by its total
+/// byte size; the service sets no limit on the element count.
+const MAX_ATTRIBUTE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Whether `tokens` float32 vectors of `dimensions` fit in one attribute value.
+pub(crate) fn multi_vector_within_limit(tokens: usize, dimensions: usize) -> bool {
+    tokens
+        .checked_mul(dimensions)
+        .and_then(|elements| elements.checked_mul(4))
+        .is_some_and(|bytes| bytes <= MAX_ATTRIBUTE_BYTES)
+}
+
 pub(crate) fn decode(value: &str, dimensions: usize) -> Result<Value, String> {
     let bytes = STANDARD
         .decode(value)
