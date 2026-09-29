@@ -114,7 +114,7 @@ fn same_value(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn scenario(seed: u64) -> (Value, Vec<Value>) {
+fn scenario(seed: u64, metric: &str) -> (Value, Vec<Value>) {
     let mut generator = Generator(seed);
     let titles = [
         "tiny fugu",
@@ -151,7 +151,7 @@ fn scenario(seed: u64) -> (Value, Vec<Value>) {
     let group = groups[generator.next(groups.len())];
     let term = ["fugu", "whale", "sea"][generator.next(3)];
     let write = json!({
-        "distance_metric":"cosine_distance",
+        "distance_metric":metric,
         "schema":{
             "id":"uint","title":{"type":"string","full_text_search":{"k1":1.8,"b":0.3}},
             "group":"string","score":"int","weight":"float",
@@ -214,11 +214,16 @@ async fn generated_queries_match_live() {
     let client = Client::new();
     let mut failures = Vec::new();
 
-    for seed in 1..=4 {
+    for seed in 1..=6 {
         let name = format!("minifugu-diff-{}", Uuid::new_v4().simple());
         let local_url = format!("{local_base}/v2/namespaces/{name}");
         let live_url = format!("{}/v2/namespaces/{name}", live_base.trim_end_matches('/'));
-        let (write, queries) = scenario(0x5eed_2026_0929 + seed);
+        let metric = if seed <= 4 {
+            "cosine_distance"
+        } else {
+            "euclidean_squared"
+        };
+        let (write, queries) = scenario(0x5eed_2026_0929 + seed, metric);
         let local_write = call(&client, "local", &local_url, &write).await;
         let live_write = call(&client, &live_token, &live_url, &write).await;
         compare_write(
