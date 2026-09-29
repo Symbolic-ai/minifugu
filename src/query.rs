@@ -381,7 +381,7 @@ impl Namespace {
                     }
                 }
                 if rank.is_some_and(|rank| !is_attribute_order(rank) && !is_ascending(rank)) {
-                    result.insert("$dist".into(), json!(score));
+                    result.insert("$dist".into(), json!(serialized_score(score)));
                 }
                 if let Some(computed) = object.get("compute_attributes").and_then(Value::as_object)
                 {
@@ -737,7 +737,7 @@ fn computed_value(
     }
     let score = score_rank(&rank, row, corpus, schema, metric);
     if score.is_finite() {
-        json!(score)
+        json!(serialized_score(score))
     } else {
         Value::Null
     }
@@ -2043,6 +2043,15 @@ fn dense_distance(query: &[Value], vector: &[Value], metric: &str) -> f64 {
 /// float32 score returned by the live service.
 fn serialized_f32(value: f32) -> f64 {
     value.to_string().parse().unwrap()
+}
+
+fn serialized_score(score: f64) -> f64 {
+    let narrow = score as f32;
+    if narrow.is_finite() {
+        serialized_f32(narrow)
+    } else {
+        score
+    }
 }
 
 /// Corpus statistics of one full-text attribute, shared by every row a query scores.

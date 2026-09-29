@@ -76,11 +76,11 @@ async fn score_precision_matches_captured_live_float32_values() {
         &client,
         &url,
         json!({
-            "schema":{"id":"uint","text":{"type":"string","full_text_search":true},"vector":{"type":"[2]f32","ann":true},"s":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}}},
+            "schema":{"id":"uint","x":"float","text":{"type":"string","full_text_search":true},"vector":{"type":"[2]f32","ann":true},"s":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}}},
             "distance_metric":"cosine_distance",
             "upsert_rows":[
-                {"id":1,"text":"fugu fugu whale","vector":[0.1,0.6],"s":{"fugu":0.123456789,"whale":0.3333333}},
-                {"id":2,"text":"fugu whale","vector":[0.3,0.3],"s":{"fugu":0.654321,"whale":0.5}},
+                {"id":1,"x":0.1234567891234,"text":"fugu fugu whale","vector":[0.1,0.6],"s":{"fugu":0.123456789,"whale":0.3333333}},
+                {"id":2,"x":1.234567891234,"text":"fugu whale","vector":[0.3,0.3],"s":{"fugu":0.654321,"whale":0.5}},
                 {"id":3,"text":"whale","vector":[0.7,0.7],"s":{"whale":0.25}}
             ]
         }),
@@ -130,6 +130,14 @@ async fn score_precision_matches_captured_live_float32_values() {
     )
     .await;
     assert_eq!(rrf["results"][0]["rows"][0]["$dist"], json!(0.032786883));
+    let (_, numeric) = post(
+        &client,
+        &query_url,
+        json!({"rank_by":["Saturate",["Attribute","x"],{"midpoint":0.5}],"limit":3}),
+    )
+    .await;
+    assert_eq!(numeric["rows"][0]["$dist"], json!(0.7117438));
+    assert_eq!(numeric["rows"][1]["$dist"], json!(0.1980198));
 }
 
 #[tokio::test]
