@@ -887,6 +887,7 @@ async fn query_shape_errors_use_live_status_codes() {
         json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":[],"limit":1}}}),
         json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["group"],"limit":2}},"include_attributes":["group"]}),
         json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["id"],"limit":1}},"include_attributes":true}),
+        json!({"rank_by":["id","asc"],"limit":{"total":10001}}),
     ] {
         assert_eq!(
             post(&client, &query_url, query).await.0,

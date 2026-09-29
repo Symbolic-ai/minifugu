@@ -275,6 +275,13 @@ impl Namespace {
             Some(Value::Object(v)) if v.get("total").and_then(Value::as_u64) == Some(0) => {
                 return Err("limit.total must be positive".into());
             }
+            Some(Value::Object(v))
+                if v.get("total")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|total| total > 10_000) =>
+            {
+                return Err("limit.total must be at most 10000".into());
+            }
             Some(Value::Null) => return Err("limit must be an integer or object".into()),
             _ => return Err(crate::shape_error("limit must be an integer or object")),
         }
