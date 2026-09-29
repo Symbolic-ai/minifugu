@@ -261,7 +261,6 @@ impl Namespace {
     ) -> Result<Value, WriteError> {
         crate::query::reset_text_caches();
         let object = body.as_object().ok_or("write body must be an object")?;
-        validate_write_keys(object)?;
         validate_write_array_shapes(object)?;
         let existing_namespace =
             self.created_at.is_some() || !self.schema.is_empty() || !self.rows.is_empty();
@@ -446,7 +445,7 @@ impl Namespace {
                     .iter()
                     .any(|operation| object.contains_key(*operation))
                 {
-                    return Err(format!("{condition} requires a matching write operation").into());
+                    return Err(unmatched_condition(condition).into());
                 }
                 validate_filter(filter, &self.schema)?;
             }
@@ -646,14 +645,22 @@ impl Namespace {
         // Row-level schema inference can add indexed vector fields after the
         // schema block above. Check again before committing the cloned namespace.
         validate_vector_lifecycle(&self.schema, &previous_vectors, existing_namespace)?;
+        let rows_affected = upserted_ids.len() + patched_ids.len() + deleted_ids.len();
         let mut result = json!({
-            "status":"OK", "message":"success",
-            "rows_affected": upserted_ids.len() + patched_ids.len() + deleted_ids.len(),
-            "rows_upserted": upserted_ids.len(),
-            "rows_patched": patched_ids.len(),
-            "rows_deleted": deleted_ids.len(),
+            "status":"OK", "message":write_message(object, rows_affected),
+            "rows_affected": rows_affected,
             "billing":{"billable_logical_bytes_written":0}
         });
+        // Live omits a per-operation count that is zero.
+        for (key, count) in [
+            ("rows_upserted", upserted_ids.len()),
+            ("rows_patched", patched_ids.len()),
+            ("rows_deleted", deleted_ids.len()),
+        ] {
+            if count > 0 {
+                result[key] = json!(count);
+            }
+        }
         if object.get("return_affected_ids") == Some(&Value::Bool(true)) {
             if !upserted_ids.is_empty() {
                 result["upserted_ids"] = json!(upserted_ids);
@@ -772,33 +779,137 @@ fn condition_matches(
         .is_none_or(|filter| filter_matches(filter, current.unwrap_or(&Map::new()), schema))
 }
 
-pub(crate) fn validate_write_keys(object: &Map<String, Value>) -> Result<(), String> {
-    for key in object.keys() {
-        if !matches!(
-            key.as_str(),
-            "schema"
-                | "distance_metric"
-                | "delete_by_filter"
-                | "deletes"
-                | "patch_by_filter"
-                | "patch_rows"
-                | "patch_columns"
-                | "upsert_rows"
-                | "upsert_columns"
-                | "return_affected_ids"
-                | "upsert_condition"
-                | "patch_condition"
-                | "delete_condition"
-                | "branch_from_namespace"
-                | "copy_from_namespace"
-                | "delete_by_filter_allow_partial"
-                | "patch_by_filter_allow_partial"
-                | "disable_backpressure"
-        ) {
-            return Err(format!("unsupported write field {key}"));
+const WRITE_FIELDS: &[&str] = &[
+    "schema",
+    "distance_metric",
+    "delete_by_filter",
+    "deletes",
+    "patch_by_filter",
+    "patch_rows",
+    "patch_columns",
+    "upsert_rows",
+    "upsert_columns",
+    "return_affected_ids",
+    "upsert_condition",
+    "patch_condition",
+    "delete_condition",
+    "branch_from_namespace",
+    "copy_from_namespace",
+    "delete_by_filter_allow_partial",
+    "patch_by_filter_allow_partial",
+    "disable_backpressure",
+];
+
+/// Normalizes a write body the way the live request deserializer does: a `null` field is
+/// the same as an omitted one. Unknown fields are rejected on purpose, unlike live, so an
+/// unsupported option cannot be dropped silently.
+pub(crate) fn normalize_write_body(body: &mut Value) -> Result<(), String> {
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| crate::shape_error("write body must be an object"))?;
+    if let Some(key) = object
+        .keys()
+        .find(|key| !WRITE_FIELDS.contains(&key.as_str()))
+    {
+        return Err(format!("unsupported write field {key}"));
+    }
+    object.retain(|_, value| !value.is_null());
+    for key in ["upsert_rows", "patch_rows", "deletes"] {
+        if object.get(key).is_some_and(|value| !value.is_array()) {
+            return Err(crate::shape_error(format!("{key}: expected a sequence")));
+        }
+    }
+    for key in ["upsert_columns", "patch_columns"] {
+        if let Some(columns) = object.get(key) {
+            let columns = columns
+                .as_object()
+                .ok_or_else(|| crate::shape_error(format!("{key}: expected a map")))?;
+            if !columns.get("id").is_some_and(Value::is_array) {
+                return Err(crate::shape_error(format!("{key}: missing field `id`")));
+            }
         }
     }
     Ok(())
+}
+
+fn unmatched_condition(condition: &str) -> String {
+    let kind = condition.trim_end_matches("_condition");
+    format!("💔 cannot set {condition} without corresponding {kind} writes")
+}
+
+/// Live rejects a write condition whose operation is absent before it checks whether the
+/// body writes anything, so this runs first.
+pub(crate) fn validate_write_conditions(object: &Map<String, Value>) -> Result<(), String> {
+    for (condition, operations) in [
+        ("upsert_condition", &["upsert_rows", "upsert_columns"][..]),
+        ("patch_condition", &["patch_rows", "patch_columns"][..]),
+        ("delete_condition", &["deletes"][..]),
+    ] {
+        if object.contains_key(condition)
+            && !operations
+                .iter()
+                .any(|operation| object.contains_key(*operation))
+        {
+            return Err(unmatched_condition(condition));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a normalized write body asks for any change. Live answers a body without one
+/// with HTTP 400, and a schema on a namespace that does not exist yet is not a change.
+pub(crate) fn has_write_operations(object: &Map<String, Value>, namespace_exists: bool) -> bool {
+    let nonempty = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|v| !v.is_empty())
+    };
+    let nonempty_columns = |key: &str| {
+        object
+            .get(key)
+            .and_then(|columns| columns.get("id"))
+            .and_then(Value::as_array)
+            .is_some_and(|ids| !ids.is_empty())
+    };
+    nonempty("upsert_rows")
+        || nonempty("patch_rows")
+        || nonempty("deletes")
+        || nonempty_columns("upsert_columns")
+        || nonempty_columns("patch_columns")
+        || object.contains_key("delete_by_filter")
+        || object.contains_key("patch_by_filter")
+        || object.contains_key("copy_from_namespace")
+        || object.contains_key("branch_from_namespace")
+        || (namespace_exists && object.contains_key("schema"))
+}
+
+/// The live success message for a write. Row writes win; otherwise a filter that matched
+/// nothing and a schema update are reported together.
+fn write_message(object: &Map<String, Value>, rows_affected: usize) -> String {
+    let row_writes = ["upsert_rows", "patch_rows", "deletes"].iter().any(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_array)
+            .is_some_and(|v| !v.is_empty())
+    }) || ["upsert_columns", "patch_columns"].iter().any(|key| {
+        object
+            .get(*key)
+            .and_then(|columns| columns.get("id"))
+            .and_then(Value::as_array)
+            .is_some_and(|ids| !ids.is_empty())
+    });
+    if row_writes || rows_affected > 0 {
+        return "documents committed successfully".into();
+    }
+    let mut parts = Vec::new();
+    if object.contains_key("delete_by_filter") || object.contains_key("patch_by_filter") {
+        parts.push("filter matched 0 documents");
+    }
+    if object.contains_key("schema") {
+        parts.push("schema updated successfully");
+    }
+    parts.join(", ")
 }
 
 #[derive(Clone, PartialEq, Eq)]

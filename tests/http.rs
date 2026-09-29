@@ -230,7 +230,9 @@ async fn delete_counts_and_filter_conditions_follow_live_rules() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(result["rows_deleted"], 0);
+    assert_eq!(result["rows_affected"], 0);
+    // Live omits per-operation counts that are zero.
+    assert!(result.get("rows_deleted").is_none());
     assert!(result.get("deleted_ids").is_none());
 }
 
@@ -1640,7 +1642,10 @@ async fn unsupported_fields_fail_loudly() {
     .await;
     let (status, body) = post(&client, &ns, json!({"upsert_condition":["id","Eq",2]})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body["error"].as_str().unwrap().contains("upsert_condition"));
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("cannot set upsert_condition without corresponding upsert writes"));
     let (status, body) = post(
         &client,
         &ns,
@@ -1766,11 +1771,12 @@ async fn unsupported_fields_fail_loudly() {
         json!({"upsert_columns":{"title":["x"]}}),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Live rejects columns without `id` in its request deserializer.
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(body["error"]
         .as_str()
         .unwrap()
-        .contains("columns require an id array"));
+        .contains("upsert_columns: missing field `id`"));
 }
 
 #[tokio::test]
