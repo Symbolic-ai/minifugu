@@ -240,6 +240,13 @@ pub(crate) fn normalize_query(
                     }
                 }
             }
+            if parts.len() == 3 && parts[1] == "SparseKNN" {
+                if let Some(definition) = parts[0].as_str().and_then(|field| schema.get(field)) {
+                    if let Some(normalized) = normalize_array_value(&parts[2], definition)? {
+                        parts[2] = normalized;
+                    }
+                }
+            }
             for part in parts {
                 normalize_query(part, schema)?;
             }

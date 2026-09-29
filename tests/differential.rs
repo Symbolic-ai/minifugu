@@ -194,7 +194,7 @@ fn scenario(seed: u64, metric: &str) -> (Value, Vec<Value>) {
         json!({"rank_by":["id","asc"],"limit":12,"compute_attributes":{"fugu_score":["title","BM25","fugu"]}}),
         json!({"aggregate_by":{"count":["Count"]},"group_by":[{"tag":["ForEachUnique","tags"]},"group"]}),
         json!({"rank_by":["vector","kNN",[0.2,0.7]],"filters":["id","Gte",1],"limit":5,"include_attributes":["vector"]}),
-        json!({"rank_by":["sparse","SparseKNN",{"fugu":1.0}],"limit":8,"include_attributes":["sparse"]}),
+        json!({"rank_by":["sparse","SparseKNN",{"fugu":0.2,"sea":0.7}],"limit":8,"include_attributes":["sparse"]}),
     ];
     (write, queries)
 }

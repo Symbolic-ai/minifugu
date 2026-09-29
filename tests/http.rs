@@ -942,7 +942,7 @@ async fn upserts_queries_deletes_and_namespaces_are_isolated() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["results"][0]["rows"][0]["id"], 1);
     assert_eq!(result["results"][0]["rows"][0]["document_id"], "one");
-    assert!((result["results"][0]["rows"][0]["$dist"].as_f64().unwrap() - 3.0 / 11.0).abs() < 1e-9);
+    assert!((result["results"][0]["rows"][0]["$dist"].as_f64().unwrap() - 3.0 / 11.0).abs() < 1e-7);
     let mut invalid = fused;
     invalid["rerank_by"][1]["weights"] = json!([1]);
     let (status, error) = post(&client, &format!("{a}/query"), invalid).await;

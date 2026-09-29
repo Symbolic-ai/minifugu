@@ -80,7 +80,7 @@ impl Namespace {
                     .skip(offset)
                     .take(limit)
                     .map(|(score, mut row)| {
-                        row["$dist"] = json!(score);
+                        row["$dist"] = json!(serialized_f32(score as f32));
                         row
                     })
                     .collect::<Vec<_>>();
@@ -1935,13 +1935,14 @@ pub(crate) fn score_rank(
             let Some(document) = row.get(field).and_then(Value::as_object) else {
                 return 0.0;
             };
-            query
+            let score: f32 = query
                 .iter()
                 .map(|(key, weight)| {
-                    weight.as_f64().unwrap()
-                        * document.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+                    weight.as_f64().unwrap() as f32
+                        * document.get(key).and_then(Value::as_f64).unwrap_or(0.0) as f32
                 })
-                .sum()
+                .sum();
+            serialized_f32(score)
         }
         "BM25" => bm25(
             field,
@@ -2014,7 +2015,7 @@ fn dense_distance(query: &[Value], vector: &[Value], metric: &str) -> f64 {
             .zip(query)
             .map(|(a, b)| (a.as_f64().unwrap() as f32 - b.as_f64().unwrap() as f32).powi(2))
             .sum();
-        return f64::from(distance);
+        return serialized_f32(distance);
     }
     let dot: f32 = vector
         .iter()
@@ -2034,8 +2035,14 @@ fn dense_distance(query: &[Value], vector: &[Value], metric: &str) -> f64 {
     if norm_a == 0.0 || norm_b == 0.0 {
         f64::INFINITY
     } else {
-        f64::from(1.0 - dot / (norm_a * norm_b))
+        serialized_f32(1.0 - dot / (norm_a * norm_b))
     }
+}
+
+/// JSON numbers are f64; use the shortest decimal that round-trips to the
+/// float32 score returned by the live service.
+fn serialized_f32(value: f32) -> f64 {
+    value.to_string().parse().unwrap()
 }
 
 /// Corpus statistics of one full-text attribute, shared by every row a query scores.
@@ -2109,15 +2116,15 @@ fn bm25(
     let k1 = config
         .and_then(|value| value.get("k1"))
         .and_then(Value::as_f64)
-        .unwrap_or(1.2);
+        .unwrap_or(1.2) as f32;
     let b = config
         .and_then(|value| value.get("b"))
         .and_then(Value::as_f64)
-        .unwrap_or(0.75);
+        .unwrap_or(0.75) as f32;
     let k3 = config
         .and_then(|value| value.get("k3"))
         .and_then(Value::as_f64)
-        .unwrap_or(8.0);
+        .unwrap_or(8.0) as f32;
     let Some(analysis) = TextAnalysis::for_field(&schema[field]) else {
         return 0.0;
     };
@@ -2137,36 +2144,38 @@ fn bm25(
     // Live computed BM25 attributes use a fixed one-token average length and
     // ln(2) IDF. Rank clauses use the namespace's actual corpus statistics.
     let stats = (!computed).then(|| field_stats(field, &analysis, corpus));
-    let avg_len = stats.as_ref().map_or(1.0, |stats| stats.average_length);
+    let avg_len = stats.as_ref().map_or(1.0, |stats| stats.average_length) as f32;
     let mut terms = HashMap::new();
     for token in query_tokens {
         *terms.entry(token).or_insert(0_usize) += 1;
     }
-    let score: f64 = terms
+    let score: f32 = terms
         .into_iter()
         .map(|(term, query_freq)| {
-            let freq = doc_tokens.iter().filter(|token| token.text == term).count() as f64;
+            let freq = doc_tokens.iter().filter(|token| token.text == term).count() as f32;
             if freq == 0.0 {
                 return 0.0;
             }
             let idf = if let Some(stats) = &stats {
-                let df = stats.document_frequency.get(&term).copied().unwrap_or(0) as f64;
-                let n = corpus.len() as f64;
+                let df = stats.document_frequency.get(&term).copied().unwrap_or(0) as f32;
+                let n = corpus.len() as f32;
                 (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
             } else {
-                std::f64::consts::LN_2
+                std::f32::consts::LN_2
             };
-            let norm = k1 * (1.0 - b + b * doc_tokens.len() as f64 / avg_len);
-            let query_weight = query_freq as f64 * (k3 + 1.0) / (query_freq as f64 + k3);
-            query_weight * idf * freq * (k1 + 1.0) / (freq + norm)
+            let norm = k1 * (1.0 - b + b * doc_tokens.len() as f32 / avg_len);
+            let query_weight = query_freq as f32 * (k3 + 1.0) / (query_freq as f32 + k3);
+            let term_weight = freq / (freq + norm) * (k1 + 1.0);
+            query_weight * (idf * term_weight)
         })
         .sum();
-    score
-        + f64::from(prefix.is_some_and(|prefix| {
+    let score = score
+        + f32::from(prefix.is_some_and(|prefix| {
             doc_tokens
                 .iter()
                 .any(|token| token.text.starts_with(&prefix))
-        }))
+        }));
+    serialized_f32(score)
 }
 
 /// The live service's name for a JSON value's type in error messages.
