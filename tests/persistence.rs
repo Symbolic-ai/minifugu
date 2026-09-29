@@ -93,6 +93,61 @@ fn corrupt_data_fails_startup_instead_of_silently_erasing_rows() {
 }
 
 #[tokio::test]
+async fn read_only_metadata_survives_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let client = Client::new();
+    let (url, task) = serve(directory.path()).await;
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("dummy")
+            .json(&json!({"upsert_rows":[{"id":1}]}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let metadata_url = url.replace("/v2/namespaces/", "/v1/namespaces/") + "/metadata";
+    assert_eq!(
+        client
+            .patch(&metadata_url)
+            .bearer_auth("dummy")
+            .json(&json!({"read_only":true}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    task.abort();
+    let (url, task) = serve(directory.path()).await;
+    let metadata_url = url.replace("/v2/namespaces/", "/v1/namespaces/") + "/metadata";
+    let metadata: Value = client
+        .get(&metadata_url)
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(metadata["read_only"], true);
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("dummy")
+            .json(&json!({"upsert_rows":[{"id":2}]}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    task.abort();
+}
+
+#[tokio::test]
 async fn older_snapshot_without_cached_byte_count_still_queries() {
     let directory = tempfile::tempdir().unwrap();
     let client = Client::new();

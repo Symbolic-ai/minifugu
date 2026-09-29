@@ -22,6 +22,694 @@ async fn post(client: &Client, url: &str, body: Value) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
+async fn metadata_read_only_blocks_writes_and_is_inherited_by_branches() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/read-only-source");
+    let metadata_url = url.replace("/v2/namespaces/", "/v1/namespaces/") + "/metadata";
+    let schema_url = url.replace("/v2/namespaces/", "/v1/namespaces/") + "/schema";
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"upsert_rows":[{"id":1,"title":"fish"}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let before: Value = client
+        .get(&metadata_url)
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(before.get("read_only").is_none());
+    assert_eq!(
+        client
+            .post(&schema_url)
+            .bearer_auth("dummy")
+            .json(&json!({"title":{"type":"string","regex":true}}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let after_schema: Value = client
+        .get(&metadata_url)
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after_schema["last_write_at"], before["last_write_at"]);
+    let patched = client
+        .patch(&metadata_url)
+        .bearer_auth("dummy")
+        .json(&json!({"read_only":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(patched.status(), StatusCode::OK);
+    let metadata: Value = patched.json().await.unwrap();
+    assert_eq!(metadata["read_only"], true);
+    assert_eq!(metadata["updated_at"], after_schema["updated_at"]);
+    assert_eq!(metadata["last_write_at"], before["last_write_at"]);
+    let (status, error) = post(
+        &client,
+        &url,
+        json!({"upsert_rows":[{"id":2,"title":"whale"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error["error"],
+        "💔 Writes not permitted. This namespace is read-only."
+    );
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"patch_rows":[{"id":1,"title":"whale"}]})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        client
+            .post(&schema_url)
+            .bearer_auth("dummy")
+            .json(&json!({"title":{"type":"string","regex":true}}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post(
+            &client,
+            &format!("{base}/read-only-branch"),
+            json!({"branch_from_namespace":"read-only-source"})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let branch_metadata: Value = client
+        .get(metadata_url.replace("read-only-source", "read-only-branch"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(branch_metadata["read_only"], true);
+    assert_eq!(branch_metadata["last_write_at"], before["last_write_at"]);
+    let queried = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["id","asc"],"limit":10}),
+    )
+    .await;
+    assert_eq!(queried.0, StatusCode::OK);
+    assert_eq!(queried.1["rows"].as_array().unwrap().len(), 1);
+    let cleared = client
+        .patch(&metadata_url)
+        .bearer_auth("dummy")
+        .json(&json!({"read_only":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+    assert!(cleared
+        .json::<Value>()
+        .await
+        .unwrap()
+        .get("read_only")
+        .is_none());
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"upsert_rows":[{"id":2,"title":"whale"}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let invalid = client
+        .patch(&metadata_url)
+        .bearer_auth("dummy")
+        .json(&json!({"read_only":"yes"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let unsupported = client
+        .patch(&metadata_url)
+        .bearer_auth("dummy")
+        .json(&json!({"pinning":{"replicas":1}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn delete_counts_and_filter_conditions_follow_live_rules() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/delete-rules");
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"upsert_rows":[{"id":2,"n":2},{"id":10,"n":10},{"id":1,"n":1}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for body in [
+        json!({"delete_by_filter":["n","Gt",0],"delete_condition":["n","Gt",5]}),
+        json!({"patch_by_filter":{"filters":["n","Gt",0],"patch":{"n":7}},"patch_condition":["n","Gt",5]}),
+    ] {
+        assert_eq!(post(&client, &url, body).await.0, StatusCode::BAD_REQUEST);
+    }
+    let (status, result) = post(
+        &client,
+        &url,
+        json!({"delete_by_filter":["n","Gt",0],"return_affected_ids":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["deleted_ids"], json!([1, 2, 10]));
+    let (status, result) = post(
+        &client,
+        &url,
+        json!({"deletes":[2,10],"return_affected_ids":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows_deleted"], 2);
+    assert_eq!(result["deleted_ids"], json!([2, 10]));
+    let (status, result) = post(
+        &client,
+        &url,
+        json!({"deletes":[2,10],"delete_condition":["n","Gt",0],"return_affected_ids":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows_deleted"], 0);
+    assert!(result.get("deleted_ids").is_none());
+}
+
+#[tokio::test]
+async fn glob_filters_match_string_arrays_and_negate_missing_values() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/glob-arrays");
+    assert_eq!(post(&client, &url, json!({
+        "schema":{"id":"uint","tags":{"type":"[]string","glob":true}},
+        "upsert_rows":[{"id":1,"tags":["Alpha","beta"]},{"id":2,"tags":["Gamma"]},{"id":3,"tags":[]},{"id":4}]
+    })).await.0, StatusCode::OK);
+    for (operator, pattern, expected) in [
+        ("Glob", "A*", json!([1])),
+        ("NotGlob", "A*", json!([2, 3, 4])),
+        ("IGlob", "a*", json!([1])),
+        ("NotIGlob", "a*", json!([2, 3, 4])),
+        ("Glob", "*", json!([1, 2])),
+        ("NotGlob", "*", json!([3, 4])),
+    ] {
+        let (status, result) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({"rank_by":["id","asc"],"filters":["tags",operator,pattern],"limit":10}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let ids: Vec<Value> = result["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].clone())
+            .collect();
+        assert_eq!(json!(ids), expected, "{operator} {pattern}");
+    }
+}
+
+#[tokio::test]
+async fn for_each_unique_groups_distinct_array_values_and_missing_rows() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/unique-groups");
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({
+                "schema":{"id":"uint","tags":"[]string","g":"string","n":"int"},
+                "upsert_rows":[
+                    {"id":1,"tags":["a","b","a"],"g":"x","n":2},
+                    {"id":2,"tags":["b","c"],"g":"x","n":3},
+                    {"id":3,"tags":[],"g":"y","n":5},
+                    {"id":4,"g":"y","n":7},
+                    {"id":5,"tags":["a"],"n":11}
+                ]
+            })
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let aggregate = json!({"count":["Count"],"sum":["Sum","n"]});
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"aggregate_by":aggregate,"group_by":[{"tag":["ForEachUnique","tags"]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        result["aggregation_groups"],
+        json!([
+            {"tag":null,"count":1,"sum":7},
+            {"tag":"a","count":2,"sum":13},
+            {"tag":"b","count":2,"sum":5},
+            {"tag":"c","count":1,"sum":3}
+        ])
+    );
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"aggregate_by":aggregate,"group_by":[{"tag":["ForEachUnique","tags"]},"g"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        result["aggregation_groups"],
+        json!([
+            {"tag":null,"g":"y","count":1,"sum":7},
+            {"tag":"a","g":null,"count":1,"sum":11},
+            {"tag":"a","g":"x","count":1,"sum":2},
+            {"tag":"b","g":"x","count":2,"sum":5},
+            {"tag":"c","g":"x","count":1,"sum":3}
+        ])
+    );
+    for invalid in [
+        json!([{"tag":["ForEachUnique","g"]}]),
+        json!([{"tag":["ForEachUnique","missing"]}]),
+        json!([{"tag":["ForEachUnique","tags"]},{"tag":["ForEachUnique","tags"]}]),
+        json!([{"tag":["ForEachUnique","tags"]},{"other":["ForEachUnique","tags"]}]),
+    ] {
+        assert_eq!(
+            post(
+                &client,
+                &format!("{url}/query"),
+                json!({"aggregate_by":{"count":["Count"]},"group_by":invalid})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
+#[tokio::test]
+async fn null_writes_remove_attributes_from_returned_rows() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/null-writes");
+    let query = json!({"rank_by":["id","asc"],"limit":10,"include_attributes":true});
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"upsert_rows":[{"id":1,"a":"x","n":5},{"id":2,"a":null,"n":null}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, result) = post(&client, &format!("{url}/query"), query.clone()).await;
+    assert_eq!(result["rows"], json!([{"id":1,"a":"x","n":5},{"id":2}]));
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"patch_rows":[{"id":1,"a":null,"n":null}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, result) = post(&client, &format!("{url}/query"), query.clone()).await;
+    assert_eq!(result["rows"], json!([{"id":1},{"id":2}]));
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"upsert_rows":[{"id":1,"a":null,"n":null}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, result) = post(&client, &format!("{url}/query"), query).await;
+    assert_eq!(result["rows"], json!([{"id":1},{"id":2}]));
+}
+
+#[tokio::test]
+async fn null_bounds_follow_live_filter_ordering() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/null-bounds");
+    assert_eq!(post(&client, &url, json!({"schema":{"id":"uint","n":"int"},"upsert_rows":[{"id":1,"n":1},{"id":2,"n":0},{"id":3}]})).await.0, StatusCode::OK);
+    for (operator, expected) in [
+        ("Lt", json!([])),
+        ("Lte", json!([3])),
+        ("Gt", json!([1, 2])),
+        ("Gte", json!([1, 2, 3])),
+    ] {
+        let (status, result) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({"rank_by":["id","asc"],"filters":["n",operator,null],"limit":10}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let ids: Vec<Value> = result["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].clone())
+            .collect();
+        assert_eq!(json!(ids), expected, "{operator}");
+    }
+    for operator in ["In", "NotIn"] {
+        let (status, _) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({"rank_by":["id","asc"],"filters":["n",operator,[null]],"limit":10}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+#[tokio::test]
+async fn id_and_attribute_name_boundaries_match_live() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/name-limits");
+    let valid = json!({"upsert_rows":[{"id":"","a":1},{"id":"x".repeat(64),"a":2}]});
+    assert_eq!(post(&client, &url, valid).await.0, StatusCode::OK);
+    let mut long_ascii = json!({"id":1});
+    long_ascii
+        .as_object_mut()
+        .unwrap()
+        .insert("a".repeat(129), json!(1));
+    let mut long_unicode = json!({"id":1});
+    long_unicode
+        .as_object_mut()
+        .unwrap()
+        .insert("é".repeat(65), json!(1));
+    for row in [
+        json!({"id":"x".repeat(65)}),
+        json!({"id":1,"":1}),
+        json!({"id":1,"$reserved":1}),
+        long_ascii,
+        long_unicode,
+    ] {
+        assert_eq!(
+            post(&client, &url, json!({"upsert_rows":[row]})).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["id","asc"],"limit":10}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["rows"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn computed_bm25_uses_live_per_row_statistics() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/computed-bm25");
+    assert_eq!(post(&client, &url, json!({
+        "schema":{"id":"uint","t":{"type":"string","full_text_search":true}},
+        "upsert_rows":[{"id":1,"t":"fugu"},{"id":2,"t":"fugu fugu"},{"id":3,"t":"other"},{"id":4,"t":"fugu whale sea"}]
+    })).await.0, StatusCode::OK);
+    let computed = json!({"s":["t","BM25","fugu"]});
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["id","asc"],"limit":10,"compute_attributes":computed}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for (row, expected) in result["rows"].as_array().unwrap().iter().zip([
+        std::f64::consts::LN_2,
+        0.7438652,
+        0.0,
+        0.38123095,
+    ]) {
+        assert!((row["s"].as_f64().unwrap() - expected).abs() < 1e-5);
+    }
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["t","BM25","fugu"],"limit":10,"compute_attributes":computed}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(result["rows"][0]["$dist"], result["rows"][0]["s"]);
+}
+
+#[tokio::test]
+async fn schema_object_updates_merge_options_and_shorthand_resets_them() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/schema-merge");
+    let schema_url = url.replace("/v2/namespaces/", "/v1/namespaces/") + "/schema";
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"schema":{
+        "id":"uint", "name":{"type":"string","full_text_search":{"k1":2.0,"b":0.2,"stemming":true},"glob":true},
+        "label":"string"
+    },"upsert_rows":[{"id":1,"name":"fugu","label":"fish"}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (status, schema) = post(
+        &client,
+        &schema_url,
+        json!({"name":{"type":"string","regex":true},"label":{"type":"string","regex":true}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(schema["name"]["glob"], true);
+    assert_eq!(schema["name"]["regex"], true);
+    assert_eq!(schema["name"]["filterable"], false);
+    assert!(schema["name"]["full_text_search"].is_object());
+    assert_eq!(schema["label"]["filterable"], true);
+    let (status, schema) = post(
+        &client,
+        &schema_url,
+        json!({"name":{"type":"string","full_text_search":{"k1":1.5}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(schema["name"]["full_text_search"]["k1"], 1.5);
+    assert_eq!(schema["name"]["full_text_search"]["b"], 0.2);
+    assert_eq!(schema["name"]["full_text_search"]["stemming"], true);
+    let (status, schema) = post(
+        &client,
+        &schema_url,
+        json!({"name":{"type":"string","full_text_search":true}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(schema["name"]["full_text_search"]["k1"], 1.5);
+    assert_eq!(schema["name"]["full_text_search"]["b"], 0.2);
+    let (status, schema) = post(&client, &schema_url, json!({"name":"string"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(schema["name"]["filterable"], false);
+    assert_eq!(schema["name"]["full_text_search"], Value::Null);
+    assert!(schema["name"].get("glob").is_none());
+    assert!(schema["name"].get("regex").is_none());
+    assert_eq!(
+        post(&client, &schema_url, json!({"name":{"regex":true}}))
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+#[tokio::test]
+async fn duplicate_explicit_ids_reject_the_entire_write() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/duplicate-ids");
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"upsert_rows":[{"id":1,"n":1},{"id":2,"n":2}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for body in [
+        json!({"upsert_rows":[{"id":3,"n":3},{"id":3,"n":4}]}),
+        json!({"patch_rows":[{"id":1,"n":3},{"id":1,"n":4}]}),
+        json!({"deletes":[1,1]}),
+        json!({"deletes":[1],"upsert_rows":[{"id":1,"n":5}]}),
+        json!({"patch_rows":[{"id":1,"n":5}],"upsert_rows":[{"id":1,"n":6}]}),
+    ] {
+        assert_eq!(post(&client, &url, body).await.0, StatusCode::BAD_REQUEST);
+    }
+    let (_, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["id","asc"],"limit":10,"include_attributes":true}),
+    )
+    .await;
+    assert_eq!(result["rows"], json!([{"id":1,"n":1},{"id":2,"n":2}]));
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"delete_by_filter":["id","Eq",1],"upsert_rows":[{"id":1,"n":9}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn dense_vectors_cannot_be_patched_but_sparse_vectors_can() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/vector-patches");
+    assert_eq!(post(&client, &url, json!({
+        "distance_metric":"cosine_distance",
+        "schema":{"id":"uint","vector":{"type":"[2]f32","ann":true},"s":{"type":"{}f16","sparse_knn":{"distance_metric":"dot_product"}}},
+        "upsert_rows":[{"id":1,"vector":[1,0],"s":{"a":0.123456789}}]
+    })).await.0, StatusCode::OK);
+    assert_eq!(
+        post(&client, &url, json!({"upsert_rows":[{"id":2,"s":{"a":1}}]}))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let origin = base.trim_end_matches("/v2/namespaces");
+    let schema: Value = client
+        .get(format!("{origin}/v1/namespaces/vector-patches/schema"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(schema["vector"]["filterable"].is_null());
+    let (_, initial) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["id","asc"],"limit":1,"include_attributes":true}),
+    )
+    .await;
+    assert_eq!(initial["rows"][0]["s"]["a"], json!(0.12347412));
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"patch_rows":[{"id":1,"vector":[0,1]}]})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"patch_by_filter":{"filters":["id","Eq",1],"patch":{"vector":[0,1]}}})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post(
+            &client,
+            &url,
+            json!({"patch_rows":[{"id":1,"s":{"a":0.654321}}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["id","asc"],"limit":10,"include_attributes":true}),
+    )
+    .await;
+    assert_eq!(result["rows"][0]["vector"], json!([1.0, 0.0]));
+    assert_eq!(result["rows"][0]["s"]["a"], json!(0.6542969));
+}
+
+#[tokio::test]
+async fn vector_arrays_round_to_their_stored_element_width() {
+    let base = server().await;
+    let client = Client::new();
+    for (kind, input, expected) in [
+        ("f32", json!([1, 0.123456789]), json!([1.0, 0.12345679])),
+        ("f16", json!([1, 0.123456789]), json!([1.0, 0.12347412])),
+        ("i8", json!([1.0, 2.0]), json!([1, 2])),
+    ] {
+        let url = format!("{base}/vector-width-{kind}");
+        let mut body = json!({"distance_metric":"cosine_distance","schema":{"id":"uint","vector":{"type":format!("[2]{kind}"),"ann":true}}});
+        if kind == "f16" {
+            body["upsert_columns"] = json!({"id":[1],"vector":[input]});
+        } else {
+            body["upsert_rows"] = json!([{"id":1,"vector":input}]);
+        }
+        assert_eq!(post(&client, &url, body).await.0, StatusCode::OK);
+        let (status, result) = post(
+            &client,
+            &format!("{url}/query"),
+            json!({"rank_by":["id","asc"],"limit":1,"include_attributes":["vector"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result["rows"][0]["vector"], expected, "{kind}");
+    }
+}
+
+#[tokio::test]
 async fn aggregates_match_live_grouping_edges() {
     let base = server().await;
     let client = Client::new();
@@ -115,11 +803,59 @@ async fn query_shape_errors_use_live_status_codes() {
         json!({"rank_by":["id","asc"],"limit":1,"compute_attributes":[]}),
         json!({"rank_by":["id","asc"],"limit":1,"compute_attributes":{"x":["id","VectorDist"]}}),
         json!({"aggregate_by":{"count":["Count"]},"group_by":"id"}),
+        json!({"rank_by":["id","asc"],"limit":1,"consistency":"strong"}),
+        json!({"rank_by":["id","asc"],"limit":1,"consistency":{"level":"invalid"}}),
+        json!({"rank_by":["id","asc"],"limit":1,"vector_encoding":"invalid"}),
+        json!({"rank_by":["id","asc"],"limit":1,"distance_metric":"invalid"}),
+        json!({"rank_by":["id","asc"],"limit":1,"distance_metric":1}),
     ] {
         let (status, body) = post(&client, &query_url, query.clone()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{query}: {body}");
         assert_eq!(body["status"], "error");
     }
+    let subquery = json!({"rank_by":["id","asc"],"limit":1});
+    for count in [0, 17] {
+        let (status, _) = post(
+            &client,
+            &query_url,
+            json!({"queries":vec![subquery.clone(); count]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{count} subqueries");
+    }
+    let (status, result) = post(&client, &query_url, json!({"queries":vec![subquery; 16]})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["results"].as_array().unwrap().len(), 16);
+    assert_eq!(
+        post(
+            &client,
+            &query_url,
+            json!({"rank_by":["id","asc"],"limit":1,"consistency":{"level":"strong","extra":1}})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for query in [
+        json!({"rank_by":["id","asc"],"limit":10000,"offset":1}),
+        json!({"rank_by":["id","asc"],"top_k":1,"offset":10000}),
+        json!({"queries":[{"rank_by":["id","asc"],"limit":1},{"rank_by":["id","desc"],"limit":1}],"rerank_by":["RRF"],"limit":10000,"offset":1}),
+    ] {
+        assert_eq!(
+            post(&client, &query_url, query).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        post(
+            &client,
+            &query_url,
+            json!({"rank_by":["id","asc"],"limit":9999,"offset":1})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
     let malformed = client
         .post(&query_url)
         .bearer_auth("dummy")

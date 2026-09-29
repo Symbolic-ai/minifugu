@@ -18,13 +18,32 @@ pub struct Namespace {
     #[serde(default)]
     pub(crate) updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
+    pub(crate) last_write_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub(crate) approx_logical_bytes: Option<usize>,
+    #[serde(default)]
+    pub(crate) read_only: bool,
 }
 
 impl Namespace {
-    pub(crate) fn touch(&mut self) {
+    pub(crate) fn touch_write(&mut self) {
         let now = Utc::now();
         self.created_at.get_or_insert(now);
+        self.updated_at = Some(now);
+        self.last_write_at = Some(now);
+        self.approx_logical_bytes = Some(self.compute_logical_bytes());
+    }
+
+    pub(crate) fn touch_schema(&mut self) {
+        let now = Utc::now();
+        self.created_at.get_or_insert(now);
+        self.updated_at = Some(now);
+    }
+
+    pub(crate) fn touch_clone(&mut self) {
+        self.last_write_at = self.last_write_at.or(self.updated_at);
+        let now = Utc::now();
+        self.created_at = Some(now);
         self.updated_at = Some(now);
         self.approx_logical_bytes = Some(self.compute_logical_bytes());
     }
@@ -50,12 +69,13 @@ impl Namespace {
             let kind = field_type(definition);
             let mut attribute = Map::new();
             attribute.insert("type".into(), json!(kind));
-            let filterable = (field != "id").then(|| {
-                definition
-                    .get("filterable")
-                    .and_then(Value::as_bool)
-                    .unwrap_or_else(|| default_filterable(definition))
-            });
+            let filterable = (field != "id" && !(field == "vector" && is_fixed_vector(definition)))
+                .then(|| {
+                    definition
+                        .get("filterable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or_else(|| default_filterable(definition))
+                });
             let full_text_search = definition
                 .get("full_text_search")
                 .filter(|config| config.is_object() || **config == json!(true))
@@ -118,16 +138,20 @@ impl Namespace {
     pub(crate) fn metadata(&self) -> Value {
         let created_at = self.created_at.unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
         let updated_at = self.updated_at.unwrap_or(created_at);
-        json!({
+        let mut metadata = json!({
             "schema": self.schema_view(SchemaView::Metadata),
             "approx_row_count": self.rows.len(),
             "approx_logical_bytes": self.logical_bytes(),
             "created_at": created_at,
             "updated_at": updated_at,
-            "last_write_at": updated_at.format("%Y-%m-%dT%H:%M:%S.000000000Z").to_string(),
+            "last_write_at": self.last_write_at.unwrap_or(updated_at).format("%Y-%m-%dT%H:%M:%S.000000000Z").to_string(),
             "encryption": {"sse": true},
             "index": {"status": "up-to-date"}
-        })
+        });
+        if self.read_only {
+            metadata["read_only"] = json!(true);
+        }
+        metadata
     }
 
     pub(crate) fn recall(&self, body: &Value) -> Result<Value, String> {
@@ -241,12 +265,46 @@ impl Namespace {
             let schema = schema.as_object().ok_or("schema must be an object")?;
             for (field, definition) in schema {
                 validate_definition(field, definition)?;
-                if let Some(previous) = self.schema.get(field) {
+                let definition = if let Some(previous) = self.schema.get(field) {
                     if field_type(previous) != field_type(definition) {
                         return Err(format!("cannot change the type of attribute {field}").into());
                     }
-                }
-                self.schema.insert(field.clone(), definition.clone());
+                    if field == "id" {
+                        definition.clone()
+                    } else if let Some(update) = definition.as_object() {
+                        let mut merged = previous.as_object().cloned().unwrap_or_else(|| {
+                            Map::from_iter([("type".into(), json!(field_type(previous)))])
+                        });
+                        merged
+                            .entry("filterable")
+                            .or_insert_with(|| json!(effective_filterable(previous)));
+                        let mut update = update.clone();
+                        if let Some(new_fts) = update.get("full_text_search").cloned() {
+                            let prior_fts = merged.get("full_text_search");
+                            if new_fts == Value::Bool(true)
+                                && prior_fts.is_some_and(Value::is_object)
+                            {
+                                update.remove("full_text_search");
+                            } else if let (Some(old), Some(new)) =
+                                (prior_fts.and_then(Value::as_object), new_fts.as_object())
+                            {
+                                let mut options = old.clone();
+                                options.extend(new.clone());
+                                update.insert("full_text_search".into(), Value::Object(options));
+                            }
+                        }
+                        merged.extend(update);
+                        Value::Object(merged)
+                    } else {
+                        // Shorthand replaces search/index options but leaves the
+                        // current filterability of an existing field in place.
+                        json!({"type":definition,"filterable":effective_filterable(previous)})
+                    }
+                } else {
+                    definition.clone()
+                };
+                validate_definition(field, &definition)?;
+                self.schema.insert(field.clone(), definition);
             }
         }
         let mut normalized = body.clone();
@@ -254,6 +312,7 @@ impl Namespace {
         let object = normalized
             .as_object()
             .ok_or("write body must be an object")?;
+        validate_distinct_document_ids(object)?;
         for (flag, operation) in [
             ("delete_by_filter_allow_partial", "delete_by_filter"),
             ("patch_by_filter_allow_partial", "patch_by_filter"),
@@ -302,11 +361,8 @@ impl Namespace {
         }
         for (condition, operations) in [
             ("upsert_condition", &["upsert_rows", "upsert_columns"][..]),
-            (
-                "patch_condition",
-                &["patch_rows", "patch_columns", "patch_by_filter"][..],
-            ),
-            ("delete_condition", &["deletes", "delete_by_filter"][..]),
+            ("patch_condition", &["patch_rows", "patch_columns"][..]),
+            ("delete_condition", &["deletes"][..]),
         ] {
             if let Some(filter) = object.get(condition) {
                 if !operations
@@ -324,29 +380,30 @@ impl Namespace {
         if let Some(filter) = object.get("delete_by_filter") {
             validate_filter(filter, &self.schema)?;
             self.rows.retain(|_, row| {
-                if filter_matches(filter, row, &self.schema)
-                    && condition_matches(object, "delete_condition", Some(row), &self.schema)
-                {
+                if filter_matches(filter, row, &self.schema) {
                     deleted_ids.push(row["id"].clone());
                     false
                 } else {
                     true
                 }
             });
+            sort_ids(&mut deleted_ids);
         }
         if let Some(deletes) = object.get("deletes") {
             let deletes = deletes.as_array().ok_or("deletes must be an array")?;
             for id in deletes {
                 let key = id_key(id)?;
-                if condition_matches(
-                    object,
-                    "delete_condition",
-                    self.rows.get(&key),
-                    &self.schema,
-                ) && self.rows.remove(&key).is_some()
+                let current = self.rows.get(&key);
+                // Plain delete-by-ID is an acknowledged write even when the row was
+                // already absent. A conditional delete skips absent rows instead.
+                if object.contains_key("delete_condition")
+                    && (current.is_none()
+                        || !condition_matches(object, "delete_condition", current, &self.schema))
                 {
-                    deleted_ids.push(id.clone());
+                    continue;
                 }
+                self.rows.remove(&key);
+                deleted_ids.push(id.clone());
             }
         }
         if let Some(patch) = object.get("patch_by_filter") {
@@ -366,15 +423,18 @@ impl Namespace {
             validate_filter(filter, &self.schema)?;
             self.validate_patch(values)?;
             for row in self.rows.values_mut() {
-                if filter_matches(filter, row, &self.schema)
-                    && condition_matches(object, "patch_condition", Some(row), &self.schema)
-                {
+                if filter_matches(filter, row, &self.schema) {
                     for (field, value) in values {
-                        row.insert(field.clone(), value.clone());
+                        if value.is_null() {
+                            row.remove(field);
+                        } else {
+                            row.insert(field.clone(), value.clone());
+                        }
                     }
                     patched_ids.push(row["id"].clone());
                 }
             }
+            sort_ids(&mut patched_ids);
         }
         if let Some(rows) = write_rows(object, "patch_rows", "patch_columns")? {
             for patch in &rows {
@@ -392,7 +452,11 @@ impl Namespace {
                 if let Some(row) = self.rows.get_mut(&key) {
                     for (field, value) in patch {
                         if field != "id" {
-                            row.insert(field.clone(), value.clone());
+                            if value.is_null() {
+                                row.remove(field);
+                            } else {
+                                row.insert(field.clone(), value.clone());
+                            }
                         }
                     }
                     patched_ids.push(id.clone());
@@ -415,7 +479,13 @@ impl Namespace {
                 ) {
                     continue;
                 }
+                for (field, definition) in &self.schema {
+                    if is_fixed_vector(definition) && !row.contains_key(field) {
+                        return Err(format!("upsert row requires vector attribute {field}").into());
+                    }
+                }
                 for (field, value) in &row {
+                    validate_attribute_name(field)?;
                     // `[]unknown` comes from an empty array; the first non-empty array
                     // settles the element type.
                     let unknown = self.schema.get(field) == Some(&json!("[]unknown"))
@@ -451,6 +521,7 @@ impl Namespace {
                         }
                     }
                 }
+                row.retain(|field, value| field == "id" || !value.is_null());
                 self.rows.insert(id_key(&id)?, row);
                 upserted_ids.push(id);
             }
@@ -479,6 +550,7 @@ impl Namespace {
 
     fn validate_patch(&self, values: &Map<String, Value>) -> Result<(), WriteError> {
         for (field, value) in values {
+            validate_attribute_name(field)?;
             if field == "id" {
                 continue;
             }
@@ -489,10 +561,44 @@ impl Namespace {
             if has_embed(definition) {
                 return Err(format!("patching embedded attribute {field} is unsupported").into());
             }
+            if vector::dimensions(definition).is_some()
+                || vector::multi_dimensions(definition).is_some()
+            {
+                return Err("💔 patching vectors is currently unsupported".into());
+            }
             validate_value(field, value, definition)?;
         }
         Ok(())
     }
+}
+
+fn validate_distinct_document_ids(object: &Map<String, Value>) -> Result<(), WriteError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut duplicates = 0;
+    if let Some(deletes) = object.get("deletes") {
+        for id in deletes.as_array().ok_or("deletes must be an array")? {
+            if !seen.insert(id_key(id)?) {
+                duplicates += 1;
+            }
+        }
+    }
+    for (rows, columns) in [
+        ("patch_rows", "patch_columns"),
+        ("upsert_rows", "upsert_columns"),
+    ] {
+        if let Some(documents) = write_rows(object, rows, columns)? {
+            for document in documents {
+                let id = document.get("id").ok_or("write row requires id")?;
+                if !seen.insert(id_key(id)?) {
+                    duplicates += 1;
+                }
+            }
+        }
+    }
+    if duplicates > 0 {
+        return Err(format!("💔 This upsert contains {duplicates} duplicate document IDs and was not written. You should ensure that individual upserts do not include duplicate documents.").into());
+    }
+    Ok(())
 }
 
 fn condition_matches(
@@ -595,6 +701,13 @@ fn default_filterable(definition: &Value) -> bool {
         || matches!(field_type(definition), "{}f16" | "bytes"))
 }
 
+fn effective_filterable(definition: &Value) -> bool {
+    definition
+        .get("filterable")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| default_filterable(definition))
+}
+
 fn is_fixed_vector(definition: &Value) -> bool {
     vector::dimensions(definition).is_some() && vector::multi_dimensions(definition).is_none()
 }
@@ -617,7 +730,29 @@ pub(crate) fn known_field(schema: &Map<String, Value>, field: &str) -> bool {
             .is_some_and(|base| schema.get(base).is_some_and(has_embed))
 }
 
+fn validate_attribute_name(field: &str) -> Result<(), String> {
+    if field.is_empty() {
+        return Err("attribute name cannot be empty".into());
+    }
+    if field.len() > 128 {
+        return Err(format!("attribute name is too long: {field}"));
+    }
+    if field.starts_with('$') {
+        return Err(format!("cannot use reserved attribute name {field}"));
+    }
+    Ok(())
+}
+
 fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
+    validate_attribute_name(field)?;
+    if definition
+        .as_object()
+        .is_some_and(|config| !config.contains_key("type"))
+    {
+        return Err(crate::shape_error(format!(
+            "schema.{field} requires a type"
+        )));
+    }
     if let Some(config) = definition.as_object() {
         for (option, value) in config {
             match option.as_str() {
@@ -750,6 +885,13 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
     }
 }
 
+fn sort_ids(ids: &mut [Value]) {
+    ids.sort_by(|left, right| match (left.as_u64(), right.as_u64()) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => left.as_str().cmp(&right.as_str()),
+    });
+}
+
 fn validate_id(value: &Value, definition: Option<&Value>) -> Result<(), String> {
     id_key(value)?;
     if let Some(definition) = definition {
@@ -760,7 +902,11 @@ fn validate_id(value: &Value, definition: Option<&Value>) -> Result<(), String> 
 
 fn id_key(value: &Value) -> Result<String, String> {
     match value {
-        Value::String(s) if !s.is_empty() => Ok(format!("s:{s}")),
+        Value::String(s) if s.len() <= 64 => Ok(format!("s:{s}")),
+        Value::String(s) => Err(format!(
+            "id string must be at most 64 bytes, got {}",
+            s.len()
+        )),
         Value::Number(n) if n.as_u64().is_some() => Ok(format!("n:{n}")),
         _ => Err("id must be a string or unsigned integer".into()),
     }

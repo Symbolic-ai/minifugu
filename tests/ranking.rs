@@ -168,6 +168,38 @@ async fn exact_cosine_ranks_explicit_vectors_and_rejects_wrong_dimensions() {
 }
 
 #[tokio::test]
+async fn cosine_float32_arithmetic_orders_near_tied_vectors_like_live() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/vector-near-ties");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","vector":{"type":"[2]f32","ann":true}},
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[
+                {"id":1,"vector":[0.7,0.7]},
+                {"id":2,"vector":[0.3,0.3]}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, result) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["vector","ANN",[0.2,0.7]],"limit":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&result), [2, 1]);
+    assert!(
+        result["rows"][0]["$dist"].as_f64().unwrap() < result["rows"][1]["$dist"].as_f64().unwrap()
+    );
+}
+
+#[tokio::test]
 async fn bm25_ranks_term_frequency_and_excludes_non_matches() {
     let base = serve(minifugu::router()).await;
     let client = Client::new();
