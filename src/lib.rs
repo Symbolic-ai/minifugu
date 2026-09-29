@@ -419,15 +419,19 @@ async fn write(
     Path(name): Path<String>,
     State(state): State<Shared>,
     headers: HeaderMap,
-    JsonBody(body): JsonBody,
+    JsonBody(mut body): JsonBody,
 ) -> Result<Json<Value>, ApiError> {
     authorized(&headers)?;
     namespace_name(&name)?;
+    store::normalize_write_body(&mut body).map_err(bad)?;
     let object = body
         .as_object()
-        .ok_or_else(|| bad("write body must be an object"))?;
-    store::validate_write_keys(object).map_err(bad)?;
+        .expect("normalized write body is an object");
+    store::validate_write_conditions(object).map_err(bad)?;
     let mut guard = state.namespaces.write().await;
+    if !store::has_write_operations(object, guard.contains_key(&name)) {
+        return Err(bad("💔 no writes provided"));
+    }
     if let Some(source) = object
         .get("branch_from_namespace")
         .or_else(|| object.get("copy_from_namespace"))
@@ -464,7 +468,7 @@ async fn write(
         let rows = namespace.rows.len();
         persist_namespace(&state, &mut guard, name, namespace)?;
         return Ok(Json(
-            json!({"status":"OK","message":"success","rows_affected":rows,"billing":{"billable_logical_bytes_written":0}}),
+            json!({"status":"OK","message":"namespace cloned successfully","rows_affected":rows,"billing":{"billable_logical_bytes_written":0}}),
         ));
     }
     if !guard.contains_key(&name)
