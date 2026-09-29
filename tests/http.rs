@@ -808,6 +808,39 @@ async fn query_shape_errors_use_live_status_codes() {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{query}: {body}");
         assert_eq!(body["status"], "error");
     }
+    let subquery = json!({"rank_by":["id","asc"],"limit":1});
+    for count in [0, 17] {
+        let (status, _) = post(
+            &client,
+            &query_url,
+            json!({"queries":vec![subquery.clone(); count]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{count} subqueries");
+    }
+    let (status, result) = post(&client, &query_url, json!({"queries":vec![subquery; 16]})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["results"].as_array().unwrap().len(), 16);
+    for query in [
+        json!({"rank_by":["id","asc"],"limit":10000,"offset":1}),
+        json!({"rank_by":["id","asc"],"top_k":1,"offset":10000}),
+        json!({"queries":[{"rank_by":["id","asc"],"limit":1},{"rank_by":["id","desc"],"limit":1}],"rerank_by":["RRF"],"limit":10000,"offset":1}),
+    ] {
+        assert_eq!(
+            post(&client, &query_url, query).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        post(
+            &client,
+            &query_url,
+            json!({"rank_by":["id","asc"],"limit":9999,"offset":1})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
     let malformed = client
         .post(&query_url)
         .bearer_auth("dummy")

@@ -41,6 +41,12 @@ impl Namespace {
             let queries = queries
                 .as_array()
                 .ok_or_else(|| crate::shape_error("queries must be an array"))?;
+            if queries.is_empty() {
+                return Err("must send at least one sub-query".into());
+            }
+            if queries.len() > 16 {
+                return Err("multi-query exceeds the 16-subquery limit".into());
+            }
             for query in queries {
                 self.validate_query(query)?;
             }
@@ -250,6 +256,13 @@ impl Namespace {
         }
         if object.get("offset").is_some_and(|v| v.as_u64().is_none()) {
             return Err("offset must be a nonnegative integer".into());
+        }
+        let total = limit
+            .and_then(|value| value.as_u64().or_else(|| value["total"].as_u64()))
+            .unwrap();
+        let offset = object.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        if offset.saturating_add(total) > 10_000 {
+            return Err("offset plus limit must be at most 10000".into());
         }
         Ok(())
     }
@@ -792,6 +805,9 @@ fn validate_rrf(
     let offset = object.get("offset").map_or(Ok(0), |v| {
         v.as_u64().ok_or("offset must be a nonnegative integer")
     })?;
+    if offset.saturating_add(limit) > 10_000 {
+        return Err("offset plus limit must be at most 10000".into());
+    }
     Ok((rank_constant, weights, limit as usize, offset as usize))
 }
 
