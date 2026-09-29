@@ -59,7 +59,7 @@ export OPENAI_API_KEY="$(your-secret-manager-command)"
 cargo run --release
 ```
 
-MiniFugu calls OpenAI's embeddings endpoint for native `embed` fields on writes and `Embed` queries, using the schema model and dimensions. `MINIFUGU_OPENAI_BASE_URL` can point at a compatible local test server. For an explicit vector field, supply the model in the query: `"rank_by":["vector","ANN",["Embed","red fugu",{"model":"openai/text-embedding-3-small"}]]`. Explicit query vectors never make provider calls. [OpenAI's embedding guide](https://developers.openai.com/api/docs/guides/embeddings) documents the model and endpoint.
+MiniFugu calls OpenAI's embeddings endpoint for native `embed` fields on writes and `Embed` queries, using the schema dimensions. A source field defaults to its schema model; an explicit query model overrides it, as on Turbopuffer. `MINIFUGU_OPENAI_BASE_URL` can point at a compatible local test server. For an explicit vector field, supply the model in the query: `"rank_by":["vector","ANN",["Embed","red fugu",{"model":"openai/text-embedding-3-small"}]]`. Explicit query vectors never make provider calls. A request may contain up to 16 `Embed` clauses; MiniFugu validates the query before calling the provider. [OpenAI's embedding guide](https://developers.openai.com/api/docs/guides/embeddings) documents the model and endpoint.
 
 ## API surface
 

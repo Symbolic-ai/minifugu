@@ -841,16 +841,17 @@ async fn query_embed_contract(base: &str, token: &str) {
     let client = Client::new();
     let name = format!("minifugu-query-embed-{}", Uuid::new_v4().simple());
     let url = format!("{base}/v2/namespaces/{name}");
-    let mut vector = vec![0.0; 256];
-    vector[0] = 1.0;
     let write = response(
         &client,
         token,
         &url,
         json!({
-            "schema":{"id":"uint","vector":{"type":"[256]f32","ann":true},"content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":256}}},
+            "schema":{"id":"uint","content":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":256}}},
             "distance_metric":"cosine_distance",
-            "upsert_rows":[{"id":1,"vector":vector,"content":"pufferfish swim"}]
+            "upsert_rows":[
+                {"id":1,"content":"pufferfish swim"},
+                {"id":2,"content":"blue whale"}
+            ]
         }),
     )
     .await;
@@ -858,48 +859,65 @@ async fn query_embed_contract(base: &str, token: &str) {
         (
             json!(["content", "ANN", ["Embed", "pufferfish"]]),
             StatusCode::OK,
+            Some(1_u64),
         ),
         (
-            json!(["vector", "ANN", ["Embed", "pufferfish", {"model":"openai/text-embedding-3-small"}]]),
+            json!(["embed_content", "ANN", ["Embed", "pufferfish", {"model":"openai/text-embedding-3-small"}]]),
             StatusCode::OK,
+            Some(1),
         ),
         (
             json!(["content", "kNN", ["Embed", "pufferfish"]]),
             StatusCode::OK,
+            Some(1),
         ),
         (
-            json!(["vector", "ANN", ["Embed", "pufferfish"]]),
-            StatusCode::BAD_REQUEST,
-        ),
-        (
-            json!(["vector", "ANN", ["Embed", "pufferfish", {"model":null}]]),
-            StatusCode::BAD_REQUEST,
-        ),
-        (
-            json!(["vector", "ANN", ["Embed", "pufferfish", {"model":"openai/text-embedding-3-small","extra":true}]]),
+            json!(["content", "ANN", ["Embed", "pufferfish", {"model":"openai/text-embedding-3-large"}]]),
             StatusCode::OK,
+            None,
         ),
         (
-            json!(["vector", "ANN", ["Embed"]]),
-            StatusCode::UNPROCESSABLE_ENTITY,
+            json!(["embed_content", "ANN", ["Embed", "pufferfish"]]),
+            StatusCode::BAD_REQUEST,
+            None,
         ),
         (
-            json!(["vector", "ANN", ["Embed", 12]]),
+            json!(["embed_content", "ANN", ["Embed", "pufferfish", {"model":null}]]),
+            StatusCode::BAD_REQUEST,
+            None,
+        ),
+        (
+            json!(["embed_content", "ANN", ["Embed", "pufferfish", {"model":"openai/text-embedding-3-small","extra":true}]]),
+            StatusCode::OK,
+            Some(1),
+        ),
+        (
+            json!(["embed_content", "ANN", ["Embed"]]),
             StatusCode::UNPROCESSABLE_ENTITY,
+            None,
+        ),
+        (
+            json!(["embed_content", "ANN", ["Embed", 12]]),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            None,
         ),
     ];
     let results: Result<Vec<_>, reqwest::Error> = async {
         let mut results = Vec::new();
-        for (rank, expected) in cases {
+        for (rank, expected, winner) in cases {
+            let mut query = json!({"rank_by":rank,"limit":2});
+            if rank[1] == "kNN" {
+                query["filters"] = json!(["id", "In", [1, 2]]);
+            }
             let reply = client
                 .post(format!("{url}/query"))
                 .bearer_auth(token)
-                .json(&json!({"rank_by":rank,"filters":["id","Eq",1],"limit":1}))
+                .json(&query)
                 .send()
                 .await?;
             let status = reply.status();
             let body = reply.json::<Value>().await?;
-            results.push((rank, expected, status, body));
+            results.push((rank, expected, winner, status, body));
         }
         Ok(results)
     }
@@ -907,10 +925,10 @@ async fn query_embed_contract(base: &str, token: &str) {
     let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
     assert_eq!(write.0, StatusCode::OK, "embed write: {}", write.1);
     assert_eq!(cleanup.status(), StatusCode::OK);
-    for (rank, expected, status, body) in results.expect("query embedding failed") {
+    for (rank, expected, winner, status, body) in results.expect("query embedding failed") {
         assert_eq!(status, expected, "rank {rank}: {body}");
-        if status == StatusCode::OK {
-            assert_eq!(ids(&body), vec![1], "rank {rank}");
+        if let Some(winner) = winner {
+            assert_eq!(body["rows"][0]["id"], winner, "rank {rank}: {body}");
         }
     }
 }

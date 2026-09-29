@@ -506,20 +506,21 @@ async fn query_namespace(
 ) -> Result<Json<Value>, ApiError> {
     authorized(&headers)?;
     namespace_name(&name)?;
-    let schema = {
+    let requests = {
         let guard = state.namespaces.read().await;
-        guard
-            .get(&name)
-            .ok_or_else(|| {
-                ApiError(
-                    StatusCode::NOT_FOUND,
-                    format!("namespace {name} does not exist"),
-                )
-            })?
-            .schema
-            .clone()
+        let namespace = guard.get(&name).ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!("namespace {name} does not exist"),
+            )
+        })?;
+        let requests = embedding::prepare_query(&mut body, &namespace.schema).map_err(bad)?;
+        if !requests.is_empty() {
+            namespace.validate_body(&body).map_err(bad)?;
+        }
+        requests
     };
-    embedding::materialize_query(&mut body, &schema, &state.embedding)
+    embedding::materialize_query(&mut body, requests, &state.embedding)
         .await
         .map_err(|error| match error {
             embedding::QueryEmbeddingError::Invalid(message) => bad(message),
@@ -528,6 +529,8 @@ async fn query_namespace(
                 "embedding provider unavailable".into(),
             ),
         })?;
+    // A schema update during the provider call is checked by the query against
+    // the current namespace below; stale vector dimensions produce a clean 400.
     let guard = state.namespaces.read().await;
     let namespace = guard.get(&name).ok_or_else(|| {
         ApiError(

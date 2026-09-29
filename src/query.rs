@@ -34,6 +34,38 @@ impl Namespace {
         Ok(result)
     }
 
+    /// Check the complete request before a query-time embedding can call a provider.
+    pub(crate) fn validate_body(&self, body: &Value) -> Result<(), String> {
+        let object = body.as_object().ok_or("query body must be an object")?;
+        validate_query_options(object)?;
+        if let Some(queries) = object.get("queries") {
+            let queries = queries
+                .as_array()
+                .ok_or_else(|| crate::shape_error("queries must be an array"))?;
+            if queries.is_empty() || queries.len() > 16 {
+                return Err("queries must contain 1 to 16 subqueries".into());
+            }
+            for query in queries {
+                self.validate_query(query)?;
+            }
+            if object.contains_key("rerank_by") {
+                validate_rrf(object, queries)?;
+            } else if object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "queries" | "limit" | "top_k" | "consistency" | "vector_encoding"
+                )
+            }) {
+                return Err(
+                    "queries cannot be combined with other query fields without rerank_by".into(),
+                );
+            }
+        } else {
+            self.validate_query(body)?;
+        }
+        Ok(())
+    }
+
     fn query_inner(&self, body: &Value) -> Result<Value, String> {
         let object = body.as_object().ok_or("query body must be an object")?;
         validate_query_options(object)?;
@@ -1531,7 +1563,7 @@ pub(crate) fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result
         for part in parts {
             validate_rank(part, schema)?;
         }
-        if parts.iter().all(is_attribute_order) {
+        if parts.iter().all(is_single_attribute_order) {
             return Ok(());
         }
         return Err("multi-attribute rank requires attribute order clauses".into());
@@ -1629,8 +1661,9 @@ pub(crate) fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result
     }
     if parts.len() == 2 && parts[0] == "Attribute" {
         let field = parts[1].as_str().ok_or("Attribute requires a field name")?;
-        if !known_field(schema, field)
-            || !matches!(field_type(&schema[field]), "uint" | "int" | "float")
+        if !schema
+            .get(field)
+            .is_some_and(|definition| matches!(field_type(definition), "uint" | "int" | "float"))
         {
             return Err(format!("attribute {field} is not numeric"));
         }
@@ -1939,20 +1972,19 @@ fn contains_knn(expression: &Value) -> bool {
         (parts.len() == 3 && parts[1] == "kNN") || parts.iter().any(contains_knn)
     })
 }
-fn is_attribute_order(rank: &Value) -> bool {
+fn is_single_attribute_order(rank: &Value) -> bool {
     rank.as_array().is_some_and(|parts| {
-        (parts.len() == 2
+        parts.len() == 2
             && parts[0].is_string()
-            && matches!(parts[1].as_str(), Some("asc" | "desc")))
-            || (!parts.is_empty()
-                && parts.iter().all(|part| {
-                    part.as_array().is_some_and(|item| {
-                        item.len() == 2
-                            && item[0].is_string()
-                            && matches!(item[1].as_str(), Some("asc" | "desc"))
-                    })
-                }))
+            && matches!(parts[1].as_str(), Some("asc" | "desc"))
     })
+}
+
+fn is_attribute_order(rank: &Value) -> bool {
+    is_single_attribute_order(rank)
+        || rank
+            .as_array()
+            .is_some_and(|parts| !parts.is_empty() && parts.iter().all(is_single_attribute_order))
 }
 
 fn compare_attribute_order(
