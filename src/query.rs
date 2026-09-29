@@ -1970,10 +1970,10 @@ fn compare_attribute_order(
             if b.is_null() {
                 std::cmp::Ordering::Equal
             } else {
-                std::cmp::Ordering::Greater
+                std::cmp::Ordering::Less
             }
         } else if b.is_null() {
-            std::cmp::Ordering::Less
+            std::cmp::Ordering::Greater
         } else {
             compare_values(a, b).unwrap_or(0).cmp(&0)
         };
