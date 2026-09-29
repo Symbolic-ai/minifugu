@@ -744,6 +744,33 @@ async fn aggregates_match_live_grouping_edges() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["aggregations"], json!({"count":4,"sum":0.0}));
 
+    let (status, result) = post(
+        &client,
+        &query_url,
+        json!({"aggregate_by":{"count":["Count"]},"group_by":["h"],"top_k":2}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        result["aggregation_groups"],
+        json!([{"h":"a","count":1},{"h":"b","count":1}])
+    );
+    let (status, result) = post(
+        &client,
+        &query_url,
+        json!({"aggregate_by":{"count":["Count"]},"group_by":["h"],"top_k":0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["aggregation_groups"], json!([]));
+    let (status, _) = post(
+        &client,
+        &query_url,
+        json!({"aggregate_by":{"count":["Count"]},"group_by":["h"],"top_k":10001}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
     for top_k in [json!(-1), json!("1"), json!(1.0), json!(true)] {
         let (status, _) = post(
             &client,
