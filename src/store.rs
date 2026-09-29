@@ -435,18 +435,9 @@ impl Namespace {
                 "distance_metric must be specified for write to namespace with a vector".into(),
             );
         }
-        for (condition, operations) in [
-            ("upsert_condition", &["upsert_rows", "upsert_columns"][..]),
-            ("patch_condition", &["patch_rows", "patch_columns"][..]),
-            ("delete_condition", &["deletes"][..]),
-        ] {
-            if let Some(filter) = object.get(condition) {
-                if !operations
-                    .iter()
-                    .any(|operation| object.contains_key(*operation))
-                {
-                    return Err(unmatched_condition(condition).into());
-                }
+        validate_write_conditions(object)?;
+        for (condition, _) in WRITE_CONDITIONS {
+            if let Some(filter) = object.get(*condition) {
                 validate_filter(filter, &self.schema)?;
             }
         }
@@ -466,7 +457,9 @@ impl Namespace {
             sort_ids(&mut deleted_ids);
         }
         if let Some(deletes) = object.get("deletes") {
-            let deletes = deletes.as_array().ok_or("deletes must be an array")?;
+            let deletes = deletes
+                .as_array()
+                .ok_or_else(|| crate::shape_error("deletes: expected a sequence"))?;
             for id in deletes {
                 let key = id_key(id)?;
                 let current = self.rows.get(&key);
@@ -743,7 +736,10 @@ fn validate_distinct_document_ids(object: &Map<String, Value>) -> Result<(), Wri
     let mut seen = std::collections::HashSet::new();
     let mut duplicates = 0;
     if let Some(deletes) = object.get("deletes") {
-        for id in deletes.as_array().ok_or("deletes must be an array")? {
+        for id in deletes
+            .as_array()
+            .ok_or_else(|| crate::shape_error("deletes: expected a sequence"))?
+        {
             if !seen.insert(id_key(id)?) {
                 duplicates += 1;
             }
@@ -807,13 +803,15 @@ pub(crate) fn normalize_write_body(body: &mut Value) -> Result<(), String> {
     let object = body
         .as_object_mut()
         .ok_or_else(|| crate::shape_error("write body must be an object"))?;
+    // A null field carries no option, so it is dropped before unknown fields are
+    // rejected, as an omitted field would be.
+    object.retain(|_, value| !value.is_null());
     if let Some(key) = object
         .keys()
         .find(|key| !WRITE_FIELDS.contains(&key.as_str()))
     {
         return Err(format!("unsupported write field {key}"));
     }
-    object.retain(|_, value| !value.is_null());
     for key in ["upsert_rows", "patch_rows", "deletes"] {
         if object.get(key).is_some_and(|value| !value.is_array()) {
             return Err(crate::shape_error(format!("{key}: expected a sequence")));
@@ -837,15 +835,18 @@ fn unmatched_condition(condition: &str) -> String {
     format!("💔 cannot set {condition} without corresponding {kind} writes")
 }
 
+/// Each write condition and the operations it applies to.
+const WRITE_CONDITIONS: &[(&str, &[&str])] = &[
+    ("upsert_condition", &["upsert_rows", "upsert_columns"]),
+    ("patch_condition", &["patch_rows", "patch_columns"]),
+    ("delete_condition", &["deletes"]),
+];
+
 /// Live rejects a write condition whose operation is absent before it checks whether the
 /// body writes anything, so this runs first.
 pub(crate) fn validate_write_conditions(object: &Map<String, Value>) -> Result<(), String> {
-    for (condition, operations) in [
-        ("upsert_condition", &["upsert_rows", "upsert_columns"][..]),
-        ("patch_condition", &["patch_rows", "patch_columns"][..]),
-        ("delete_condition", &["deletes"][..]),
-    ] {
-        if object.contains_key(condition)
+    for (condition, operations) in WRITE_CONDITIONS {
+        if object.contains_key(*condition)
             && !operations
                 .iter()
                 .any(|operation| object.contains_key(*operation))
@@ -1012,7 +1013,7 @@ fn write_rows(
         (Some(_), Some(_)) => Err(format!("{row_key} and {column_key} cannot be combined").into()),
         (Some(rows), None) => Ok(Some(
             rows.as_array()
-                .ok_or_else(|| format!("{row_key} must be an array"))?
+                .ok_or_else(|| crate::shape_error(format!("{row_key}: expected a sequence")))?
                 .clone(),
         )),
         (None, Some(columns)) => Ok(Some(rows_from_columns(columns)?)),
@@ -1073,16 +1074,18 @@ fn inferred_vector_dimensions(object: &Map<String, Value>) -> Result<Option<usiz
 }
 
 fn rows_from_columns(columns: &Value) -> Result<Vec<Value>, WriteError> {
-    let columns = columns.as_object().ok_or("columns must be an object")?;
+    let columns = columns
+        .as_object()
+        .ok_or_else(|| crate::shape_error("columns: expected a map"))?;
     let ids = columns
         .get("id")
         .and_then(Value::as_array)
-        .ok_or("columns require an id array")?;
+        .ok_or_else(|| crate::shape_error("columns: missing field `id`"))?;
     let mut rows = vec![Map::new(); ids.len()];
     for (field, values) in columns {
         let values = values
             .as_array()
-            .ok_or_else(|| format!("column {field} must be an array"))?;
+            .ok_or_else(|| crate::shape_error(format!("column {field}: expected a sequence")))?;
         if values.len() != rows.len() {
             return Err(format!("column {field} length must match id length").into());
         }

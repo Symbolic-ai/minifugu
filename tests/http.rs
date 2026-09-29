@@ -1968,13 +1968,15 @@ async fn namespaces_can_be_copied_and_then_diverge() {
     let (status, result) = post(&client, &branch, json!({"branch_from_namespace":"source"})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["rows_affected"], 1);
-    let (status, _) = post(
+    assert_eq!(result["message"], "namespace cloned successfully");
+    let (status, result) = post(
         &client,
         &copy,
         json!({"copy_from_namespace":{"source_namespace":"source"}}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["message"], "namespace cloned successfully");
     post(
         &client,
         &branch,
