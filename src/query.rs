@@ -989,26 +989,32 @@ fn fuzzy_matches(value: &Value, query: &str, options: &Value) -> bool {
         // A match needs at least `query - distance` characters of text, so shorter
         // values are skipped before the quadratic distance computation.
         candidate.chars().count() + max_distance as usize >= query.chars().count()
-            && fuzzy_substring_distance(&query, &candidate) <= max_distance as usize
+            && fuzzy_substring_within(&query, &candidate, max_distance as usize)
     })
 }
 
-/// Smallest edit distance between `query` and any substring of `text`.
-fn fuzzy_substring_distance(query: &str, text: &str) -> usize {
+/// Whether some substring of `text` is within `max_distance` edits of `query`. The scan
+/// stops at the first such substring, and reuses two rows instead of allocating per
+/// character.
+fn fuzzy_substring_within(query: &str, text: &str, max_distance: usize) -> bool {
     let query: Vec<char> = query.chars().collect();
+    if query.len() <= max_distance {
+        return true;
+    }
     let mut previous: Vec<usize> = (0..=query.len()).collect();
-    let mut best = query.len();
+    let mut current = vec![0; query.len() + 1];
     for character in text.chars() {
-        let mut current = vec![0; query.len() + 1];
         for (index, expected) in query.iter().enumerate() {
             current[index + 1] = (previous[index + 1] + 1)
                 .min(current[index] + 1)
                 .min(previous[index] + usize::from(*expected != character));
         }
-        best = best.min(current[query.len()]);
-        previous = current;
+        if current[query.len()] <= max_distance {
+            return true;
+        }
+        std::mem::swap(&mut previous, &mut current);
     }
-    best
+    false
 }
 
 fn token_filter_matches(parts: &[Value], left: &Value) -> bool {
