@@ -111,24 +111,26 @@ impl Namespace {
                 }
             }
             if let Some(embed) = definition.get("embed") {
-                let generated = format!("embed_{field}");
+                let generated = embedding_target(field, embed);
                 if matches!(view, SchemaView::Metadata) {
                     attribute.insert(
                         "embed".into(),
                         json!({"attribute":generated,"model":embed["model"]}),
                     );
                 }
-                let kind = format!("[{}]f16", embed["dims"].as_u64().unwrap());
-                let generated_attribute = match view {
-                    SchemaView::Schema => json!({
-                        "type":kind,"filterable":false,"full_text_search":null,"ann":true
-                    }),
-                    SchemaView::Metadata => json!({
-                        "type":kind,"filterable":false,
-                        "ann":{"distance_metric":self.distance_metric.as_deref().unwrap_or("cosine_distance")}
-                    }),
-                };
-                attributes.insert(generated, generated_attribute);
+                if !self.schema.contains_key(&generated) {
+                    let kind = format!("[{}]f16", embed["dims"].as_u64().unwrap());
+                    let generated_attribute = match view {
+                        SchemaView::Schema => json!({
+                            "type":kind,"filterable":false,"full_text_search":null,"ann":true
+                        }),
+                        SchemaView::Metadata => json!({
+                            "type":kind,"filterable":false,
+                            "ann":{"distance_metric":self.distance_metric.as_deref().unwrap_or("cosine_distance")}
+                        }),
+                    };
+                    attributes.insert(generated, generated_attribute);
+                }
             }
             attributes.insert(field.clone(), Value::Object(attribute));
         }
@@ -195,7 +197,7 @@ impl Namespace {
                 self.schema
                     .iter()
                     .find(|(_, definition)| has_embed(definition))
-                    .map(|(field, _)| format!("embed_{field}"))
+                    .map(|(field, definition)| embedding_target(field, &definition["embed"]))
             })
             .ok_or("recall requires an ANN-enabled vector attribute")?;
         let mut ground_truth = Vec::new();
@@ -312,6 +314,57 @@ impl Namespace {
                 self.schema.insert(field.clone(), definition);
             }
         }
+        // Every embedded source writes one vector attribute: its named target or
+        // the default embed_<source>. Live rejects two sources that share one.
+        let mut targets = std::collections::BTreeSet::new();
+        for (field, definition) in &self.schema {
+            if let Some(config) = definition.get("embed") {
+                let target = embedding_target(field, config);
+                if !targets.insert(target.clone()) {
+                    return Err(format!(
+                        "cannot have multiple embedded attributes targeting the attribute `{target}`"
+                    )
+                    .into());
+                }
+            }
+        }
+        // Named embedding targets become ordinary vector attributes in the schema.
+        // The default embed_<source> target remains a computed schema view.
+        let embedded_targets = self
+            .schema
+            .iter()
+            .filter_map(|(field, definition)| {
+                let config = definition.get("embed")?;
+                let target = config.get("attribute")?.as_str()?;
+                Some((field.clone(), target.to_owned(), config.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (source, target, config) in embedded_targets {
+            validate_attribute_name(&target)?;
+            if target == source {
+                return Err(
+                    format!("embedding cannot target non-vector attribute `{target}`").into(),
+                );
+            }
+            let dimensions = config.get("dims").and_then(Value::as_u64).unwrap_or(1536) as usize;
+            if let Some(existing) = self.schema.get(&target) {
+                if vector::dimensions(existing).is_some_and(|existing| existing != dimensions) {
+                    return Err("💔 embedded field's dims don't match the target vector".into());
+                }
+                if vector::dimensions(existing) != Some(dimensions)
+                    || !matches!(
+                        field_type(existing).rsplit_once(']').map(|(_, t)| t),
+                        Some("f16" | "f32")
+                    )
+                {
+                    return Err(format!("embedding target {target} must be a {dimensions}-dimensional f16 or f32 vector").into());
+                }
+            } else {
+                let definition = json!({"type":format!("[{dimensions}]f16"),"ann":true});
+                validate_definition(&target, &definition)?;
+                self.schema.insert(target, definition);
+            }
+        }
         // Live Turbopuffer infers an undeclared `vector` attribute as an ANN-indexed
         // `[N]f32` from the upserted values, so the metric checks below must see it.
         if self
@@ -326,7 +379,7 @@ impl Namespace {
             }
         }
         for (field, definition) in &self.schema {
-            if has_embed(definition) {
+            if has_embed(definition) && definition["embed"].get("attribute").is_none() {
                 let generated = format!("embed_{field}");
                 if self.schema.contains_key(&generated) {
                     return Err(format!(
@@ -342,7 +395,13 @@ impl Namespace {
             .filter_map(|(field, definition)| {
                 let embed = definition.get("embed")?;
                 let dims = embed.get("dims").and_then(Value::as_u64).unwrap_or(1536);
-                Some((format!("embed_{field}"), json!(format!("[{dims}]f16"))))
+                let target = embedding_target(field, embed);
+                let definition = self
+                    .schema
+                    .get(&target)
+                    .cloned()
+                    .unwrap_or_else(|| json!(format!("[{dims}]f16")));
+                Some((target, definition))
             })
             .collect::<Map<_, _>>();
         let mut normalized = body.clone();
@@ -549,7 +608,10 @@ impl Namespace {
                     continue;
                 }
                 for (field, definition) in &self.schema {
-                    if is_fixed_vector(definition) && row.get(field).is_none_or(Value::is_null) {
+                    if is_fixed_vector(definition)
+                        && !generated_vectors.contains_key(field)
+                        && row.get(field).is_none_or(Value::is_null)
+                    {
                         return Err(format!("upsert row requires vector attribute {field}").into());
                     }
                     if vector::multi_dimensions(definition).is_some() {
@@ -601,7 +663,7 @@ impl Namespace {
                 }
                 for (field, definition) in &self.schema {
                     if has_embed(definition) {
-                        let vector_field = format!("embed_{field}");
+                        let vector_field = embedding_target(field, &definition["embed"]);
                         if row.get(&vector_field).is_some_and(|value| !value.is_null()) {
                             continue;
                         }
@@ -705,7 +767,8 @@ fn vector_attributes(schema: &Map<String, Value>) -> BTreeSet<String> {
             fields.insert(field.clone());
         }
         if has_embed(definition) {
-            fields.insert(format!("embed_{field}"));
+            // A named target is also a schema field, so the set counts it once.
+            fields.insert(embedding_target(field, &definition["embed"]));
         }
     }
     fields
@@ -1140,11 +1203,21 @@ pub(crate) fn has_embed(definition: &Value) -> bool {
     definition.get("embed").is_some()
 }
 
+pub(crate) fn embedding_target(field: &str, config: &Value) -> String {
+    config
+        .get("attribute")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("embed_{field}"))
+}
+
 pub(crate) fn known_field(schema: &Map<String, Value>, field: &str) -> bool {
     schema.contains_key(field)
-        || field
-            .strip_prefix("embed_")
-            .is_some_and(|base| schema.get(base).is_some_and(has_embed))
+        || schema.iter().any(|(source, definition)| {
+            definition
+                .get("embed")
+                .is_some_and(|config| embedding_target(source, config) == field)
+        })
 }
 
 fn validate_attribute_name(field: &str) -> Result<(), String> {
@@ -1305,7 +1378,7 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
                     if value.as_object().is_some_and(|embed| {
                         embed
                             .keys()
-                            .any(|key| !matches!(key.as_str(), "model" | "dims"))
+                            .any(|key| !matches!(key.as_str(), "model" | "dims" | "attribute"))
                     }) {
                         return Err(format!("unsupported embed option for attribute {field}"));
                     }
@@ -1329,6 +1402,14 @@ fn validate_definition(field: &str, definition: &Value) -> Result<(), String> {
                 .is_some_and(|dims| dims > 0 && dims <= 3072)
         {
             return Err(format!("invalid embed configuration for attribute {field}"));
+        }
+        if embed
+            .get("attribute")
+            .is_some_and(|value| !value.is_string())
+        {
+            return Err(crate::shape_error(format!(
+                "schema.{field}: embed.attribute must be a string"
+            )));
         }
     }
     if vector::dimensions(definition).is_some()
