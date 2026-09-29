@@ -2130,6 +2130,51 @@ async fn embedded_attribute_schema_views_match_live_shapes() {
 }
 
 #[tokio::test]
+async fn embedding_schema_shorthand_infers_supported_model_dimensions() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/embed-shorthand");
+    let origin = base.trim_end_matches("/v2/namespaces");
+    let (status, body) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{
+                "id":"uint",
+                "short":{"type":"string","embed":"openai/text-embedding-3-small"},
+                "object":{"type":"string","embed":{"model":"openai/text-embedding-3-small"}},
+                "large":{"type":"string","embed":{"model":"openai/text-embedding-3-large"}}
+            },
+            "distance_metric":"cosine_distance",
+            "upsert_rows":[{"id":1,"short":"red fish","object":"blue whale"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let schema: Value = client
+        .get(format!("{origin}/v1/namespaces/embed-shorthand/schema"))
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(schema["embed_short"]["type"], "[1536]f16");
+    assert_eq!(schema["embed_object"]["type"], "[1536]f16");
+    assert_eq!(schema["embed_large"]["type"], "[3072]f16");
+    let vector = minifugu::deterministic_embedding("red fish", 1536);
+    let (status, query) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({"rank_by":["embed_short","ANN",vector],"limit":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{query}");
+    assert_eq!(query["rows"][0]["id"], 1);
+}
+
+#[tokio::test]
 async fn integer_sum_keeps_values_beyond_float_precision() {
     let base = server().await;
     let client = Client::new();
