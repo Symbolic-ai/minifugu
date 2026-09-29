@@ -1557,7 +1557,7 @@ async fn euclidean_metric_and_i8_vectors_rank_exactly() {
     assert_eq!(response["rows"][0]["id"], 1);
     assert_eq!(response["rows"][0]["$dist"], 2.0);
     assert_eq!(response["rows"][1]["$dist"], 13.0);
-    let (status, override_result) = post(
+    let (status, mismatch) = post(
         &client,
         &format!("{ns}/query"),
         json!({
@@ -1566,9 +1566,11 @@ async fn euclidean_metric_and_i8_vectors_rank_exactly() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(override_result["rows"][0]["id"], 2);
-    assert_eq!(override_result["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(mismatch["error"]
+        .as_str()
+        .unwrap()
+        .contains("Distance metric mismatch"));
 }
 
 #[tokio::test]

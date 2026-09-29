@@ -891,6 +891,19 @@ async fn ann_contract(base: &str, token: &str) {
     )
     .await;
     assert_eq!(create.0, StatusCode::OK, "ANN update setup: {}", create.1);
+    for (metric, expected) in [
+        ("cosine_distance", StatusCode::OK),
+        ("euclidean_squared", StatusCode::BAD_REQUEST),
+    ] {
+        let (status, reply) = response(
+            &client,
+            token,
+            &format!("{url}/query"),
+            json!({"rank_by":["vector","ANN",[1.0,0.0]],"distance_metric":metric,"limit":1}),
+        )
+        .await;
+        assert_eq!(status, expected, "query metric {metric}: {reply}");
+    }
     let schema_url = format!("{base}/v1/namespaces/{name}/schema");
     let matching = response(
         &client,
