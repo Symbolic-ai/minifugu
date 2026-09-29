@@ -23,6 +23,51 @@ async fn post(client: &Client, url: &str, body: Value) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
+async fn equal_bm25_scores_order_numeric_ids_numerically() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/bm25-ties");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","title":{"type":"string","full_text_search":true}},
+            "upsert_rows":[
+                {"id":11,"title":"fugu"},{"id":5,"title":"fugu"},{"id":2,"title":"fugu"},
+                {"id":9007199254740993_u64,"title":"fugu"},
+                {"id":9007199254740992_u64,"title":"fugu"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = post(
+        &client,
+        &format!("{url}/query"),
+        json!({
+            "rank_by":["title","BM25","fugu"],"limit":5
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| &row["id"])
+            .collect::<Vec<_>>(),
+        vec![
+            &json!(2),
+            &json!(5),
+            &json!(11),
+            &json!(9007199254740992_u64),
+            &json!(9007199254740993_u64)
+        ]
+    );
+}
+
+#[tokio::test]
 async fn exact_cosine_ranks_explicit_vectors_and_rejects_wrong_dimensions() {
     let base = serve(minifugu::router()).await;
     let client = Client::new();

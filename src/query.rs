@@ -65,7 +65,7 @@ impl Namespace {
                 let mut rows = fused.into_values().collect::<Vec<_>>();
                 rows.sort_by(|a, b| {
                     b.0.total_cmp(&a.0)
-                        .then_with(|| a.1["id"].to_string().cmp(&b.1["id"].to_string()))
+                        .then_with(|| compare_ids(&a.1["id"], &b.1["id"]))
                 });
                 let rows = rows
                     .into_iter()
@@ -183,7 +183,7 @@ impl Namespace {
             return Err("limit and top_k cannot be combined".into());
         }
         if object.get("top_k").is_some_and(|value| !value.is_number()) {
-            return Err("top_k must be an integer".into());
+            return Err(crate::shape_error("top_k must be an integer"));
         }
         let limit = object.get("limit").or_else(|| object.get("top_k"));
         match limit {
@@ -194,7 +194,7 @@ impl Namespace {
                     .is_some_and(|n| n <= 10_000) =>
             {
                 if v.keys().any(|key| !matches!(key.as_str(), "total" | "per")) {
-                    return Err("unsupported limit field".into());
+                    return Err(crate::shape_error("unsupported limit field"));
                 }
                 if let Some(per) = v.get("per") {
                     let per = per.as_object().ok_or("limit.per must be an object")?;
@@ -202,7 +202,7 @@ impl Namespace {
                         .keys()
                         .any(|key| !matches!(key.as_str(), "attributes" | "limit"))
                     {
-                        return Err("unsupported limit.per field".into());
+                        return Err(crate::shape_error("unsupported limit.per field"));
                     }
                     let fields = per
                         .get("attributes")
@@ -240,7 +240,11 @@ impl Namespace {
                     }
                 }
             }
-            _ => return Err("limit or top_k must be an integer at most 10000".into()),
+            None => return Err("rank_by queries must specify top_k or limit".into()),
+            Some(Value::Number(_)) => {
+                return Err("limit or top_k must be an integer at most 10000".into());
+            }
+            _ => return Err(crate::shape_error("limit must be an integer or object")),
         }
         if object.get("offset").is_some_and(|v| v.as_u64().is_none()) {
             return Err("offset must be a nonnegative integer".into());
@@ -291,11 +295,11 @@ impl Namespace {
         scored.sort_by(|(a, row_a), (b, row_b)| {
             if let Some(rank) = rank.filter(|rank| is_attribute_order(rank)) {
                 return compare_attribute_order(rank, row_a, row_b)
-                    .then_with(|| row_a["id"].to_string().cmp(&row_b["id"].to_string()));
+                    .then_with(|| compare_ids(&row_a["id"], &row_b["id"]));
             }
             let order = a.total_cmp(b);
             (if ascending { order } else { order.reverse() })
-                .then_with(|| row_a["id"].to_string().cmp(&row_b["id"].to_string()))
+                .then_with(|| compare_ids(&row_a["id"], &row_b["id"]))
         });
         let offset = object.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
         let limit = object
@@ -392,7 +396,9 @@ impl Namespace {
                     | "vector_encoding"
                     | "consistency"
             ) {
-                return Err(format!("unsupported aggregation field {key}"));
+                return Err(crate::shape_error(format!(
+                    "unknown aggregation field {key}"
+                )));
             }
         }
         let aggregates = object["aggregate_by"]
@@ -417,7 +423,7 @@ impl Namespace {
                         return Err(format!("Sum attribute {field} must be numeric"));
                     }
                 }
-                _ => return Err(format!("unsupported aggregate {name}")),
+                _ => return Err(crate::shape_error(format!("unsupported aggregate {name}"))),
             }
         }
         if let Some(filter) = object.get("filters") {
@@ -425,10 +431,17 @@ impl Namespace {
         }
         if let Some(groups) = object.get("group_by") {
             let groups = groups.as_array().ok_or("group_by must be an array")?;
+            let mut seen = std::collections::HashSet::new();
             for field in groups {
                 let field = field
                     .as_str()
                     .ok_or("group_by entries must be attribute names")?;
+                if field == "id" {
+                    return Err("cannot group by id".into());
+                }
+                if !seen.insert(field) {
+                    return Err(format!("cannot use {field} in group_by more than once"));
+                }
                 if !known_field(&self.schema, field) {
                     return Err(format!("attribute {field} does not exist in schema"));
                 }
@@ -462,10 +475,10 @@ impl Namespace {
             })
             .collect::<Vec<_>>();
         let aggregates = object["aggregate_by"].as_object().unwrap();
-        let Some(groups) = object.get("group_by") else {
-            return json!({"aggregations": aggregate_values(aggregates, &rows)});
+        let fields = object.get("group_by").and_then(Value::as_array);
+        let Some(fields) = fields.filter(|fields| !fields.is_empty()) else {
+            return json!({"aggregations": aggregate_values(aggregates, &rows, &self.schema)});
         };
-        let fields = groups.as_array().unwrap();
         let mut grouped = std::collections::BTreeMap::<
             String,
             (Map<String, Value>, Vec<&Map<String, Value>>),
@@ -516,7 +529,7 @@ impl Namespace {
             .into_iter()
             .take(limit)
             .map(|(mut attrs, rows)| {
-                attrs.extend(aggregate_values(aggregates, &rows));
+                attrs.extend(aggregate_values(aggregates, &rows, &self.schema));
                 Value::Object(attrs)
             })
             .collect::<Vec<_>>();
@@ -667,6 +680,7 @@ fn validate_rrf(
 fn aggregate_values(
     aggregates: &Map<String, Value>,
     rows: &[&Map<String, Value>],
+    schema: &Map<String, Value>,
 ) -> Map<String, Value> {
     aggregates
         .iter()
@@ -680,7 +694,11 @@ fn aggregate_values(
                     .iter()
                     .filter_map(|row| row.get(field).and_then(Value::as_f64))
                     .sum();
-                if total.fract() == 0.0 && total >= i64::MIN as f64 && total <= i64::MAX as f64 {
+                if field_type(&schema[field]) != "float"
+                    && total.fract() == 0.0
+                    && total >= i64::MIN as f64
+                    && total <= i64::MAX as f64
+                {
                     json!(total as i64)
                 } else {
                     json!(total)
@@ -891,7 +909,9 @@ pub(crate) fn validate_filter(filter: &Value, schema: &Map<String, Value>) -> Re
         "AnyGt" | "AnyGte" | "AnyLt" | "AnyLte" => {
             Err(format!("attribute {field} is not an array"))
         }
-        _ => Err(format!("unsupported filter operator {op}")),
+        _ => Err(crate::shape_error(format!(
+            "unsupported filter operator {op}"
+        ))),
     }
 }
 
@@ -1090,6 +1110,13 @@ fn token_filter_matches(parts: &[Value], left: &Value, definition: &Value) -> bo
             })
         }
         _ => false,
+    }
+}
+
+fn compare_ids(left: &Value, right: &Value) -> std::cmp::Ordering {
+    match (left.as_u64(), right.as_u64()) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => left.as_str().cmp(&right.as_str()),
     }
 }
 
@@ -1398,7 +1425,12 @@ pub(crate) fn validate_rank(rank: &Value, schema: &Map<String, Value>) -> Result
         {
             Ok(())
         }
-        _ => Err(format!("unsupported rank operator {operator}")),
+        "asc" | "desc" if parts.len() == 2 => {
+            Err(format!("attribute {field} cannot be used for ordering"))
+        }
+        _ => Err(crate::shape_error(format!(
+            "unsupported rank operator {operator}"
+        ))),
     }
 }
 

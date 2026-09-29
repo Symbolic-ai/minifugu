@@ -22,6 +22,111 @@ async fn post(client: &Client, url: &str, body: Value) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
+async fn aggregates_match_live_grouping_edges() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/aggregation-edges");
+    let query_url = format!("{url}/query");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","g":"uint","h":"string","f":"float"},
+            "upsert_rows":[
+                {"id":1,"g":10,"h":"b","f":1.5},
+                {"id":2,"g":2,"h":"c","f":2.5},
+                {"id":3,"g":2,"h":"a","f":-4.0},
+                {"id":4,"h":"z"}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let aggregate = json!({"aggregate_by":{"count":["Count"],"sum":["Sum","f"]}});
+    let (status, result) = post(
+        &client,
+        &query_url,
+        json!({
+            "aggregate_by":aggregate["aggregate_by"],"group_by":[]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["aggregations"], json!({"count":4,"sum":0.0}));
+
+    let (status, result) = post(
+        &client,
+        &query_url,
+        json!({
+            "aggregate_by":aggregate["aggregate_by"],"group_by":["g","h"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        result["aggregation_groups"],
+        json!([
+            {"g":null,"h":"z","count":1,"sum":0.0},
+            {"g":2,"h":"a","count":1,"sum":-4.0},
+            {"g":2,"h":"c","count":1,"sum":2.5},
+            {"g":10,"h":"b","count":1,"sum":1.5}
+        ])
+    );
+
+    for fields in [json!(["id"]), json!(["g", "g"])] {
+        let (status, _) = post(
+            &client,
+            &query_url,
+            json!({
+                "aggregate_by":{"count":["Count"]},"group_by":fields
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn query_shape_errors_use_live_status_codes() {
+    let base = server().await;
+    let client = Client::new();
+    let url = format!("{base}/query-shapes");
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint"},"upsert_rows":[{"id":1}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query_url = format!("{url}/query");
+    for query in [
+        json!({"rank_by":["id","asc"],"limit":"x"}),
+        json!({"rank_by":["id","sideways"],"limit":1}),
+        json!({"rank_by":["id","asc"],"filters":["id","Equals",1],"limit":1}),
+        json!({"aggregate_by":{"count":["Avg","id"]}}),
+        json!({"aggregate_by":{"count":["Count"]},"group_by":["id"],"limit":1}),
+    ] {
+        let (status, body) = post(&client, &query_url, query.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{query}: {body}");
+        assert_eq!(body["status"], "error");
+    }
+    let malformed = client
+        .post(&query_url)
+        .bearer_auth("dummy")
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    let body: Value = malformed.json().await.unwrap();
+    assert_eq!(body["status"], "error");
+}
+
+#[tokio::test]
 async fn rejects_unknown_document_selector_even_for_empty_namespace() {
     let base = server().await;
     let client = Client::new();
@@ -752,32 +857,37 @@ async fn unsupported_fields_fail_loudly() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(body["error"].as_str().unwrap().contains("aggregation"));
-    for (query, expected) in [
+    for (query, expected, expected_status) in [
         (
             json!({"rank_by":["id","asc"],"top_k":{"total":1,"per":{"attributes":["title"],"limit":1}},"include_attributes":["title"]}),
             "top_k must",
+            StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (
             json!({"rank_by":["id","asc"],"limit":{"total":1,"extra":true}}),
             "unsupported limit field",
+            StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (
             json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["title"],"limit":1,"extra":true}},"include_attributes":["title"]}),
             "unsupported limit.per field",
+            StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (
             json!({"aggregate_by":{"count":["Count"]},"top_k":1}),
             "top_k requires group_by",
+            StatusCode::BAD_REQUEST,
         ),
         (
             json!({"aggregate_by":{"title":["Count"]},"group_by":["title"],"top_k":1}),
             "conflicts with a group field",
+            StatusCode::BAD_REQUEST,
         ),
     ] {
         let (status, body) = post(&client, &format!("{ns}/query"), query).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, expected_status);
         assert!(body["error"].as_str().unwrap().contains(expected), "{body}");
     }
     let (status, body) = post(
