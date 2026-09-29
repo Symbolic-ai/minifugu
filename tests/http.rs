@@ -511,7 +511,7 @@ async fn schema_object_updates_merge_options_and_shorthand_resets_them() {
             &client,
             &url,
             json!({"schema":{
-        "id":"uint", "name":{"type":"string","full_text_search":true,"glob":true},
+        "id":"uint", "name":{"type":"string","full_text_search":{"k1":2.0,"b":0.2,"stemming":true},"glob":true},
         "label":"string"
     },"upsert_rows":[{"id":1,"name":"fugu","label":"fish"}]})
         )
@@ -531,6 +531,25 @@ async fn schema_object_updates_merge_options_and_shorthand_resets_them() {
     assert_eq!(schema["name"]["filterable"], false);
     assert!(schema["name"]["full_text_search"].is_object());
     assert_eq!(schema["label"]["filterable"], true);
+    let (status, schema) = post(
+        &client,
+        &schema_url,
+        json!({"name":{"type":"string","full_text_search":{"k1":1.5}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(schema["name"]["full_text_search"]["k1"], 1.5);
+    assert_eq!(schema["name"]["full_text_search"]["b"], 0.2);
+    assert_eq!(schema["name"]["full_text_search"]["stemming"], true);
+    let (status, schema) = post(
+        &client,
+        &schema_url,
+        json!({"name":{"type":"string","full_text_search":true}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(schema["name"]["full_text_search"]["k1"], 1.5);
+    assert_eq!(schema["name"]["full_text_search"]["b"], 0.2);
     let (status, schema) = post(&client, &schema_url, json!({"name":"string"})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(schema["name"]["filterable"], false);

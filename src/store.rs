@@ -277,7 +277,22 @@ impl Namespace {
                         merged
                             .entry("filterable")
                             .or_insert_with(|| json!(effective_filterable(previous)));
-                        merged.extend(update.clone());
+                        let mut update = update.clone();
+                        if let Some(new_fts) = update.get("full_text_search").cloned() {
+                            let prior_fts = merged.get("full_text_search");
+                            if new_fts == Value::Bool(true)
+                                && prior_fts.is_some_and(Value::is_object)
+                            {
+                                update.remove("full_text_search");
+                            } else if let (Some(old), Some(new)) =
+                                (prior_fts.and_then(Value::as_object), new_fts.as_object())
+                            {
+                                let mut options = old.clone();
+                                options.extend(new.clone());
+                                update.insert("full_text_search".into(), Value::Object(options));
+                            }
+                        }
+                        merged.extend(update);
                         Value::Object(merged)
                     } else {
                         // Shorthand replaces search/index options but leaves the

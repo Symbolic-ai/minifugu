@@ -148,7 +148,7 @@ fn scenario(seed: u64) -> (Value, Vec<Value>) {
     let term = ["fugu", "whale", "sea"][generator.next(3)];
     let write = json!({
         "schema":{
-            "id":"uint","title":{"type":"string","full_text_search":true},
+            "id":"uint","title":{"type":"string","full_text_search":{"k1":1.8,"b":0.3}},
             "group":"string","score":"int","weight":"float",
             "tags":{"type":"[]string","glob":true,"filterable":true}
         },
@@ -286,6 +286,15 @@ async fn generated_queries_match_live() {
             if local.0 != live.0 || !same_value(&local.1, &live.1) {
                 failures.push(format!(
                     "seed {seed} schema update: local {} {}, live {} {}",
+                    local.0, local.1, live.0, live.1
+                ));
+            }
+            let tuning = json!({"title":{"type":"string","full_text_search":{"k1":1.5}}});
+            let local = call(&client, "local", &local_schema_url, &tuning).await;
+            let live = call(&client, &live_token, &live_schema_url, &tuning).await;
+            if local.0 != live.0 || !same_value(&local.1, &live.1) {
+                failures.push(format!(
+                    "seed {seed} text tuning update: local {} {}, live {} {}",
                     local.0, local.1, live.0, live.1
                 ));
             }
