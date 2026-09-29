@@ -742,6 +742,21 @@ async fn aggregates_match_live_grouping_edges() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["aggregations"], json!({"count":4,"sum":0.0}));
+    let (status, result) = post(
+        &client,
+        &query_url,
+        json!({"aggregate_by":{"count":["Count"],"legacy_count":["Count","id"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["aggregations"], json!({"count":4,"legacy_count":4}));
+    let (status, _) = post(
+        &client,
+        &query_url,
+        json!({"aggregate_by":{"invalid":["Count","f"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 
     let (status, result) = post(
         &client,

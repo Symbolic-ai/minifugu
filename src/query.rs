@@ -441,6 +441,12 @@ impl Namespace {
                 .ok_or_else(|| format!("aggregate {name} must be an array"))?;
             match parts.as_slice() {
                 [operator] if operator == "Count" => (),
+                [operator, field] if operator == "Count" && field == "id" => (),
+                [operator, field] if operator == "Count" && field.is_string() => {
+                    return Err(
+                        "aggregate_by with attributes other than id is not supported".into(),
+                    );
+                }
                 [operator, field] if operator == "Sum" => {
                     let field = field.as_str().ok_or("Sum attribute must be a string")?;
                     let definition = self
