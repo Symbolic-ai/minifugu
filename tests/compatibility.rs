@@ -949,10 +949,11 @@ async fn embed_schema_contract(base: &str, token: &str) {
                 "id":"uint",
                 "short":{"type":"string","embed":"openai/text-embedding-3-small"},
                 "object":{"type":"string","embed":{"model":"openai/text-embedding-3-small"}},
-                "large":{"type":"string","embed":{"model":"openai/text-embedding-3-large"}}
+                "large":{"type":"string","embed":{"model":"openai/text-embedding-3-large"}},
+                "narrow":{"type":"string","embed":{"model":"openai/text-embedding-3-small","dims":256}}
             },
             "distance_metric":"cosine_distance",
-            "upsert_rows":[{"id":1,"short":"red fish","object":"blue whale","large":"green turtle"}]
+            "upsert_rows":[{"id":1,"short":"red fish","object":"blue whale","large":"green turtle","narrow":"yellow crab"}]
         }),
     )
     .await;
@@ -962,6 +963,31 @@ async fn embed_schema_contract(base: &str, token: &str) {
         Ok((status, response.json().await?))
     }
     .await;
+    let mut updates = Vec::new();
+    for embed in [
+        json!({"model":"openai/text-embedding-3-small"}),
+        json!({"model":"openai/text-embedding-3-small","dims":null}),
+    ] {
+        let update = response(
+            &client,
+            token,
+            &url,
+            json!({
+                "schema":{"narrow":{"type":"string","embed":embed}}
+            }),
+        )
+        .await;
+        let current: Value = client
+            .get(&schema_url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        updates.push((update, current));
+    }
     let cleanup = client.delete(&url).bearer_auth(token).send().await.unwrap();
     assert_eq!(write.0, StatusCode::OK, "embed schema write: {}", write.1);
     assert_eq!(cleanup.status(), StatusCode::OK);
@@ -970,6 +996,11 @@ async fn embed_schema_contract(base: &str, token: &str) {
     assert_eq!(schema["embed_short"]["type"], "[1536]f16");
     assert_eq!(schema["embed_object"]["type"], "[1536]f16");
     assert_eq!(schema["embed_large"]["type"], "[3072]f16");
+    assert_eq!(schema["embed_narrow"]["type"], "[256]f16");
+    for (update, schema) in updates {
+        assert_eq!(update.0, StatusCode::OK, "embed update: {}", update.1);
+        assert_eq!(schema["embed_narrow"]["type"], "[256]f16");
+    }
 }
 
 async fn null_sort_contract(base: &str, token: &str) {
