@@ -858,6 +858,10 @@ async fn query_shape_errors_use_live_status_codes() {
         json!({"rank_by":["id","asc"],"limit":1,"filters":["group","In",["a",1]]}),
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","ContainsAny",[null]]}),
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","In",[["fish"]]]}),
+        json!({"rank_by":["id","asc"],"limit":1.0}),
+        json!({"rank_by":["id","asc"],"top_k":-1}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":null,"limit":1}}}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["group"],"limit":null}},"include_attributes":["group"]}),
     ] {
         let (status, body) = post(&client, &query_url, query.clone()).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{query}: {body}");
@@ -876,6 +880,13 @@ async fn query_shape_errors_use_live_status_codes() {
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Gte",["fish"]]}),
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Lt",["z"]]}),
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","Lte",["fish"]]}),
+        json!({"rank_by":["id","asc"],"limit":null}),
+        json!({"rank_by":["id","asc"],"top_k":null}),
+        json!({"limit":1,"offset":0}),
+        json!({"rank_by":["id","asc"],"limit":1,"exclude_attributes":["id"]}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":[],"limit":1}}}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["group"],"limit":2}},"include_attributes":["group"]}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["id"],"limit":1}},"include_attributes":true}),
     ] {
         assert_eq!(
             post(&client, &query_url, query).await.0,
@@ -895,6 +906,10 @@ async fn query_shape_errors_use_live_status_codes() {
     for query in [
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","In",["fish"]]}),
         json!({"rank_by":["id","asc"],"limit":1,"filters":["tags","NotIn",["other"]]}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"extra":true}}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":null}}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["id"],"limit":1,"extra":true}},"include_attributes":["id"]}),
+        json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["group"],"limit":1}},"include_attributes":["group"]}),
     ] {
         let (status, body) = post(&client, &query_url, query).await;
         assert_eq!(status, StatusCode::OK);
@@ -1692,16 +1707,6 @@ async fn unsupported_fields_fail_loudly() {
         (
             json!({"rank_by":["id","asc"],"top_k":{"total":1,"per":{"attributes":["title"],"limit":1}},"include_attributes":["title"]}),
             "top_k must",
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ),
-        (
-            json!({"rank_by":["id","asc"],"limit":{"total":1,"extra":true}}),
-            "unsupported limit field",
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ),
-        (
-            json!({"rank_by":["id","asc"],"limit":{"total":1,"per":{"attributes":["title"],"limit":1,"extra":true}},"include_attributes":["title"]}),
-            "unsupported limit.per field",
             StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (
