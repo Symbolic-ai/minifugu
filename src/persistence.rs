@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
-    io::{self, Write},
+    io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -170,9 +170,12 @@ impl Store {
     fn append(&mut self, record: &RecordOut<'_>) -> io::Result<()> {
         let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
         line.push(b'\n');
+        // The log is written at a tracked offset rather than in append mode: Windows
+        // refuses to truncate a file opened for appending.
         let result = self
             .log
-            .write_all(&line)
+            .seek(SeekFrom::Start(self.log_bytes))
+            .and_then(|_| self.log.write_all(&line))
             .and_then(|()| self.log.sync_data());
         match result {
             Ok(()) => {
@@ -295,17 +298,16 @@ fn write_snapshot(directory: &Path, namespaces: &HashMap<String, Namespace>) -> 
     Ok(bytes.len() as u64)
 }
 
-/// Opens the log empty, in append mode, so writes after a truncation start at offset 0.
+/// Opens the log empty.
 fn open_log(directory: &Path) -> io::Result<File> {
     let mut options = fs::OpenOptions::new();
-    options.append(true).create(true);
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     let file = options.open(directory.join(LOG))?;
-    file.set_len(0)?;
     file.sync_all()?;
     sync_directory(directory)?;
     Ok(file)
