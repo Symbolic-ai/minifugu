@@ -63,12 +63,18 @@ pub(crate) struct Store {
     log_bytes: u64,
     snapshot_bytes: u64,
     min_compaction_bytes: u64,
+    /// Set when a failed append could not be undone. The file may then end in a
+    /// partial line, so later appends fail rather than write after it.
+    poisoned: bool,
 }
 
-/// Loads the snapshot, replays the log, and compacts both into a new snapshot.
+/// Loads the snapshot and replays the log over it.
 ///
-/// A corrupt snapshot or a corrupt complete log line stops startup instead of dropping
-/// data. A final log line without its newline was never acknowledged, so it is discarded.
+/// A log that is at least as large as the snapshot (and the compaction minimum) is
+/// compacted into a new snapshot; a smaller one is kept, so a restart after a few writes
+/// does not rewrite a large snapshot. A corrupt snapshot or a corrupt complete log line
+/// stops startup instead of dropping data. A final log line without its newline was
+/// never acknowledged, so it is discarded.
 pub(crate) fn open(directory: &Path) -> io::Result<(Store, HashMap<String, Namespace>)> {
     fs::create_dir_all(directory)?;
     #[cfg(unix)]
@@ -77,7 +83,7 @@ pub(crate) fn open(directory: &Path) -> io::Result<(Store, HashMap<String, Names
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
     }
     let snapshot_path = directory.join(SNAPSHOT);
-    let (mut namespaces, mut snapshot_bytes): (HashMap<String, Namespace>, u64) =
+    let (mut namespaces, snapshot_bytes): (HashMap<String, Namespace>, u64) =
         match fs::read(&snapshot_path) {
             Ok(bytes) => (
                 serde_json::from_slice(&bytes).map_err(io::Error::other)?,
@@ -86,28 +92,26 @@ pub(crate) fn open(directory: &Path) -> io::Result<(Store, HashMap<String, Names
             Err(error) if error.kind() == io::ErrorKind::NotFound => (HashMap::new(), 0),
             Err(error) => return Err(error),
         };
-    let replayed = replay(&directory.join(LOG), &mut namespaces)?;
+    let log_bytes = replay(&directory.join(LOG), &mut namespaces)?;
     // Older snapshots lack the cached byte estimate; compute it once on startup.
     for namespace in namespaces.values_mut() {
         if namespace.approx_logical_bytes.is_none() {
             namespace.approx_logical_bytes = Some(namespace.logical_bytes());
         }
     }
-    if replayed {
-        snapshot_bytes = write_snapshot(directory, &namespaces)?;
-    }
-    // The snapshot now holds every logged change, so the log starts empty.
-    let log = open_log(directory)?;
-    Ok((
-        Store {
-            directory: directory.to_path_buf(),
-            log,
-            log_bytes: 0,
-            snapshot_bytes,
-            min_compaction_bytes: MIN_COMPACTION_BYTES,
-        },
-        namespaces,
-    ))
+    let mut store = Store {
+        directory: directory.to_path_buf(),
+        log: open_log(directory)?,
+        log_bytes,
+        snapshot_bytes,
+        min_compaction_bytes: MIN_COMPACTION_BYTES,
+        poisoned: false,
+    };
+    // Drops an unacknowledged final line, so the next append starts a clean line.
+    store.log.set_len(log_bytes)?;
+    store.log.sync_all()?;
+    store.maybe_compact(&namespaces)?;
+    Ok((store, namespaces))
 }
 
 impl Store {
@@ -147,7 +151,8 @@ impl Store {
         self.append(&RecordOut::Drop { name })
     }
 
-    /// Rewrites the snapshot and empties the log once the log outgrows the snapshot.
+    /// Rewrites the snapshot and empties the log once the log is at least as large as
+    /// the snapshot and the compaction minimum.
     ///
     /// The last write is already durable in the log, so a failure here loses nothing.
     pub(crate) fn maybe_compact(
@@ -168,6 +173,11 @@ impl Store {
     }
 
     fn append(&mut self, record: &RecordOut<'_>) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "the log could not be repaired after a failed write; restart MiniFugu",
+            ));
+        }
         let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
         line.push(b'\n');
         // The log is written at a tracked offset rather than in append mode: Windows
@@ -185,7 +195,9 @@ impl Store {
             Err(error) => {
                 // Remove a partial line, or the next acknowledged line would follow it
                 // and the log could not be replayed.
-                let _ = self.log.set_len(self.log_bytes);
+                if self.log.set_len(self.log_bytes).is_err() {
+                    self.poisoned = true;
+                }
                 Err(error)
             }
         }
@@ -210,6 +222,9 @@ fn row_changes<'a>(
 }
 
 /// The namespace without its rows: what a log record needs besides the row changes.
+///
+/// The literal names every field and has no `..` rest, so a new `Namespace` field does
+/// not compile until it is added here, and replay cannot silently drop it.
 fn metadata(namespace: &Namespace) -> Namespace {
     Namespace {
         schema: namespace.schema.clone(),
@@ -224,14 +239,14 @@ fn metadata(namespace: &Namespace) -> Namespace {
     }
 }
 
-/// Applies the log to `namespaces` and returns whether it held any record.
-fn replay(path: &Path, namespaces: &mut HashMap<String, Namespace>) -> io::Result<bool> {
+/// Applies the log to `namespaces` and returns the length of its complete lines.
+fn replay(path: &Path, namespaces: &mut HashMap<String, Namespace>) -> io::Result<u64> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error),
     };
-    let mut replayed = false;
+    let mut complete_bytes = 0;
     let mut lines = bytes.split(|byte| *byte == b'\n').peekable();
     while let Some(line) = lines.next() {
         // The segment after the last newline is empty, or a line that was cut off
@@ -246,9 +261,9 @@ fn replay(path: &Path, namespaces: &mut HashMap<String, Namespace>) -> io::Resul
             )
         })?;
         apply(namespaces, record);
-        replayed = true;
+        complete_bytes += line.len() as u64 + 1;
     }
-    Ok(replayed)
+    Ok(complete_bytes)
 }
 
 fn apply(namespaces: &mut HashMap<String, Namespace>, record: RecordIn) {
@@ -298,10 +313,10 @@ fn write_snapshot(directory: &Path, namespaces: &HashMap<String, Namespace>) -> 
     Ok(bytes.len() as u64)
 }
 
-/// Opens the log empty.
 fn open_log(directory: &Path) -> io::Result<File> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    // The caller sets the length to the replayed lines.
+    options.write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -358,25 +373,109 @@ mod tests {
         assert_eq!(delete, ["3"]);
     }
 
+    fn put(
+        store: &mut Store,
+        namespaces: &mut HashMap<String, Namespace>,
+        name: &str,
+        ids: &[&str],
+    ) {
+        let next = namespace(ids);
+        store.put(name, namespaces.get(name), &next).unwrap();
+        namespaces.insert(name.into(), next);
+    }
+
+    fn log_len(directory: &Path) -> u64 {
+        fs::metadata(directory.join(LOG)).unwrap().len()
+    }
+
     #[test]
-    fn a_log_larger_than_the_snapshot_is_compacted() {
+    fn the_log_is_compacted_once_it_is_as_large_as_the_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut store, mut namespaces) = open(directory.path()).unwrap();
+        store.min_compaction_bytes = 1;
+        put(
+            &mut store,
+            &mut namespaces,
+            "ns",
+            &["1", "2", "3", "4", "5", "6"],
+        );
+        store.maybe_compact(&namespaces).unwrap();
+        assert_eq!(log_len(directory.path()), 0);
+        assert!(store.snapshot_bytes > store.min_compaction_bytes);
+
+        // A log above the minimum but smaller than the snapshot is kept.
+        put(
+            &mut store,
+            &mut namespaces,
+            "ns",
+            &["1", "2", "3", "4", "5"],
+        );
+        store.maybe_compact(&namespaces).unwrap();
+        assert!(log_len(directory.path()) > 0);
+        assert!(store.log_bytes < store.snapshot_bytes);
+
+        // Once the log reaches the snapshot size, it is compacted.
+        while store.log_bytes < store.snapshot_bytes {
+            put(
+                &mut store,
+                &mut namespaces,
+                "ns",
+                &["1", "2", "3", "4", "5", "6"],
+            );
+            put(
+                &mut store,
+                &mut namespaces,
+                "ns",
+                &["1", "2", "3", "4", "5"],
+            );
+        }
+        store.maybe_compact(&namespaces).unwrap();
+        assert_eq!(log_len(directory.path()), 0);
+
+        // The next append lands at the start of the emptied log and replays cleanly.
+        put(&mut store, &mut namespaces, "ns", &["1", "7"]);
+        assert_eq!(
+            fs::read(directory.path().join(LOG)).unwrap().first(),
+            Some(&b'{')
+        );
+        drop(store);
+        let (_store, reopened) = open(directory.path()).unwrap();
+        assert_eq!(reopened["ns"].rows.keys().collect::<Vec<_>>(), ["1", "7"]);
+    }
+
+    #[test]
+    fn replaying_a_log_over_its_own_snapshot_gives_the_same_state() {
         let directory = tempfile::tempdir().unwrap();
         let (mut store, mut namespaces) = open(directory.path()).unwrap();
         store.min_compaction_bytes = 0;
-        let first = namespace(&["1"]);
-        store.put("ns", None, &first).unwrap();
-        namespaces.insert("ns".into(), first);
-        store.maybe_compact(&namespaces).unwrap();
-        assert_eq!(fs::metadata(directory.path().join(LOG)).unwrap().len(), 0);
-
-        // The next append lands at the start of the emptied log, so it replays cleanly.
-        let second = namespace(&["1", "2"]);
-        store.put("ns", namespaces.get("ns"), &second).unwrap();
+        put(&mut store, &mut namespaces, "a", &["1", "2"]);
+        put(&mut store, &mut namespaces, "b", &["7"]);
+        store.drop_namespace("b").unwrap();
+        namespaces.remove("b");
+        put(&mut store, &mut namespaces, "b", &["8"]);
+        put(&mut store, &mut namespaces, "a", &["2"]);
         let log = fs::read(directory.path().join(LOG)).unwrap();
-        assert_eq!(log.first(), Some(&b'{'));
+
+        // A crash after compaction renames the snapshot but before it empties the log
+        // leaves both, and the next start replays the log a second time.
+        store.maybe_compact(&namespaces).unwrap();
         drop(store);
+        fs::write(directory.path().join(LOG), log).unwrap();
         let (_store, reopened) = open(directory.path()).unwrap();
-        assert_eq!(reopened["ns"].rows.keys().collect::<Vec<_>>(), ["1", "2"]);
+        assert_eq!(reopened["a"].rows.keys().collect::<Vec<_>>(), ["2"]);
+        assert_eq!(reopened["b"].rows.keys().collect::<Vec<_>>(), ["8"]);
+    }
+
+    #[test]
+    fn a_poisoned_store_refuses_later_appends() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut store, mut namespaces) = open(directory.path()).unwrap();
+        put(&mut store, &mut namespaces, "ns", &["1"]);
+        store.poisoned = true;
+        assert!(store
+            .put("ns", namespaces.get("ns"), &namespace(&["1", "2"]))
+            .is_err());
+        assert!(store.drop_namespace("ns").is_err());
     }
 
     #[test]

@@ -151,29 +151,17 @@ async fn read_only_metadata_survives_restart() {
 async fn older_snapshot_without_cached_byte_count_still_queries() {
     let directory = tempfile::tempdir().unwrap();
     let client = Client::new();
-    let (url, task) = serve(directory.path()).await;
-    let write = client
-        .post(&url)
-        .bearer_auth("dummy")
-        .json(&json!({
-            "schema":{"id":"uint","title":"string"},
-            "upsert_rows":[{"id":1,"title":"old snapshot"}]
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(write.status(), StatusCode::OK);
-    task.abort();
-    // Opening the store again compacts the logged write into the snapshot.
-    let _ = router_with_data_dir(EmbeddingMode::Deterministic, directory.path()).unwrap();
-
-    let path = directory.path().join("namespaces.json");
-    let mut snapshot: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    snapshot["persisted"]
-        .as_object_mut()
-        .unwrap()
-        .remove("approx_logical_bytes");
-    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    // Snapshots from before the cached byte estimate have no `approx_logical_bytes`.
+    let snapshot = json!({"persisted":{
+        "schema":{"id":"uint","title":"string"},
+        "rows":{"n:1":{"id":1,"title":"old snapshot"}},
+        "distance_metric":null
+    }});
+    std::fs::write(
+        directory.path().join("namespaces.json"),
+        serde_json::to_vec(&snapshot).unwrap(),
+    )
+    .unwrap();
 
     let (url, task) = serve(directory.path()).await;
     let query = client
@@ -259,6 +247,22 @@ async fn writes_append_row_changes_and_replay_after_restart() {
 
     let (url, task) = serve(directory.path()).await;
     assert_eq!(ids(&client, &url).await, vec![1, 2]);
+    // The replayed byte estimate equals that of the same rows written at once.
+    let fresh = url.replace("/persisted", "/fresh");
+    let final_rows = json!([{"id":1,"title":"one"},{"id":2,"title":"patched fugu"}]);
+    assert_eq!(
+        post(
+            &client,
+            &fresh,
+            json!({"schema":schema,"upsert_rows":final_rows})
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        logical_bytes(&client, &url).await,
+        logical_bytes(&client, &fresh).await
+    );
     let result: Value = client
         .post(format!("{url}/query"))
         .bearer_auth("dummy")
@@ -270,14 +274,8 @@ async fn writes_append_row_changes_and_replay_after_restart() {
         .await
         .unwrap();
     assert_eq!(result["rows"][0]["id"], 2);
-    // Startup compacted the log into the snapshot.
-    assert_eq!(
-        std::fs::metadata(directory.path().join("namespaces.log"))
-            .unwrap()
-            .len(),
-        0
-    );
-    assert!(directory.path().join("namespaces.json").exists());
+    // A log smaller than the compaction minimum is kept rather than rewritten.
+    assert!(!directory.path().join("namespaces.json").exists());
     task.abort();
 }
 
@@ -299,6 +297,15 @@ async fn an_unacknowledged_final_log_line_is_discarded() {
 
     let (url, task) = serve(directory.path()).await;
     assert_eq!(ids(&client, &url).await, vec![1]);
+    // Startup cut the partial line, so the next record starts a clean line.
+    assert_eq!(
+        post(&client, &url, json!({"upsert_rows":[{"id":2}]})).await,
+        StatusCode::OK
+    );
+    task.abort();
+
+    let (url, task) = serve(directory.path()).await;
+    assert_eq!(ids(&client, &url).await, vec![1, 2]);
     task.abort();
 }
 
@@ -307,55 +314,6 @@ fn a_corrupt_complete_log_line_fails_startup() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("namespaces.log"), b"not json\n").unwrap();
     assert!(router_with_data_dir(EmbeddingMode::Deterministic, directory.path()).is_err());
-}
-
-#[tokio::test]
-async fn replaying_a_log_over_its_own_snapshot_gives_the_same_state() {
-    let directory = tempfile::tempdir().unwrap();
-    let client = Client::new();
-    let (url, task) = serve(directory.path()).await;
-    let other = url.replace("/persisted", "/other");
-    assert_eq!(
-        post(&client, &url, json!({"upsert_rows":[{"id":1},{"id":2}]})).await,
-        StatusCode::OK
-    );
-    assert_eq!(
-        post(&client, &other, json!({"upsert_rows":[{"id":7}]})).await,
-        StatusCode::OK
-    );
-    assert_eq!(
-        client
-            .delete(&other)
-            .bearer_auth("dummy")
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        post(&client, &other, json!({"upsert_rows":[{"id":8}]})).await,
-        StatusCode::OK
-    );
-    assert_eq!(
-        post(&client, &url, json!({"deletes":[1]})).await,
-        StatusCode::OK
-    );
-    task.abort();
-    let log = std::fs::read(directory.path().join("namespaces.log")).unwrap();
-
-    // A crash after compaction renames the snapshot but before it empties the log
-    // leaves both; the next start replays the log a second time.
-    let _ = router_with_data_dir(EmbeddingMode::Deterministic, directory.path()).unwrap();
-    std::fs::write(directory.path().join("namespaces.log"), log).unwrap();
-
-    let (url, task) = serve(directory.path()).await;
-    assert_eq!(ids(&client, &url).await, vec![2]);
-    assert_eq!(
-        ids(&client, &url.replace("/persisted", "/other")).await,
-        vec![8]
-    );
-    task.abort();
 }
 
 #[tokio::test]
@@ -380,4 +338,84 @@ async fn a_copied_namespace_survives_restart() {
         vec![1, 2]
     );
     task.abort();
+}
+
+async fn logical_bytes(client: &Client, url: &str) -> u64 {
+    let metadata: Value = client
+        .get(url.replace("/v2/namespaces/", "/v1/namespaces/") + "/metadata")
+        .bearer_auth("dummy")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    metadata["approx_logical_bytes"].as_u64().unwrap()
+}
+
+#[tokio::test]
+async fn a_snapshot_written_by_v0_2_0_loads_and_accepts_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        "tests/fixtures/v0.2.0-namespaces.json",
+        directory.path().join("namespaces.json"),
+    )
+    .unwrap();
+    let client = Client::new();
+    let (url, task) = serve(directory.path()).await;
+    let legacy = url.replace("/persisted", "/legacy");
+    let result: Value = client
+        .post(format!("{legacy}/query"))
+        .bearer_auth("dummy")
+        .json(&json!({"rank_by":["vector","ANN",[1,0]],"limit":1}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(result["rows"][0]["id"], 1);
+    assert_eq!(
+        post(&client, &legacy, json!({"deletes":[2]})).await,
+        StatusCode::OK
+    );
+    task.abort();
+
+    let (url, task) = serve(directory.path()).await;
+    assert_eq!(
+        ids(&client, &url.replace("/persisted", "/legacy")).await,
+        vec![1]
+    );
+    let strings: Value = client
+        .post(format!(
+            "{}/query",
+            url.replace("/persisted", "/legacy-strings")
+        ))
+        .bearer_auth("dummy")
+        .json(&json!({"rank_by":["id","asc"],"limit":10,"include_attributes":true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(strings["rows"][0]["note"], "string id");
+    task.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn data_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let client = Client::new();
+    let (url, task) = serve(directory.path()).await;
+    assert_eq!(
+        post(&client, &url, json!({"upsert_rows":[{"id":1}]})).await,
+        StatusCode::OK
+    );
+    task.abort();
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(directory.path()), 0o700);
+    assert_eq!(mode(&directory.path().join("namespaces.log")), 0o600);
 }

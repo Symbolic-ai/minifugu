@@ -29,7 +29,9 @@ type Shared = Arc<AppState>;
 struct AppState {
     namespaces: RwLock<HashMap<String, Namespace>>,
     embedding: EmbeddingMode,
-    /// Only touched while `namespaces` is write-locked, so it never waits on itself.
+    /// Only touched while `namespaces` is write-locked, so it never waits on itself. The
+    /// store reports failures through `Result`s, so a lock poisoned by an unrelated panic
+    /// is recovered rather than failing every later write.
     store: Option<std::sync::Mutex<persistence::Store>>,
 }
 
@@ -422,7 +424,9 @@ fn persist_namespace(
         guard.insert(name, namespace);
         return Ok(());
     };
-    let mut store = store.lock().map_err(|_| persist_failed())?;
+    let mut store = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     store
         .put(&name, guard.get(&name), &namespace)
         .map_err(|_| persist_failed())?;
@@ -647,7 +651,9 @@ async fn delete_namespace(
         ));
     }
     if let Some(store) = &state.store {
-        let mut store = store.lock().map_err(|_| persist_failed())?;
+        let mut store = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         store.drop_namespace(&name).map_err(|_| persist_failed())?;
         guard.remove(&name);
         compact(&mut store, &guard);
