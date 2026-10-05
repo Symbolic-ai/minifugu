@@ -16,11 +16,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
-use std::{
-    collections::HashMap,
-    path::{Path as FilePath, PathBuf},
-    sync::Arc,
-};
+use std::{collections::HashMap, path::Path as FilePath, sync::Arc};
 use tokio::sync::RwLock;
 
 pub use embedding::{deterministic_embedding, EmbeddingMode};
@@ -33,7 +29,10 @@ type Shared = Arc<AppState>;
 struct AppState {
     namespaces: RwLock<HashMap<String, Namespace>>,
     embedding: EmbeddingMode,
-    data_path: Option<PathBuf>,
+    /// Only touched while `namespaces` is write-locked, so it never waits on itself. The
+    /// store reports failures through `Result`s, so a lock poisoned by an unrelated panic
+    /// is recovered rather than failing every later write.
+    store: Option<std::sync::Mutex<persistence::Store>>,
 }
 
 #[derive(Debug)]
@@ -142,19 +141,19 @@ pub fn router_with_data_dir(
     embedding: EmbeddingMode,
     directory: &FilePath,
 ) -> std::io::Result<Router> {
-    let (path, namespaces) = persistence::open(directory)?;
-    Ok(router_with_state(embedding, Some(path), namespaces))
+    let (store, namespaces) = persistence::open(directory)?;
+    Ok(router_with_state(embedding, Some(store), namespaces))
 }
 
 fn router_with_state(
     embedding: EmbeddingMode,
-    data_path: Option<PathBuf>,
+    store: Option<persistence::Store>,
     namespaces: HashMap<String, Namespace>,
 ) -> Router {
     let state = Arc::new(AppState {
         namespaces: RwLock::new(namespaces),
         embedding,
-        data_path,
+        store: store.map(std::sync::Mutex::new),
     });
     Router::new()
         .route("/v1/namespaces", get(list_namespaces))
@@ -421,20 +420,34 @@ fn persist_namespace(
     name: String,
     namespace: Namespace,
 ) -> Result<(), ApiError> {
-    if let Some(path) = &state.data_path {
-        let mut next = guard.clone();
-        next.insert(name, namespace);
-        persistence::save(path, &next).map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to persist namespace".into(),
-            )
-        })?;
-        *guard = next;
-    } else {
+    let Some(store) = &state.store else {
         guard.insert(name, namespace);
-    }
+        return Ok(());
+    };
+    let mut store = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    store
+        .put(&name, guard.get(&name), &namespace)
+        .map_err(|_| persist_failed())?;
+    guard.insert(name, namespace);
+    compact(&mut store, guard);
     Ok(())
+}
+
+fn persist_failed() -> ApiError {
+    ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "failed to persist namespace".into(),
+    )
+}
+
+/// The write is already durable in the log, so a failed compaction is reported and
+/// retried after a later write rather than failing this request.
+fn compact(store: &mut persistence::Store, namespaces: &HashMap<String, Namespace>) {
+    if let Err(error) = store.maybe_compact(namespaces) {
+        eprintln!("MiniFugu could not compact its snapshot: {error}");
+    }
 }
 
 async fn write(
@@ -575,7 +588,7 @@ async fn write(
                 "embedding provider unavailable".into(),
             ),
         })?;
-    namespace.touch_write();
+    namespace.touch_write(guard.get(&name));
     persist_namespace(&state, &mut guard, name, namespace)?;
     Ok(Json(result))
 }
@@ -637,16 +650,13 @@ async fn delete_namespace(
             "namespace does not exist".into(),
         ));
     }
-    if let Some(path) = &state.data_path {
-        let mut next = guard.clone();
-        next.remove(&name);
-        persistence::save(path, &next).map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to persist namespace".into(),
-            )
-        })?;
-        *guard = next;
+    if let Some(store) = &state.store {
+        let mut store = store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.drop_namespace(&name).map_err(|_| persist_failed())?;
+        guard.remove(&name);
+        compact(&mut store, &guard);
     } else {
         guard.remove(&name);
     }

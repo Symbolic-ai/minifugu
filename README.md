@@ -44,13 +44,13 @@ Set `MINIFUGU_LISTEN=0.0.0.0:8787` to listen on another address. The default bin
 
 ## Keep data across restarts
 
-Set `MINIFUGU_DATA_DIR` to store all namespaces in a local JSON snapshot:
+Set `MINIFUGU_DATA_DIR` to store all namespaces in a local data directory:
 
 ```sh
 MINIFUGU_DATA_DIR="$HOME/.local/share/minifugu" cargo run --release
 ```
 
-Writes use a temporary file, file sync, and rename before the HTTP request succeeds. On startup, a corrupt snapshot stops the server instead of clearing data. On Unix, MiniFugu sets the data directory to `0700` and the snapshot file to `0600`. The snapshot is **not encrypted**; the `encryption.sse` metadata value is a compatibility field for the HTTP API. This is intended for a single small local instance; it does not provide concurrent process access, sharding, or large-scale indexing. Leave the variable unset for an empty in-memory store on every start.
+The directory holds a JSON snapshot, `namespaces.json`, and an append-only log, `namespaces.log`. Before the HTTP request succeeds, each write appends one line with only the rows it changed and syncs the log. A write therefore costs about the same in a large store as in a small one. On startup, MiniFugu replays the log over the snapshot. When the log is at least as large as the snapshot and at least 16 MiB, MiniFugu writes a new snapshot and empties the log, on startup or after a write. That write waits for the full snapshot, and other requests wait for it too, so this pause occurs about once for each snapshot size of logged changes. A corrupt snapshot or log line stops the server instead of clearing data. A final log line without its newline was never acknowledged, so MiniFugu discards it. On Unix, MiniFugu sets the data directory to `0700` and both files to `0600`. The files are **not encrypted**; the `encryption.sse` metadata value is a compatibility field for the HTTP API. This is intended for a single small local instance; it does not provide concurrent process access, sharding, or large-scale indexing. Leave the variable unset for an empty in-memory store on every start.
 
 ## Embeddings
 

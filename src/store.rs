@@ -7,11 +7,17 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+pub(crate) type Row = Map<String, Value>;
+pub(crate) type Rows = BTreeMap<String, Arc<Row>>;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Namespace {
     pub(crate) schema: Map<String, Value>,
-    pub(crate) rows: BTreeMap<String, Map<String, Value>>,
+    /// Rows are shared between a namespace and its clones until one of them changes a row,
+    /// so cloning a namespace before a write copies pointers, not row data.
+    pub(crate) rows: Rows,
     pub(crate) distance_metric: Option<String>,
     #[serde(default)]
     pub(crate) created_at: Option<DateTime<Utc>>,
@@ -30,12 +36,32 @@ pub struct Namespace {
 }
 
 impl Namespace {
-    pub(crate) fn touch_write(&mut self) {
+    /// Records a data write. With the namespace as it was `before` the write, the byte
+    /// estimate is updated from the changed rows instead of reserializing every row.
+    pub(crate) fn touch_write(&mut self, before: Option<&Namespace>) {
         let now = Utc::now();
         self.created_at.get_or_insert(now);
         self.updated_at = Some(now);
         self.last_write_at = Some(now);
-        self.approx_logical_bytes = Some(self.compute_logical_bytes());
+        let previous = before.and_then(|before| Some((before, before.approx_logical_bytes?)));
+        self.approx_logical_bytes = Some(match previous {
+            Some((before, bytes)) => {
+                let removed: usize = before
+                    .rows
+                    .iter()
+                    .filter(|(id, row)| !same_row(self.rows.get(*id), row))
+                    .map(|(_, row)| row_bytes(row))
+                    .sum();
+                let added: usize = self
+                    .rows
+                    .iter()
+                    .filter(|(id, row)| !same_row(before.rows.get(*id), row))
+                    .map(|(_, row)| row_bytes(row))
+                    .sum();
+                bytes.saturating_sub(removed) + added
+            }
+            None => self.compute_logical_bytes(),
+        });
     }
 
     pub(crate) fn touch_schema(&mut self) {
@@ -53,10 +79,7 @@ impl Namespace {
     }
 
     fn compute_logical_bytes(&self) -> usize {
-        self.rows
-            .values()
-            .map(|row| serde_json::to_vec(row).map_or(0, |bytes| bytes.len()))
-            .sum()
+        self.rows.values().map(|row| row_bytes(row)).sum()
     }
 
     pub(crate) fn logical_bytes(&self) -> usize {
@@ -541,7 +564,7 @@ impl Namespace {
                 .ok_or_else(|| crate::shape_error("deletes: expected a sequence"))?;
             for id in deletes {
                 let key = id_key(id)?;
-                let current = self.rows.get(&key);
+                let current = self.rows.get(&key).map(Arc::as_ref);
                 // Plain delete-by-ID is an acknowledged write even when the row was
                 // already absent. A conditional delete skips absent rows instead.
                 if object.contains_key("delete_condition")
@@ -572,6 +595,8 @@ impl Namespace {
             self.validate_patch(values)?;
             for row in self.rows.values_mut() {
                 if filter_matches(filter, row, &self.schema) {
+                    // Copies the row only if a clone of this namespace still shares it.
+                    let row = Arc::make_mut(row);
                     for (field, value) in values {
                         if value.is_null() {
                             row.remove(field);
@@ -593,11 +618,16 @@ impl Namespace {
                 validate_id(id, self.schema.get("id"))?;
                 self.validate_patch(patch)?;
                 let key = id_key(id)?;
-                if !condition_matches(object, "patch_condition", self.rows.get(&key), &self.schema)
-                {
+                if !condition_matches(
+                    object,
+                    "patch_condition",
+                    self.rows.get(&key).map(Arc::as_ref),
+                    &self.schema,
+                ) {
                     continue;
                 }
                 if let Some(row) = self.rows.get_mut(&key) {
+                    let row = Arc::make_mut(row);
                     for (field, value) in patch {
                         if field != "id" {
                             if value.is_null() {
@@ -622,7 +652,7 @@ impl Namespace {
                 if !condition_matches(
                     object,
                     "upsert_condition",
-                    self.rows.get(&id_key(&id)?),
+                    self.rows.get(&id_key(&id)?).map(Arc::as_ref),
                     &self.schema,
                 ) {
                     continue;
@@ -713,7 +743,7 @@ impl Namespace {
                 }
                 vector::normalize_row(&mut row, &generated_vectors)?;
                 row.retain(|field, value| field == "id" || !value.is_null());
-                self.rows.insert(id_key(&id)?, row);
+                self.rows.insert(id_key(&id)?, Arc::new(row));
                 upserted_ids.push(id);
             }
         }
@@ -1542,6 +1572,16 @@ fn validate_id(value: &Value, definition: Option<&Value>) -> Result<(), String> 
     Ok(())
 }
 
+/// Whether a write left `row` as it was. A row that no write touched is still the
+/// same allocation in the namespace and its clone, so this rarely compares contents.
+pub(crate) fn same_row(old: Option<&Arc<Row>>, row: &Arc<Row>) -> bool {
+    old.is_some_and(|old| Arc::ptr_eq(old, row) || old == row)
+}
+
+fn row_bytes(row: &Map<String, Value>) -> usize {
+    serde_json::to_vec(row).map_or(0, |bytes| bytes.len())
+}
+
 fn id_key(value: &Value) -> Result<String, String> {
     match value {
         Value::String(s) if s.len() <= 64 => Ok(format!("s:{s}")),
@@ -1705,6 +1745,27 @@ fn uuid_like(value: &str) -> bool {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn incremental_byte_estimate_matches_a_full_count() {
+        let mut namespace = Namespace::default();
+        let embedding = EmbeddingMode::Deterministic;
+        let writes = [
+            json!({"upsert_rows":[{"id":1,"title":"one"},{"id":2,"title":"two"},{"id":3,"title":"three"}]}),
+            json!({"patch_rows":[{"id":2,"title":"a much longer second title"}]}),
+            json!({"deletes":[1]}),
+            json!({"upsert_rows":[{"id":4,"title":"four"}],"delete_by_filter":["id","Eq",3]}),
+        ];
+        for write in writes {
+            let before = namespace.clone();
+            namespace.write(&write, &embedding).await.unwrap();
+            namespace.touch_write(Some(&before));
+            assert_eq!(
+                namespace.approx_logical_bytes,
+                Some(namespace.compute_logical_bytes())
+            );
+        }
+    }
 
     #[tokio::test]
     async fn legacy_vector_placeholder_upgrades_in_both_schema_forms() {

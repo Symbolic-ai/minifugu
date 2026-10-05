@@ -1,0 +1,59 @@
+{
+ "legacy": {
+  "approx_logical_bytes": 96,
+  "cmek_key_name": null,
+  "created_at": "2026-10-05T16:30:49.621822Z",
+  "distance_metric": "cosine_distance",
+  "last_write_at": "2026-10-05T16:30:49.621822Z",
+  "read_only": false,
+  "rows": {
+   "n:1": {
+    "id": 1,
+    "title": "small fugu",
+    "vector": [
+     1.0,
+     0.0
+    ]
+   },
+   "n:2": {
+    "id": 2,
+    "title": "blue whale",
+    "vector": [
+     0.0,
+     1.0
+    ]
+   }
+  },
+  "schema": {
+   "id": "uint",
+   "title": {
+    "full_text_search": true,
+    "type": "string"
+   },
+   "vector": {
+    "ann": true,
+    "type": "[2]f16"
+   }
+  },
+  "updated_at": "2026-10-05T16:30:49.621822Z"
+ },
+ "legacy-strings": {
+  "approx_logical_bytes": 29,
+  "cmek_key_name": null,
+  "created_at": "2026-10-05T16:30:49.639828Z",
+  "distance_metric": null,
+  "last_write_at": "2026-10-05T16:30:49.639828Z",
+  "read_only": false,
+  "rows": {
+   "s:a": {
+    "id": "a",
+    "note": "string id"
+   }
+  },
+  "schema": {
+   "id": "string",
+   "note": "string"
+  },
+  "updated_at": "2026-10-05T16:30:49.639828Z"
+ }
+}
