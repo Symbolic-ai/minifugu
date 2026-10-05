@@ -2,6 +2,13 @@
 
 Release Please maintains this file from conventional commits when a release pull request is merged.
 
+## [0.2.1](https://github.com/Symbolic-ai/minifugu/compare/v0.2.0...v0.2.1) (2026-10-05)
+
+
+### Performance Improvements
+
+* persist writes as an append-only log of changed rows ([#30](https://github.com/Symbolic-ai/minifugu/issues/30)) ([63f648b](https://github.com/Symbolic-ai/minifugu/commit/63f648bc9c16397061d6e66f1ecba401dcb090f0))
+
 ## [0.2.0](https://github.com/Symbolic-ai/minifugu/compare/v0.1.1...v0.2.0) (2026-09-29)
 
 
