@@ -446,7 +446,7 @@ impl Namespace {
                 result.insert("id".into(), row["id"].clone());
                 match object.get("include_attributes") {
                     Some(Value::Bool(true)) => {
-                        for (key, value) in row {
+                        for (key, value) in row.iter() {
                             result.insert(key.clone(), value.clone());
                         }
                     }
@@ -461,7 +461,7 @@ impl Namespace {
                     _ => (),
                 }
                 if let Some(Value::Array(fields)) = object.get("exclude_attributes") {
-                    for (field, value) in row {
+                    for (field, value) in row.iter() {
                         if field != "id" && !fields.contains(&Value::String(field.clone())) {
                             result.insert(field.clone(), value.clone());
                         }
@@ -627,6 +627,7 @@ impl Namespace {
         let rows = self
             .rows
             .values()
+            .map(|row| row.as_ref())
             .filter(|row| {
                 object
                     .get("filters")
@@ -808,7 +809,7 @@ fn validate_computed(expression: &Value, schema: &Map<String, Value>) -> Result<
 fn computed_value(
     expression: &Value,
     row: &Map<String, Value>,
-    corpus: &BTreeMap<String, Map<String, Value>>,
+    corpus: &crate::store::Rows,
     schema: &Map<String, Value>,
     metric: &str,
 ) -> Value {
@@ -1862,7 +1863,7 @@ fn has_max_floor(rank: &Value) -> bool {
 fn matches_rank(
     rank: &Value,
     row: &Map<String, Value>,
-    corpus: &std::collections::BTreeMap<String, Map<String, Value>>,
+    corpus: &crate::store::Rows,
     schema: &Map<String, Value>,
     metric: &str,
 ) -> bool {
@@ -2035,7 +2036,7 @@ fn is_ascending(rank: &Value) -> bool {
 pub(crate) fn score_rank(
     rank: &Value,
     row: &Map<String, Value>,
-    corpus: &std::collections::BTreeMap<String, Map<String, Value>>,
+    corpus: &crate::store::Rows,
     schema: &Map<String, Value>,
     metric: &str,
 ) -> f64 {
@@ -2278,7 +2279,7 @@ pub(crate) fn reset_text_caches() {
 fn field_stats(
     field: &str,
     analysis: &TextAnalysis,
-    corpus: &BTreeMap<String, Map<String, Value>>,
+    corpus: &crate::store::Rows,
 ) -> std::rc::Rc<FieldStats> {
     if let Some(stats) = FIELD_STATS.with(|stats| stats.borrow().get(field).cloned()) {
         return stats;
@@ -2312,7 +2313,7 @@ fn bm25(
     query: &Value,
     last_as_prefix: bool,
     row: &Map<String, Value>,
-    corpus: &std::collections::BTreeMap<String, Map<String, Value>>,
+    corpus: &crate::store::Rows,
     schema: &Map<String, Value>,
     computed: bool,
 ) -> f64 {

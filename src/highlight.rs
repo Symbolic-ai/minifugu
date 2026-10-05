@@ -4,7 +4,7 @@
 use crate::query::{score_rank, validate_rank, with_isolated_field_stats};
 use crate::text::{self, TextAnalysis};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Range;
 
 /// The attribute name a fragment expression uses for the fragment text.
@@ -204,7 +204,7 @@ pub(crate) fn compute(
     // Score every fragment against a corpus made of this row's fragments.
     let mut fragment_schema = schema.clone();
     fragment_schema.insert(FRAGMENT.into(), definition.clone());
-    let corpus: BTreeMap<String, Map<String, Value>> = fragments
+    let corpus: crate::store::Rows = fragments
         .iter()
         .enumerate()
         .map(|(index, fragment)| {
@@ -218,7 +218,7 @@ pub(crate) fn compute(
                 FRAGMENT.into(),
                 json!(&inputs[fragment.input_index][fragment.range.clone()]),
             );
-            (format!("{index:08}"), fragment_row)
+            (format!("{index:08}"), std::sync::Arc::new(fragment_row))
         })
         .collect();
     with_isolated_field_stats(|| {
