@@ -26,9 +26,9 @@ dependencies = [
 
 [[package]]
 name = "alyze"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3714c9c2b8ec72602057a5dbc28c30f72326d4d28c801fe1dea87f27ff32416d"
+checksum = "1c87adf9feb450598edfa25e4bd457dc1b07bb4f4f4be80aaa46e2d43c4f1636"
 dependencies = [
  "ahash",
  "phf",
