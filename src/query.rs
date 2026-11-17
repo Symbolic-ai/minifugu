@@ -85,12 +85,12 @@ impl Namespace {
             if object.contains_key("rerank_by") {
                 let (rank_constant, weights, limit, offset) = validate_rrf(object, queries)?;
                 let results = queries.iter().map(|q| self.execute_query(q));
-                let mut fused = BTreeMap::<String, (f64, Value)>::new();
+                let mut fused = BTreeMap::<String, (f32, Value)>::new();
                 for (result, weight) in results.zip(weights) {
                     for (index, row) in result["rows"].as_array().unwrap().iter().enumerate() {
                         let id = serde_json::to_string(&row["id"]).unwrap();
                         let entry = fused.entry(id).or_insert_with(|| (0.0, row.clone()));
-                        entry.0 += weight / (rank_constant + index as f64 + 1.0);
+                        entry.0 += weight as f32 / (rank_constant as f32 + index as f32 + 1.0);
                         if let (Some(existing), Some(current)) =
                             (entry.1.as_object_mut(), row.as_object())
                         {
@@ -112,7 +112,7 @@ impl Namespace {
                     .skip(offset)
                     .take(limit)
                     .map(|(score, mut row)| {
-                        row["$dist"] = json!(vector::serialized_f32(score as f32));
+                        row["$dist"] = json!(vector::serialized_f32(score));
                         row
                     })
                     .collect::<Vec<_>>();
