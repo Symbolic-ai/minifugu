@@ -2,6 +2,13 @@
 
 Release Please maintains this file from conventional commits when a release pull request is merged.
 
+## [0.2.2](https://github.com/Symbolic-ai/minifugu/compare/v0.2.1...v0.2.2) (2026-11-17)
+
+
+### Bug Fixes
+
+* match live Turbopuffer RRF precision before candidate cutoff ([1882618](https://github.com/Symbolic-ai/minifugu/commit/1882618bf670ff686a787352177a2317d644455d))
+
 ## [0.2.1](https://github.com/Symbolic-ai/minifugu/compare/v0.2.0...v0.2.1) (2026-10-05)
 
 
