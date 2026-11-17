@@ -27,6 +27,49 @@ async fn post(client: &Client, url: &str, body: Value) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
+async fn weighted_rrf_cutoff_matches_live_float32_ranking() {
+    let base = serve(minifugu::router()).await;
+    let client = Client::new();
+    let url = format!("{base}/v2/namespaces/rrf-precision");
+    let rows = (1..396)
+        .map(|id| json!({"id":id,"ann_arm":true,"keyword":id <= 29}))
+        .chain((1000..1106).map(|id| json!({"id":id,"ann_arm":false,"keyword":true})))
+        .collect::<Vec<_>>();
+    let (status, _) = post(
+        &client,
+        &url,
+        json!({
+            "schema":{"id":"uint","ann_arm":"bool","keyword":"bool"},
+            "upsert_rows":rows
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut query = json!({
+        "queries":[
+            {"rank_by":["id","asc"],"filters":["ann_arm","Eq",true],"limit":395},
+            {"rank_by":["id","asc"],"filters":["keyword","Eq",true],"limit":135}
+        ],
+        "rerank_by":["RRF",{"weights":[0.7,0.3],"rank_constant":60}],
+        "limit":501
+    });
+    let (status, full) = post(&client, &format!("{url}/query"), query.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = full["results"][0]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 501);
+    assert_eq!(rows[499], json!({"id":1105,"$dist":0.0015384617}));
+    assert_eq!(rows[500], json!({"id":395,"$dist":0.0015384615}));
+
+    query["limit"] = json!(500);
+    let (status, limited) = post(&client, &format!("{url}/query"), query).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = limited["results"][0]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 500);
+    assert_eq!(rows.last().unwrap()["id"], 1105);
+    assert!(!rows.iter().any(|row| row["id"] == 395));
+}
+
+#[tokio::test]
 async fn equal_bm25_scores_order_numeric_ids_numerically() {
     let base = serve(minifugu::router()).await;
     let client = Client::new();
